@@ -1,0 +1,32 @@
+# consistent with vLLM v0.10.2
+[build-system]
+requires = [
+    "setuptools>=77.0.3,<80.0.0", 
+    "torch>=2.8.0" 
+    # pybind11 headers are contained in torch, so that we use consistent pybind11 version with torch
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instanttensor"
+version = "0.1.0"
+description = "An ultra-fast, distributed Safetensors loader"
+dependencies = [
+    "torch>=2.8.0",
+]
+# authors = [ { name = "Your Name", email = "you@example.com" } ]
+
+[project.optional-dependencies]
+test = [
+    "numpy",
+    "safetensors",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["instanttensor*"]
+
+# this does not work for uv
+# [tool.uv]
+# no-build-isolation-package = ["torch"]
