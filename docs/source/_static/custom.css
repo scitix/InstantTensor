@@ -1,0 +1,13 @@
+/* prevent sidebar title from wrapping */
+.sidebar .sidebar-title {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* force no line break */
+h1.sidebar-title,
+.sidebar h1 {
+    white-space: nowrap !important;
+    word-break: keep-all !important;
+}

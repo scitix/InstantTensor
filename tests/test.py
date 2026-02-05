@@ -10,8 +10,8 @@ import argparse
 import numpy as np
 import ctypes
 # import zlib
-import instantsafetensors
-from instantsafetensors import safe_open as instant_safe_open
+import instanttensor
+from instanttensor import safe_open as instant_safe_open
 
 from safetensors import safe_open as safetensors_safe_open
 
@@ -26,8 +26,8 @@ def parse_args():
     parser.add_argument(
         'backend',
         type=str,
-        choices=['instantsafetensors', 'safetensors'],
-        help='Backend type (choices: instantsafetensors, safetensors)'
+        choices=['instanttensor', 'safetensors'],
+        help='Backend type (choices: instanttensor, safetensors)'
     )
     # all remaining positional arguments go into files list
     parser.add_argument(
@@ -87,19 +87,19 @@ pp = args.pp
 load_group_size = args.load_group_size
 compute_checksum = args.checksum
 rank0_only = args.rank0_only
-grouped = True if backend == 'instantsafetensors' else False
+grouped = True if backend == 'instanttensor' else False
 
 if os.environ.get("NCCL_IB_GID_INDEX") != "3":
     print("Setting NCCL_IB_GID_INDEX to 3")
     os.environ["NCCL_IB_GID_INDEX"] = "3"
 
 safe_open_dict = {
-    'instantsafetensors': instant_safe_open,
+    'instanttensor': instant_safe_open,
     'safetensors': safetensors_safe_open,
 }
 
 device_dict = {
-    'instantsafetensors': 'cuda',
+    'instanttensor': 'cuda',
     'safetensors': 'cpu', # NOTE: safetensors performs best when the intermediate tensors are on CPU
 }
 
@@ -122,9 +122,7 @@ def allocate_tensors(global_rank, files):
     num_tensors = len(tensor_names)
     pp_tensor_names = tensor_names[(num_tensors+pp-1)//pp*pp_rank : (num_tensors+pp-1)//pp*(pp_rank+1)] # the right side may overflow, but it is ok
     for key in pp_tensor_names:
-        shape = f.get_shape(key)
-        dtype = f.get_dtype(key)
-
+        dtype, shape = f.get_tensor_metadata(key)
 
         tp_shard_l = (shape[0]+tp-1) // tp * tp_rank
         tp_shard_r = (shape[0]+tp-1) // tp * (tp_rank+1)
@@ -193,9 +191,8 @@ def distributed_load():
     if buffer_device == 'cuda':
         buffer_device = f'cuda:{local_rank}'
     
-    if backend == 'instantsafetensors':
-        if any(not instantsafetensors.file_in_memory(file) for file in files):
-            instantsafetensors.init()
+    if backend == 'instanttensor':
+        instanttensor.init() # can be commented out
         # NOTE: process_group can be the world group or a sub-group, 
         #       each group loads tensors independently. 
         #       Typically, we use the world group to maximize concurrency and avoid redundant loading.
@@ -222,7 +219,7 @@ def distributed_load():
 
     grouped_files = [files] if grouped else files
 
-    if rank0_only and load_group_rank != 0 and backend == 'instantsafetensors':
+    if rank0_only and load_group_rank != 0 and backend == 'instanttensor':
         for file in grouped_files:
             safe_open(file, framework='pt', device=buffer_device, open_now=False) # run allreduce inside
     
@@ -293,7 +290,7 @@ def distributed_load():
     if compute_checksum:
         collective_print("[TEST] Computing checksum")
         checksum = 0
-        for key in tqdm(full_ordered_keys):
+        for key in tqdm(full_ordered_keys, position=local_rank, desc=f"{load_group_id}-{load_group_rank}-checksum"):
             if key in tensors: # some keys are not in tensors in PP mode
                 checksum ^= tensor_checksum(tensors[key])
         collective_print(f"[TEST] Final checksum: {checksum:016x}")

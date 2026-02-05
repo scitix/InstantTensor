@@ -3,34 +3,47 @@ import json
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C
-from typing import Union, List
+from typing import Union, List, Generator
 import threading
 import io
 
 import atexit
 import os 
 
-atexit.register(instanttensor._C.cleanup)
+# Register cleanup function, but handle the case where _C might not be available
+# (e.g., during documentation generation with autodoc_mock_imports)
+try:
+    atexit.register(instanttensor._C.cleanup)
+except AttributeError:
+    # _C module is mocked (e.g., during Sphinx documentation build)
+    print("instanttensor._C is mocked, skipping cleanup registration")
 
 
-def safetensors_dtype_to_torch_dtype(dtype: str):
-    # "bool" => Dtype::BOOL,
-    # "int8" => Dtype::I8,
-    # "uint8" => Dtype::U8,
-    # "int16" => Dtype::I16,
-    # "uint16" => Dtype::U16,
-    # "int32" => Dtype::I32,
-    # "uint32" => Dtype::U32,
-    # "int64" => Dtype::I64,
-    # "uint64" => Dtype::U64,
-    # "float16" => Dtype::F16,
-    # "float32" => Dtype::F32,
-    # "float64" => Dtype::F64,
-    # "bfloat16" => Dtype::BF16,
-    # "float8_e4m3fn" => Dtype::F8_E4M3,
-    # "float8_e5m2" => Dtype::F8_E5M2,
-    # "float8_e8m0fnu" => Dtype::F8_E8M0,
-    # "float4_e2m1fn_x2" => Dtype::F4,
+def safetensors_dtype_to_torch_dtype(dtype: str) -> torch.dtype:
+    """Convert a safetensors dtype string to the corresponding PyTorch dtype.
+    
+    Args:
+        dtype: The safetensors dtype string. Supported values include:
+            - "BOOL" -> ``torch.bool``
+            - "I8", "I16", "I32", "I64" -> ``torch.int8``, ``torch.int16``, ``torch.int32``, ``torch.int64``
+            - "U8", "U16", "U32", "U64" -> ``torch.uint8``, ``torch.uint16``, ``torch.uint32``, ``torch.uint64``
+            - "F16", "F32", "F64" -> ``torch.float16``, ``torch.float32``, ``torch.float64``
+            - "BF16" -> ``torch.bfloat16``
+            - "F8_E4M3", "F8_E5M2" -> ``torch.float8`` variants
+            - "F8_E8M0" -> ``torch.float8_e8m0fnu``
+            - "F4" -> ``torch.float4_e2m1fn_x2``
+    
+    Returns:
+        The corresponding PyTorch dtype object (e.g., ``torch.float32``).
+    
+    Raises:
+        ValueError: If the dtype string is not supported by safetensors.
+    
+    Example:
+        >>> dtype = safetensors_dtype_to_torch_dtype("F32")
+        >>> print(dtype)
+        torch.float32
+    """
     if dtype == "BOOL":
         return torch.bool
     elif dtype == "I8":
@@ -68,7 +81,31 @@ def safetensors_dtype_to_torch_dtype(dtype: str):
     else:
         raise ValueError(f"Safetensors does not support dtype: {dtype}")
 
-def read_safetensors_metadata(filename: str):
+def read_safetensors_metadata(filename: str) -> tuple:
+    """Read the safetensors metadata from a file.
+    
+    This function reads the header metadata from a safetensors file, which
+    contains information about the tensors stored in the file.
+    
+    Args:
+        filename: Path to the safetensors file to read.
+    
+    Returns:
+        A tuple containing:
+            - file_metadata (``dict`` or ``None``): File-level metadata if present
+            - tensor_metadata (``dict``): Dictionary mapping tensor names to their
+              metadata (shape, dtype, offsets, etc.)
+            - header_size (``int``): Size of the metadata header in bytes (including the 8 bytes of metadata size)
+    
+    Raises:
+        FileNotFoundError: If the specified file does not exist.
+        ValueError: If the file format is invalid.
+    
+    Example:
+        >>> file_meta, tensor_meta, header_size = read_safetensors_metadata("model.safetensors")
+        >>> print(f"Found {len(tensor_meta)} tensors")
+        >>> print(f"Header size: {header_size} bytes")
+    """
     with open(filename, "rb") as f:
         metadata_size = int.from_bytes(f.read(8), "little")
         metadata_str = f.read(metadata_size).decode("utf-8")
@@ -76,62 +113,121 @@ def read_safetensors_metadata(filename: str):
         file_metadata = tensor_metadata.pop("__metadata__", None)
         return file_metadata, tensor_metadata, 8 + metadata_size
 
-# This will be called lazily in safe_open(), but can be explicitly called to control the timing of initialization
-def init(): 
+def init():
+    """Initialize the InstantTensor library.
+    
+    This function initializes the underlying C++ backend of InstantTensor.
+    It is an optional function and will be called lazily when ``safe_open()`` is first used, but can be
+    explicitly called to control the timing of initialization.
+    
+    Example:
+        >>> import instanttensor
+        >>> instanttensor.init()  # Explicit initialization
+    """
     instanttensor._C.init() 
 
-def file_in_memory(filename: str):
+def file_in_memory(filename: str) -> bool:
+    """Check if a file is located in an in-memory filesystem.
+    
+    This helper function determines whether a file is stored in a tmpfs or
+    ramfs filesystem, which affects the I/O strategy used by InstantTensor.
+    
+    Args:
+        filename: Path to the file to check.
+    
+    Returns:
+        ``True`` if the file is in an in-memory filesystem (tmpfs/ramfs),
+        ``False`` otherwise.
+    
+    Example:
+        >>> if file_in_memory("model.safetensors"):
+        ...     print("File is in memory, using optimized path")
+        ... else:
+        ...     print("File is on disk, using standard I/O")
+    """
     return instanttensor._C.file_in_memory(filename)
 
 group_communicator_cache = {}
 
 class safe_open:
-    """
-    Opens a safetensors lazily and returns tensors as asked
-    To get the best performance:
-    1. pass multiple files through a filename list instead of calling safe_open multiple times.
-    2. set the buffer_size as large as possible.
-    3. set the chunk_size large enough to saturate the loading bandwidth, 
-       but not too large to 
-    Setting the 
-
+    """Context manager for lazily loading safetensors files with high performance.
+    
+    This class provides an ultra-fast, distributed safetensors loader that
+    maximizes I/O throughput when moving model weights from safetensors files
+    to GPU memory. It supports multiple I/O backends including GPUDirect
+    Storage, legacy storage, and memory-based storage.
+    
     Args:
-        filename (`str`, or `List[str]`):
-            The filename(s) to open
-
-        framework (`str`):
-            The framework you want you tensors in. 
-            Supported values: `pt`, `tf`, `flax`, `numpy`.
-            Currently only `pt` is supported.
-
-        device (`str`, or `torch.device`):
-            The device on which you want the tensors. Must be a CUDA device.
-
-        process_group (`Any`, or `None`, defaults to `None`):
-            Process group from torch.distributed, or `None` for single-process usage.
-
-        buffer_size (`int`, defaults to `1024*1024*1024`):
-            The buffer size in bytes on the device. 
-            This may be further enlarged or shrunk to imporve the performance or avoid memory waste.
-
-        chunk_size (`int`, defaults to None):
-            Size of each file IO in bytes.
-            Leave it as None to use the automatically determined value.
+        filename: The filename(s) to open. Can be a single file path (``str``) or
+            a list of file paths (``List[str]``) for multi-file loading. When
+            multiple files are provided, they are automatically sorted. Providing
+            all files in a single list has better performance than calling 
+            ``safe_open`` multiple times.
+        framework: The framework you want tensors in. Currently only ``"pt"``
+            (PyTorch) is supported. Defaults to ``"pt"``.
+        device: The device on which you want the tensors. Must be a CUDA device.
+            Can be specified as an ``int`` (device ID), ``str`` (e.g., ``"cuda:0"``), or
+            ``torch.device`` object.
+        process_group: Process group from ``torch.distributed`` for distributed
+            loading, or ``None`` for single-process usage. When provided, InstantTensor
+            uses NCCL to coordinate loading across processes for higher throughput.
+        buffer_size: The size of the GPU buffer used for tensors in bytes.
+            If ``None`` (default), automatically determined based on tensor sizes
+            for optimal performance. Larger values improve throughput but use
+            more GPU memory.
+        chunk_size: The size of each file I/O operation in bytes. If ``None``
+            (default), automatically determined based on storage type.
+            Increasing this value can improve throughput, but values that are
+            too large may conversely reduce throughput.
+        concurrency: The number of concurrent I/O operations. If ``None`` (default),
+            automatically determined based on storage type and system capabilities.
+            Increasing this value can improve throughput, but values that are
+            too large may conversely reduce throughput.
+        load_now: Whether to load tensors immediately. If ``True`` (default), starts
+            loading immediately. If ``False``, only reads file metadata initially;
+            tensors will be loaded when the context manager is entered. Useful
+            for testing and debugging.
+    
+    Returns:
+        A context manager that yields a file-like object with tensor access
+        methods.
+    
+    Example:
+        Basic single-file usage:
         
-        concurrency (`int`, defaults to None):
-            Number of concurrent IOs for the loading.
-            Leave it as None to use the automatically determined value.
-
-        load_now (`bool`, defaults to `True`):
-            Whether to load the tensors immediately.
-            For testing and debugging purposes.
-            If True, it starts to load the tensors immediately.
-            If False, it only reads the file metadata, and the tensors will be loaded when the context manager is entered.
-            
+        >>> from instanttensor import safe_open
+        >>> tensors = {}
+        >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+        ...     for name, tensor in f.tensors():
+        ...         tensors[name] = tensor.clone()
+        
+        Multi-file loading (recommended for better performance):
+        
+        >>> files = ["model-00001-of-00002.safetensors",
+        ...          "model-00002-of-00002.safetensors"]
+        >>> with safe_open(files, framework="pt", device=0) as f:
+        ...     for name, tensor in f.tensors():
+        ...         tensors[name] = tensor.clone()
+        
+        Distributed loading:
+        
+        >>> import torch
+        >>> import torch.distributed as dist
+        >>> dist.init_process_group(backend="nccl")
+        >>> process_group = dist.GroupMember.WORLD
+        >>> with safe_open(files, framework="pt",
+        ...                device=torch.cuda.current_device(),
+        ...                process_group=process_group) as f:
+        ...     for name, tensor in f.tensors():
+        ...         tensors[name] = tensor.clone()
     """
     def __init__(self, filename: Union[str, List[str]], framework: str, 
-            device: Union[str, torch.device], process_group=None, 
-            buffer_size=1*1024*1024*1024, chunk_size=None, concurrency=None, load_now=True): 
+            device: Union[int, str, torch.device], process_group=None, 
+            buffer_size=None, chunk_size=None, concurrency=None, load_now=True):
+        """Initialize the safe_open context manager.
+        
+        See class docstring for detailed parameter descriptions.
+        """ 
         self.init_time = time.perf_counter()
 
         if isinstance(filename, str):
@@ -155,7 +251,8 @@ class safe_open:
                 if chunk_size is None:
                     chunk_size = 4*1024*1024
                 if concurrency is None:
-                    concurrency = max(64 // self.world_size, 1) # 64 # OK if os.cpu_count() < 64 since threads are blocked by cuFileRead
+                    # OK if os.cpu_count() < 64 since threads are blocked by cuFileRead
+                    concurrency = max(64 // self.world_size, 1) 
                 io_depth = 2 # cuFileRead + ncclAllGather
             else: # aio
                 if chunk_size is None:
@@ -178,10 +275,11 @@ class safe_open:
         self.concurrency = concurrency
         self.io_depth = io_depth
         self.loader_handle = None
-        self.expect_index = 0
 
-        self.ordered_key_values = []
+        self.ordered_tensor_metadatas = []
         self.tensor_offsets = []
+        self.iterated = False
+        self.tmp_generator = None
         
         self.sync_time = time.perf_counter()
         if self.process_group is not None:
@@ -195,42 +293,48 @@ class safe_open:
         self.meta_read_time = time.perf_counter()
 
         # t0 = time.perf_counter()
-        meta_read_results = self.read_metadata()
+        meta_read_results = self._read_metadata()
         # print(f"Time: read_safetensors_metadata = {time.perf_counter() - t0:.2f}s")
 
+        self.file_metadata = None
         for f_idx, f in enumerate(self.filename):
             file_metadata, tensor_metadata, tensor_offset = meta_read_results[f_idx]
+            if file_metadata is not None:
+                self.file_metadata = file_metadata
             assert file_metadata is None or file_metadata.get("format", "pt") == "pt", "InstantTensor only supports pytorch format for now"
             # A typical entry: "model.layers.20.post_attention_layernorm.weight":{"dtype":"BF16","shape":[2880],"data_offsets":[0,5760]}
-            ordered_key_values = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
-            assert all(ordered_key_values[i][1]["data_offsets"][1] == ordered_key_values[i+1][1]["data_offsets"][0] for i in range(len(ordered_key_values) - 1))
+            ordered_tensor_metadatas = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
+            assert all(ordered_tensor_metadatas[i][1]["data_offsets"][1] == ordered_tensor_metadatas[i+1][1]["data_offsets"][0] for i in range(len(ordered_tensor_metadatas) - 1))
             
-            self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_key_values] + [(f_idx, ordered_key_values[-1][1]["data_offsets"][1] + tensor_offset)])
-            self.ordered_key_values.extend(ordered_key_values)
+            self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
+            self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
         
 
-        self.key_to_index = {k: i for i, (k, v) in enumerate(self.ordered_key_values)}
+        self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
 
         # adjust buffer size    
-        tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_key_values]
+        tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
         self.total_tensor_size = sum(tensor_sizes)
 
-        # make sure any two contiguous tensors will not be overlapped with each other in the buffer
-        min_buffer_size = max(tensor_sizes[i]+2*tensor_sizes[i+1] for i in range(len(tensor_sizes) - 1))
-        
-        if self.buffer_size < min_buffer_size:
-            print(f"Warning: Enlarge buffer size from {self.buffer_size} to {min_buffer_size} for better performance")
-            self.buffer_size = min_buffer_size
+        if self.buffer_size is None:
+            # make sure any two contiguous tensors will not be overlapped with each other in the buffer
+            recommended_buffer_size = max(tensor_sizes[i]+2*tensor_sizes[i+1] for i in range(len(tensor_sizes) - 1))
+            self.buffer_size = recommended_buffer_size
+        else:
+            min_buffer_size = max(tensor_sizes)
+            if self.buffer_size < min_buffer_size:
+                print(f"Warning: Enlarge buffer size from {self.buffer_size} to {min_buffer_size} to match the largest tensor size.")
+                self.buffer_size = min_buffer_size
 
-        max_buffer_size = self.total_tensor_size
-        if self.buffer_size > max_buffer_size:
-            print(f"Warning: Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste")
-            self.buffer_size = max_buffer_size
+            max_buffer_size = self.total_tensor_size
+            if self.buffer_size > max_buffer_size:
+                print(f"Warning: Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste")
+                self.buffer_size = max_buffer_size
 
         if load_now:
             self._open()
 
-    def read_metadata(self):
+    def _read_metadata(self):
         meta_read_threads = []
         meta_read_results = [None] * len(self.filename)
 
@@ -274,7 +378,6 @@ class safe_open:
         group_world_size = 1
         if self.process_group is not None:
             group_rank = dist.get_rank(self.process_group)
-            # global_rank = dist.get_global_rank(self.process_group, group_rank)
             group_world_size = dist.get_world_size(self.process_group)
 
             # cache the nccl communicator since ncclCommInitRank and ncclCommDestroy are very slow
@@ -309,19 +412,13 @@ class safe_open:
             self.filename, self.device_idx, self.process_group, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.tensor_offsets)
 
-    def __enter__(self):
-        """
-        Start the context manager
-        """
+    def __enter__(self) -> 'safe_open':
         if self.loader_handle is None:
             self._open()
         self.enter_time = time.perf_counter()
         return self
 
-    def __exit__(self, _exc_type, _exc_value, _traceback):
-        """
-        Exits the context manager
-        """
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         stream = torch.cuda.current_stream()
         stream.synchronize() # make sure all the data transfer is done
         self.exit_time = time.perf_counter()
@@ -337,106 +434,166 @@ class safe_open:
         print(f"Time: total={total_time:.2f}s, init={init_time:.2f}s, sync={sync_time:.2f}s, meta_read={meta_read_time:.2f}s, open={open_time:.2f}s, load={load_time:.2f}s, close={close_time:.2f}s")
         print(f"Throughput: total={self.total_tensor_size * 1e-9 / total_time:.2f}GB/s, load={self.total_tensor_size * 1e-9 / load_time:.2f}GB/s")
 
-    # for experiment
-    def get_shape(self, name):
-        """
-        Returns the size of the tensor
-        """
-        tensor_index = self.key_to_index[name]
-        return self.ordered_key_values[tensor_index][1]["shape"]
+    def tensors(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Iterate over all tensors in the safetensors file(s).
+        
+        This method returns an iterator that yields (name, tensor) pairs for
+        all tensors from the safetensors file(s) that are loaded on the
+        specified GPU device.
 
-    # for experiment
-    def get_dtype(self, name):
-        """
-        Returns the dtype of the tensor
-        """
-        tensor_index = self.key_to_index[name]
-        return safetensors_dtype_to_torch_dtype(self.ordered_key_values[tensor_index][1]["dtype"])
-
-    # def get_slice(self, name):
-    #     """
-    #     Returns a full slice view object
-
-    #     Args:
-    #         name (`str`):
-    #             The name of the tensor you want
-
-    #     Returns:
-    #         (`PySafeSlice`):
-    #             A dummy object you can slice into to get a real tensor
-    #     Example:
-    #     ```python
-    #     from safetensors import safe_open
-
-    #     with safe_open("model.safetensors", framework="pt", device=0) as f:
-    #         tensor_part = f.get_slice("embedding")[:, ::8]
-
-    #     ```
-    #     """
-    #     pass
-
-    def get_tensor(self, name):
-        """
-        Returns a full tensor
-
-        Args:
-            name (`str`):
-                The name of the tensor you want
-
-        Returns:
-            (`Tensor`):
-                The tensor in the framework you opened the file for.
-
+        Note:
+            This method synchronizes CUDA streams to ensure data transfer
+            completion.
+        
+        Yields:
+            tuple: A (name, tensor) pair where:
+                - name (``str``): The name/key of the tensor
+                - tensor (``torch.Tensor``): The tensor data on the specified device
+        
         Example:
-        ```python
-        from safetensors import safe_open
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     for name, tensor in f.tensors():
+            ...         print(f"{name}: {tensor.shape}, {tensor.dtype}")
+            ...         # Important: copy if storing for later use
+            ...         stored_tensor = tensor.clone()
 
-        with safe_open("model.safetensors", framework="pt", device=0) as f:
-            tensor = f.get_tensor("embedding")
-
-        ```
+        Warning:
+            The tensors returned by ``tensors()`` point to an internal buffer that
+            is reused during iteration. You must copy each tensor (e.g., using
+            ``.clone()`` or ``.copy_()``) if you need to use it after the current
+            iteration completes. Otherwise, the tensor data may be overwritten by
+            subsequent iterations, leading to incorrect results.
         """
-        # Since we gradually free old tensors in the buffer, we need to synchronize here to ensure the data transfer is finished on GPU.
-        # TODO: Do we really need this?
-        # NOTE: This synchronization seems to make the performance a little bit better, but the reason is not clear.
-        stream = torch.cuda.current_stream()
-        stream.synchronize()
-        tensor_index = self.key_to_index[name]
-        assert tensor_index == self.expect_index, f"get_tensor() should be called in the order of tensor names returned by keys()" 
-        self.expect_index += 1
-        shape = self.ordered_key_values[tensor_index][1]["shape"]
-        dtype = safetensors_dtype_to_torch_dtype(self.ordered_key_values[tensor_index][1]["dtype"])
-        tensor = instanttensor._C.get_tensor(self.loader_handle, tensor_index, shape, dtype)
-        if tensor.data_ptr() % tensor.element_size() != 0:
-            raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {dtype} size {tensor.element_size()}B")
+        if self.iterated:
+            raise RuntimeError("tensors() can only be called once")
+        self.iterated = True
+        for tensor_index, (name, metadata) in enumerate(self.ordered_tensor_metadatas):
+            stream = torch.cuda.current_stream()
+            stream.synchronize()
+            shape = metadata["shape"]
+            dtype = safetensors_dtype_to_torch_dtype(metadata["dtype"])
+            tensor = instanttensor._C.get_tensor(self.loader_handle, tensor_index, shape, dtype)
+            if tensor.data_ptr() % tensor.element_size() != 0:
+                raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {dtype} size {tensor.element_size()}B")
+            yield name, tensor
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        """Get a specific tensor by name from the safetensors file(s).
+        
+        This method provides compatibility with the safetensors library API.
+        It retrieves a single tensor by its name. Random access is not supported;
+        tensors must be retrieved sequentially in the order returned by keys().
+        
+        Note:
+            It is recommended to use ``tensors()`` directly instead of this method.
+        
+        Args:
+            name: The name/key of the tensor to retrieve. Must match the next
+                tensor name in the sequence returned by keys().
+        
+        Returns:
+            The tensor as a ``torch.Tensor`` on the specified device. The tensor
+            points to an internal buffer and should be copied (using ``.clone()`` 
+            or ``.copy_()``) if used outside the current iteration.
+        
+        Raises:
+            ValueError: If the requested tensor name does not match the expected
+                name (i.e., tensors are not retrieved in the order returned by
+                ``keys()``).
+        
+        Example:
+            Compatible usage with safetensors API:
+            
+            >>> from instanttensor import safe_open
+            >>> 
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     # Must get tensors in the exact order returned by keys()
+            ...     for key in f.keys():
+            ...         tensor = f.get_tensor(key)
+            ...         # Important: copy the tensor if storing for later use
+            ...         stored_tensor = tensor.clone()
+            ...         print(f"{key}: {stored_tensor.shape}")
+        
+        Warning:
+            Tensors must be retrieved in the exact order returned by ``keys()``.
+            Calling ``get_tensor()`` with a name that doesn't match the next expected
+            tensor will raise a ``ValueError``.
+        """
+        if self.tmp_generator is None:
+            self.tmp_generator = self.tensors()
+        expect_name, tensor = next(self.tmp_generator)
+        if name != expect_name:
+            raise ValueError(f"get_tensor() should be called in the order of tensor names returned by keys()")
         return tensor
 
-    def keys(self):
-        """
-        Returns the names of the tensors in the file.
-
+    def keys(self) -> List[str]:
+        """Get the names of all tensors in the safetensors file(s).
+        
+        This is an alias for ``offset_keys()`` that returns tensor names in the
+        order they appear in the file (by offset).
+        
         Returns:
-            (`List[str]`):
-                The name of the tensors contained in that file
+            A list of tensor names (keys) in the order they appear in the file.
+        
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     tensor_names = f.keys()
+            ...     print(f"Found {len(tensor_names)} tensors")
+            ...     for name in tensor_names:
+            ...         tensor = f.get_tensor(name)
         """
         return self.offset_keys()
 
-    def metadata(self):
-        """
-        Return the special non tensor information in the header
-
+    def metadata(self) -> dict:
+        """Get the file-level metadata from the safetensors file(s).
+        
+        This method returns the special non-tensor information stored in the
+        safetensors file header (under the ``"__metadata__"`` key).
+        
         Returns:
-            (`Dict[str, str]`):
-                The freeform metadata.
+            A dictionary containing file-level metadata, or ``None`` if no
+            metadata is present in the file.
+        
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     meta = f.metadata()
+            ...     if meta:
+            ...         print(f"Model version: {meta.get('version', 'unknown')}")
         """
-        return self.file_metadata
+        return dict(self.file_metadata)
 
-    def offset_keys(self):
-        """
-        Returns the names of the tensors in the file, ordered by offset.
-
+    def offset_keys(self) -> List[str]:
+        """Get the names of all tensors, ordered by their offset in the file.
+        
+        This method returns tensor names in the order they appear in the
+        safetensors file(s), sorted by their data offset. This is the order
+        in which tensors should be retrieved using ``get_tensor()`` for optimal
+        performance.
+        
         Returns:
-            (`List[str]`):
-                The name of the tensors contained in that file
+            A list of tensor names (keys) ordered by their data offset in
+            the file(s).
+        
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     # Get keys in offset order
+            ...     keys = f.offset_keys()
+            ...     for key in keys:
+            ...         tensor = f.get_tensor(key)  # Must be in this order
         """
-        return [key for key, _ in self.ordered_key_values]
+        return [key for key, _ in self.ordered_tensor_metadatas]
+
+    def get_tensor_metadata(self, name: str) -> tuple[torch.dtype, torch.Size]: # dtype and shape
+        """Get the metadata (dtype and shape) of a specific tensor by name from the safetensors file(s).
+        
+        This method provides compatibility with the safetensors library API.
+        It retrieves the metadata of a single tensor by its name.
+        
+        Args:
+            name: The name/key of the tensor to retrieve metadata for.
+        
+        Returns:
+            A tuple containing the dtype and shape of the tensor.
+        """
+        tensor_metadata = self.ordered_tensor_metadatas[self.tensor_name_to_index[name]][1]
+        return safetensors_dtype_to_torch_dtype(tensor_metadata["dtype"]), torch.Size(tensor_metadata["shape"])

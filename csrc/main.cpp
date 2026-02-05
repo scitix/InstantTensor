@@ -387,7 +387,7 @@ public:
     size_t thread_alignment = 0;
     size_t rank_alignment = 0;
     size_t world_alignment = 0;
-    size_t first_tensor_alignment = 16; // must >= sizeof(dtype) for any dtype, torch.complex128.itemsize == 16
+    const size_t first_tensor_alignment = 16; // must >= sizeof(dtype) for any dtype, torch.complex128.itemsize == 16
     // NOTE: Never use cudaHostRegisterReadOnly for a host-writable buffer.
     //       cudaHostRegisterReadOnly should only be used for mapped weight memory.
     // NOTE: cudaHostRegisterMapped can be automatically determined.
@@ -693,7 +693,7 @@ public:
         size_t chunk_file_index = 0;
         size_t chunk_file_offset = 0; // The chunk offset from the beginning of the file, aligned to thread_alignment (typically == PAGE_SIZE)
         size_t chunk_device_buffer_offset = 0; // TODO: rename. The chunk offset from the beginning of the device buffers, aligned to world_chunk_alignment
-        size_t unchunked_file_size = 0;
+        size_t current_chunk_size = 0;
         size_t tensor_id = 0;
         size_t in_buffer_tensor_id = 0;
         size_t left_most_tensor_id = 0;
@@ -703,24 +703,22 @@ public:
 
         auto tensor_device_buffer_offset = [&](size_t tensor_file_offset) -> size_t {// TODO: rename
             return tensor_file_offset - chunk_file_offset + chunk_device_buffer_offset;
-            // tensor_file_offset - chunk_file_offset == unchunked_file_size
+            // tensor_file_offset - chunk_file_offset == current_chunk_size
         };
 
-        auto finish_chunk = [&](size_t chunk_size) {
-            if(chunk_size > 0) {
-                if(unchunked_file_size < chunk_size) {
-                    throw std::runtime_error("Internal error: Unchunked size is smaller than the chunk size.");
-                }
+        auto finish_chunk = [&]() {
+            if(current_chunk_size > 0) {
                 // ROUND_UP/DOWN make real effect only at the right most chunk
-                this->chunks.push_back(Chunk{chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}, {}});
+                this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}, {}});
 
                 if(chunk_file_offset % this->thread_alignment != 0) {
                     throw std::runtime_error("Internal error: Chunk alignment error.");
                 }
 
-                chunk_file_offset += ROUND_DOWN(chunk_size, this->thread_alignment);// may reread the last file page
-                chunk_device_buffer_offset += ROUND_UP(chunk_size, this->world_chunk_alignment); 
-                unchunked_file_size -= ROUND_DOWN(chunk_size, this->thread_alignment); // "-= chunk_size" and then "+= left_padding"
+                chunk_file_offset += ROUND_DOWN(current_chunk_size, this->thread_alignment);// may reread the last file page
+                chunk_device_buffer_offset += ROUND_UP(current_chunk_size, this->world_chunk_alignment); 
+                // current_chunk_size -= ROUND_DOWN(current_chunk_size, this->thread_alignment); // "-= chunk_size" and then "+= left_padding"
+                current_chunk_size %= this->thread_alignment;
 
                 chunk_id_t prev_chunk_id = (chunk_id_t)this->chunks.size() - 2;
                 while(in_buffer_tensor_id < left_most_tensor_id 
@@ -731,7 +729,7 @@ public:
             }
         };
         auto reset_chunk_buffer_offset = [&](size_t new_left_most_tensor_id) {
-            if(unchunked_file_size >= this->thread_alignment) {
+            if(current_chunk_size >= this->thread_alignment) {
                 print_and_throw(std::runtime_error("Internal error: Unchunked page detected when resetting chunk buffer offset."));
             }
             chunk_id_t latest_chunk_id = (chunk_id_t)this->chunks.size() - 1;
@@ -739,17 +737,17 @@ public:
                 this->tensors[in_buffer_tensor_id].prefetch_chunk_id = latest_chunk_id;
                 in_buffer_tensor_id++;
             }
-            chunk_device_buffer_offset = this->first_tensor_alignment - unchunked_file_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
+            chunk_device_buffer_offset = this->first_tensor_alignment - current_chunk_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
             left_most_tensor_id = new_left_most_tensor_id;
         };
         auto reset_chunk_file = [&](size_t file_index, size_t file_offset) {
-            if(unchunked_file_size >= this->thread_alignment) {
+            if(current_chunk_size >= this->thread_alignment) {
                 print_and_throw(std::runtime_error("Internal error: Unchunked page detected when resetting chunk file offset."));
             }
             chunk_file_index = file_index;
             chunk_file_offset = ROUND_DOWN(file_offset, this->thread_alignment);
-            unchunked_file_size = file_offset % this->thread_alignment;
-            chunk_device_buffer_offset = ROUND_UP(chunk_device_buffer_offset, this->first_tensor_alignment) + this->first_tensor_alignment - unchunked_file_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
+            current_chunk_size = file_offset % this->thread_alignment;
+            chunk_device_buffer_offset = ROUND_UP(chunk_device_buffer_offset, this->first_tensor_alignment) + this->first_tensor_alignment - current_chunk_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
         };
 
 
@@ -761,33 +759,40 @@ public:
             size_t next_file_index = tensor_offsets[i + 1].first;
             size_t next_tensor_offset = tensor_offsets[i + 1].second;
             if (file_index != next_file_index) {
-                finish_chunk(unchunked_file_size);
+                finish_chunk();
                 reset_chunk_file(next_file_index, next_tensor_offset);
                 continue;
             }
-            if(unchunked_file_size != tensor_file_offset - chunk_file_offset) {
+            if(current_chunk_size != tensor_file_offset - chunk_file_offset) {
                 throw std::runtime_error("Internal error: Unchunked file size mismatch.");
             }
             size_t tensor_size = next_tensor_offset - tensor_file_offset;
             if (tensor_size > this->buffer_size) {
                 print_and_throw(std::runtime_error("Internal error: Buffer size is smaller than a single tensor size. This should be forbidden by the python frontend."));
             }
-            if (chunk_device_buffer_offset + ROUND_UP(unchunked_file_size + tensor_size, this->world_chunk_alignment) > this->buffer_size) {
-                finish_chunk(unchunked_file_size);
+            if (chunk_device_buffer_offset + ROUND_UP(current_chunk_size + tensor_size, this->world_chunk_alignment) > this->buffer_size) {
+                finish_chunk();
                 reset_chunk_buffer_offset(tensor_id);
                 // place the tensor at the beginning of the buffer
             }
             size_t _tensor_device_buffer_offset = tensor_device_buffer_offset(tensor_file_offset);
-            unchunked_file_size += tensor_size;
-            while (unchunked_file_size > this->world_chunk_size) {
-                finish_chunk(this->world_chunk_size);
+            size_t tensor_size_left = tensor_size;
+            while(current_chunk_size + tensor_size_left > this->world_chunk_size) {
+                size_t size_add = this->world_chunk_size - current_chunk_size;
+                current_chunk_size += size_add;
+                tensor_size_left -= size_add;
+                finish_chunk();
             }
+            current_chunk_size += tensor_size_left;
+            // while (current_chunk_size > this->world_chunk_size) {
+            //     finish_chunk(this->world_chunk_size);
+            // }
             chunk_id_t current_chunk_id = (chunk_id_t)this->chunks.size();
             this->tensors[tensor_id] = TensorMetadate{tensor_size, file_index, tensor_file_offset, _tensor_device_buffer_offset, current_chunk_id, 0};
 
             tensor_id ++;
         }
-        finish_chunk(unchunked_file_size);
+        finish_chunk();
         reset_chunk_buffer_offset(tensor_id);// set prefetch_chunk_id of the second-to-last layer tensors to the last chunk
         reset_chunk_buffer_offset(tensor_id);// set prefetch_chunk_id of the last layer tensors to the last chunk
 
