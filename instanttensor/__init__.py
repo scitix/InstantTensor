@@ -1,1 +1,1 @@
-from .safe_open_impl import safe_open, init
+from ._impl import safe_open

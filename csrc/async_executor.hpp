@@ -1,7 +1,6 @@
-// executor.hpp
 #pragma once
 
-#include "queue.hpp"            // your SPSCQueue<T>
+#include "queue.hpp"
 #include <any>
 #include <atomic>
 #include <functional>
@@ -25,13 +24,10 @@ public:
         join();
     }
 
-    // Post any callable F that returns U; we wrap its result into an std::any
     template<typename F>
     int post(F&& f) {
-        // allocate a unique id
         int id = next_id.fetch_add(1, std::memory_order_relaxed);
 
-        // wrap f() → std::any
         Task t = [fn = std::forward<F>(f)]() mutable -> std::any {
             using R = std::invoke_result_t<decltype(fn)>;
             if constexpr (std::is_void_v<R>) {
@@ -45,7 +41,6 @@ public:
 
         WorkItem w{id, std::move(t)};
 
-        // try to enqueue; if input_queue is full, drain output_queue to help
         while (!input_queue.try_push(w)) {
             drainOutputQueueToBuffer();
             std::this_thread::yield();
@@ -88,7 +83,6 @@ public:
         return drainOutputQueueUntil(req_id, out);
     }
 
-    // Pop into caller-supplied std::any; blocks (via yield-loop) until ready
     template<typename R>
     void pop(int req_id, R& out) {
         std::any res;
@@ -97,7 +91,6 @@ public:
     }
 
     void pop(int req_id, std::any& out) {
-        // 1) check buffered out-of-order results
         auto it = result_buffer.find(req_id);
         if (it != result_buffer.end()) {
             out = std::move(it->second);
@@ -105,7 +98,6 @@ public:
             return;
         }
 
-        // 2) spin on output_queue
         while(true) {
             bool finished = drainOutputQueueUntil(req_id, out);
             if(finished) return;
@@ -118,7 +110,6 @@ public:
         pop(req_id, out);
     }
 
-    // Signal the worker to stop
     void stopAsync() {
         WorkItem w{0, Task()};  // id==0 is the sentinel
         while (!input_queue.try_push(w)) {
@@ -127,7 +118,6 @@ public:
         }
     }
 
-    // Join the worker
     void join() {
         if (worker.joinable()) {
             stopAsync();
@@ -143,30 +133,25 @@ private:
 
     using WorkPair  = std::pair<int,std::any>;
 
-    SPSCQueue<WorkItem, InputQueueCapacity>      input_queue;     // main → worker
-    SPSCQueue<WorkPair, OutputQueueCapacity>      output_queue;    // worker → main
-    std::unordered_map<int,std::any> result_buffer; // cache out-of-order
+    SPSCQueue<WorkItem, InputQueueCapacity>      input_queue;
+    SPSCQueue<WorkPair, OutputQueueCapacity>      output_queue;
+    std::unordered_map<int,std::any> result_buffer; // cache out-of-order results
 
     std::atomic<int>         next_id;
     std::thread              worker;
 
-    // The worker thread main loop
     void run() {
         WorkItem w;
         while (true) {
-            // pop next work (spin if empty)
             while (!input_queue.try_pop(w)) {
                 std::this_thread::yield();
             }
             if (!w.task) {
-                // empty task => shutdown
                 break;
             }
 
-            // execute and wrap into std::any
             std::any res = w.task();
 
-            // push into output; spin if full
             WorkPair pr{w.id, std::move(res)};
             while (!output_queue.try_push(pr)) {
                 std::this_thread::yield();
@@ -182,6 +167,8 @@ private:
         }
     }
 
+    // Drain everything from output_queue into result_buffer
+    // Early return if the expected result of req_id is found
     bool drainOutputQueueUntil(int req_id, std::any& out) {
         WorkPair pr;
         while (output_queue.try_pop(pr)) {

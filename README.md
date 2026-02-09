@@ -2,12 +2,14 @@
 
 InstantTensor is an **ultra-fast, distributed Safetensors loader** designed to maximize I/O throughput when moving model weights from Safetensors files to GPU memory.
 
-| Model | #GPUs | Backend | Load Time (s) | Throughput (GB/s) | Speedup |
+**Model loading benchmark on inference engines:**
+
+| Model | GPU | Backend | Load Time (s) | Throughput (GB/s) | Speedup |
 |---|---:|---|---:|---:|---|
-| Qwen3-30B-A3B | 1 | Safetensors | TBD | TBD | 1.0 |
-| Qwen3-30B-A3B | 1 | InstantTensor | TBD | TBD | <span style="color: green">**Ax**</span> |
-| DeepSeek-R1 | 8 | Safetensors | TBD | TBD | 1.0 |
-| DeepSeek-R1 | 8 | InstantTensor | TBD | TBD | <span style="color: green">**Ax**</span> |
+| Qwen3-30B-A3B | 1*H20 | Safetensors   | 574  | 1.2 | 1x |
+| Qwen3-30B-A3B | 1*H20 | InstantTensor | 17.7 | 39  | <span style="color: green">**32.5x**</span> |
+| DeepSeek-R1   | 8*H20 | Safetensors   | 109  | 4.3 | 1x |
+| DeepSeek-R1   | 8*H20 | InstantTensor | 10.4 | 45  | <span style="color: green">**10.5x**</span> |
 
 ### Quickstart
 
@@ -135,7 +137,7 @@ InstantTensor uses a few environment variables to select I/O strategies:
 
 See [Build API reference](./docs/build_doc.md)
 
-## Benchmark
+<!-- ## Benchmark -->
 
 <!-- ## Roadmap
 

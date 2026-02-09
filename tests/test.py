@@ -192,7 +192,7 @@ def distributed_load():
         buffer_device = f'cuda:{local_rank}'
     
     if backend == 'instanttensor':
-        instanttensor.init() # can be commented out
+        instanttensor._impl.init() # can be commented out
         # NOTE: process_group can be the world group or a sub-group, 
         #       each group loads tensors independently. 
         #       Typically, we use the world group to maximize concurrency and avoid redundant loading.

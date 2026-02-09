@@ -1,23 +1,34 @@
+import os 
 import time
 import json
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C
-from typing import Union, List, Generator
+from typing import Union, Generator
 import threading
-import io
-
 import atexit
-import os 
 
-# Register cleanup function, but handle the case where _C might not be available
-# (e.g., during documentation generation with autodoc_mock_imports)
+
 try:
     atexit.register(instanttensor._C.cleanup)
 except AttributeError:
     # _C module is mocked (e.g., during Sphinx documentation build)
     print("instanttensor._C is mocked, skipping cleanup registration")
 
+_instanttensor_debug = None
+_instanttensor_use_cufile = None
+
+def instanttensor_debug():
+    global _instanttensor_debug
+    if _instanttensor_debug is None:
+        _instanttensor_debug = os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
+    return _instanttensor_debug
+
+def instanttensor_use_cufile():
+    global _instanttensor_use_cufile
+    if _instanttensor_use_cufile is None:
+        _instanttensor_use_cufile = os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
+    return _instanttensor_use_cufile
 
 def safetensors_dtype_to_torch_dtype(dtype: str) -> torch.dtype:
     """Convert a safetensors dtype string to the corresponding PyTorch dtype.
@@ -159,12 +170,12 @@ class safe_open:
     
     Args:
         filename: The filename(s) to open. Can be a single file path (``str``) or
-            a list of file paths (``List[str]``) for multi-file loading. When
+            a list of file paths (``list[str]``) for multi-file loading. When
             multiple files are provided, they are automatically sorted. Providing
             all files in a single list has better performance than calling 
             ``safe_open`` multiple times.
         framework: The framework you want tensors in. Currently only ``"pt"``
-            (PyTorch) is supported. Defaults to ``"pt"``.
+            (PyTorch) is supported.
         device: The device on which you want the tensors. Must be a CUDA device.
             Can be specified as an ``int`` (device ID), ``str`` (e.g., ``"cuda:0"``), or
             ``torch.device`` object.
@@ -221,7 +232,7 @@ class safe_open:
         ...     for name, tensor in f.tensors():
         ...         tensors[name] = tensor.clone()
     """
-    def __init__(self, filename: Union[str, List[str]], framework: str, 
+    def __init__(self, filename: Union[str, list[str]], framework: str, 
             device: Union[int, str, torch.device], process_group=None, 
             buffer_size=None, chunk_size=None, concurrency=None, load_now=True):
         """Initialize the safe_open context manager.
@@ -247,11 +258,11 @@ class safe_open:
                 concurrency = max(min(32, os.cpu_count()) // self.world_size, 1)
             io_depth = 3 # memcpy + cudaMemcpyAsync + ncclAllGather
         else:
-            if os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1":
+            if instanttensor_use_cufile():
                 if chunk_size is None:
                     chunk_size = 4*1024*1024
                 if concurrency is None:
-                    # OK if os.cpu_count() < 64 since threads are blocked by cuFileRead
+                    # Since these are all IO-intensive threads, using more threads than CPU cores is acceptable
                     concurrency = max(64 // self.world_size, 1) 
                 io_depth = 2 # cuFileRead + ncclAllGather
             else: # aio
@@ -275,6 +286,7 @@ class safe_open:
         self.concurrency = concurrency
         self.io_depth = io_depth
         self.loader_handle = None
+        self.distributed_metadata_read = False
 
         self.ordered_tensor_metadatas = []
         self.tensor_offsets = []
@@ -287,14 +299,11 @@ class safe_open:
             # Even set async_op=True, the first call may still block to initialize ncclComm_t
             # Most of the time is spent on NCCL initialization rather than on the all_reduce itself.
             dist.all_reduce(torch.zeros(1, device=self.device), group=self.process_group) 
-            # sync_work.wait()
             # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
 
         self.meta_read_time = time.perf_counter()
 
-        # t0 = time.perf_counter()
         meta_read_results = self._read_metadata()
-        # print(f"Time: read_safetensors_metadata = {time.perf_counter() - t0:.2f}s")
 
         self.file_metadata = None
         for f_idx, f in enumerate(self.filename):
@@ -338,15 +347,16 @@ class safe_open:
         meta_read_threads = []
         meta_read_results = [None] * len(self.filename)
 
-        # print(f"world_size = {self.world_size}, rank = {self.rank}")
-
-        # meta_read_start = len(self.filename) // self.world_size * self.rank + min(self.rank, len(self.filename) % self.world_size)
-        # meta_read_cnt = len(self.filename) // self.world_size + int(self.rank < len(self.filename) % self.world_size)
-        # meta_read_end = meta_read_start + meta_read_cnt
-        meta_read_start = 0 
-        meta_read_end = len(self.filename)
-
-        # print(f"meta_read = {meta_read_start}-{meta_read_end}")
+        if self.distributed_metadata_read: # slower due to all_gather
+            print(f"world_size = {self.world_size}, rank = {self.rank}")
+            meta_read_start = len(self.filename) // self.world_size * self.rank + min(self.rank, len(self.filename) % self.world_size)
+            meta_read_cnt = len(self.filename) // self.world_size + int(self.rank < len(self.filename) % self.world_size)
+            meta_read_end = meta_read_start + meta_read_cnt
+            print(f"meta_read = {meta_read_start}-{meta_read_end}")
+        else:
+            meta_read_start = 0 
+            meta_read_end = len(self.filename)
+        
         for f_idx, f in list(enumerate(self.filename))[meta_read_start:meta_read_end]:
             def read_safetensors_metadata_wrapper(f, result_idx):
                 meta_read_results[result_idx] = read_safetensors_metadata(f)
@@ -359,54 +369,19 @@ class safe_open:
             t.join()
 
         
-        # if self.world_size > 1:
-        #     tmp = [None for _ in range(self.world_size)]
-        #     # import pickle
-        #     # print(len(pickle.dumps(meta_read_results[meta_read_start:meta_read_end])))
-        #     t0 = time.perf_counter()
-        #     dist.all_gather_object(tmp, meta_read_results[meta_read_start:meta_read_end], self.process_group)
-        #     t1 = time.perf_counter()
-        #     meta_read_results = [item for sublist in tmp for item in sublist]
-        #     print(f"Time: all_gather = {t1 - t0:.2f}s")
+        if self.distributed_metadata_read and self.world_size > 1:
+            tmp = [None for _ in range(self.world_size)]
+            # import pickle
+            # print(len(pickle.dumps(meta_read_results[meta_read_start:meta_read_end])))
+            t0 = time.perf_counter()
+            dist.all_gather_object(tmp, meta_read_results[meta_read_start:meta_read_end], self.process_group)
+            t1 = time.perf_counter()
+            meta_read_results = [item for sublist in tmp for item in sublist]
+            print(f"Time: all_gather = {t1 - t0:.2f}s")
 
         return meta_read_results
 
-    def _get_group_communicator(self):
-        group_constructor = None
-        group_communicator = None
-        group_rank = 0
-        group_world_size = 1
-        if self.process_group is not None:
-            group_rank = dist.get_rank(self.process_group)
-            group_world_size = dist.get_world_size(self.process_group)
-
-            # cache the nccl communicator since ncclCommInitRank and ncclCommDestroy are very slow
-            if group_world_size > 1:
-                if self.process_group in group_communicator_cache:
-                    group_communicator = group_communicator_cache[self.process_group]
-                else:
-                    if group_rank == 0:
-                        group_constructor = instanttensor._C.create_group_constructor()
-                        group_constructor_list = [group_constructor]
-                    else:
-                        group_constructor_list = [None]
-                    src_global_rank = dist.get_global_rank(self.process_group, 0)
-                    dist.broadcast_object_list(group_constructor_list, src=src_global_rank, group=self.process_group)
-                    group_constructor = group_constructor_list[0]
-                    with torch.cuda.device(self.device_idx): # Device should be set before calling ncclCommInitRank
-                        group_communicator = instanttensor._C.create_group_communicator(group_constructor, group_world_size, group_rank)
-                    group_communicator_cache[self.process_group] = group_communicator
-        return group_communicator, group_rank, group_world_size
-
     def _open(self):
-        # group_communicator, group_rank, group_world_size = self._get_group_communicator()
-        # # print(group_world_size, group_communicator)
-
-        # if dist.get_rank(self.process_group) == 0:
-        #     import pdb; pdb.set_trace()
-        # else:
-        #     while True:
-        #         time.sleep(1)
         self.open_time = time.perf_counter()
         self.loader_handle = instanttensor._C.open(
             self.filename, self.device_idx, self.process_group, self.buffer_size, 
@@ -431,8 +406,9 @@ class safe_open:
         open_time = self.enter_time - self.open_time
         load_time = self.exit_time - self.enter_time
         close_time = self.close_time - self.exit_time
-        print(f"Time: total={total_time:.2f}s, init={init_time:.2f}s, sync={sync_time:.2f}s, meta_read={meta_read_time:.2f}s, open={open_time:.2f}s, load={load_time:.2f}s, close={close_time:.2f}s")
-        print(f"Throughput: total={self.total_tensor_size * 1e-9 / total_time:.2f}GB/s, load={self.total_tensor_size * 1e-9 / load_time:.2f}GB/s")
+        if instanttensor_debug():
+            print(f"Time: total={total_time:.2f}s, init={init_time:.2f}s, sync={sync_time:.2f}s, meta_read={meta_read_time:.2f}s, open={open_time:.2f}s, load={load_time:.2f}s, close={close_time:.2f}s")
+            print(f"Throughput: total={self.total_tensor_size * 1e-9 / total_time:.2f}GB/s, load={self.total_tensor_size * 1e-9 / load_time:.2f}GB/s")
 
     def tensors(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Iterate over all tensors in the safetensors file(s).
@@ -526,7 +502,7 @@ class safe_open:
             raise ValueError(f"get_tensor() should be called in the order of tensor names returned by keys()")
         return tensor
 
-    def keys(self) -> List[str]:
+    def keys(self) -> list[str]:
         """Get the names of all tensors in the safetensors file(s).
         
         This is an alias for ``offset_keys()`` that returns tensor names in the
@@ -562,7 +538,7 @@ class safe_open:
         """
         return dict(self.file_metadata)
 
-    def offset_keys(self) -> List[str]:
+    def offset_keys(self) -> list[str]:
         """Get the names of all tensors, ordered by their offset in the file.
         
         This method returns tensor names in the order they appear in the
@@ -583,7 +559,7 @@ class safe_open:
         """
         return [key for key, _ in self.ordered_tensor_metadatas]
 
-    def get_tensor_metadata(self, name: str) -> tuple[torch.dtype, torch.Size]: # dtype and shape
+    def get_tensor_metadata(self, name: str) -> tuple[torch.dtype, torch.Size]:
         """Get the metadata (dtype and shape) of a specific tensor by name from the safetensors file(s).
         
         This method provides compatibility with the safetensors library API.
