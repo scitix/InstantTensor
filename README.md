@@ -144,6 +144,6 @@ See [Build API reference](./docs/build_doc.md)
 - **Supporting loading to CPU**: E.g., CPU inference.
 - **Improving scalability**: E.g., Collective loading on 32+ GPUs. -->
 
-## Contributing
+## Thanks
 
-PRs are welcome!
+Thanks to the AI Systems and Optimization team at ScitiX AI and the Wenfei Wu Lab at Peking University.
