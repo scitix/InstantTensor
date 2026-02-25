@@ -6,8 +6,8 @@ InstantTensor is an **ultra-fast, distributed Safetensors loader** designed to m
 
 | Model | GPU | Backend | Load Time (s) | Throughput (GB/s) | Speedup |
 |---|---:|---|---:|---:|---|
-| Qwen3-30B-A3B | 1*H20 | Safetensors   | 574  | 1.2 | 1x |
-| Qwen3-30B-A3B | 1*H20 | InstantTensor | 17.7 | 39  | <span style="color: green">**32.5x**</span> |
+| Qwen3-30B-A3B | 1*H20 | Safetensors   | 57.4  | 1.2 | 1x |
+| Qwen3-30B-A3B | 1*H20 | InstantTensor | 1.77 | 39  | <span style="color: green">**32.5x**</span> |
 | DeepSeek-R1   | 8*H20 | Safetensors   | 109  | 4.3 | 1x |
 | DeepSeek-R1   | 8*H20 | InstantTensor | 10.4 | 45  | <span style="color: green">**10.5x**</span> |
 
@@ -22,7 +22,7 @@ with safe_open("model.safetensors", framework="pt", device=0) as f:
         tensors[name] = tensor.clone()
 ```
 
-> **NOTE:** `tensor` points to the internal buffer of InstantTensor and should be copied immediately (e.g. by clone() or copy_()) to use it outside the loop.
+> **NOTE:** `tensor` points to the internal buffer of InstantTensor and should be copied immediately (e.g. by clone() or copy_()) to avoid data being overwritten during buffer reuse.
 
 See [Usage](#usage) for more details (multi-file and distributed usage).
 
@@ -73,7 +73,7 @@ For Ubuntu/Debian with CUDA pre-installed, the typical installation steps are as
 
 ## Usage
 
-### Loading multiple files at once (recommended)
+### Multi-file mode (recommended)
 
 Passing a list of files allows the backend to plan reads and provides higher throughput than making multiple calls to load single files:
 

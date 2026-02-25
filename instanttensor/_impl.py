@@ -454,10 +454,9 @@ class safe_open:
             yield name, tensor
 
     def get_tensor(self, name: str) -> torch.Tensor:
-        """Get a specific tensor by name from the safetensors file(s).
+        """Safetensors-compatible API: get a specific tensor by name from the safetensors file(s).
         
-        This method provides compatibility with the safetensors library API.
-        It retrieves a single tensor by its name. Random access is not supported;
+        This method retrieves a single tensor by its name. Random access is not supported;
         tensors must be retrieved sequentially in the order returned by keys().
         
         Note:
@@ -503,7 +502,7 @@ class safe_open:
         return tensor
 
     def keys(self) -> list[str]:
-        """Get the names of all tensors in the safetensors file(s).
+        """Safetensors-compatible API: get the names of all tensors in the safetensors file(s).
         
         This is an alias for ``offset_keys()`` that returns tensor names in the
         order they appear in the file (by offset).
@@ -521,7 +520,7 @@ class safe_open:
         return self.offset_keys()
 
     def metadata(self) -> dict:
-        """Get the file-level metadata from the safetensors file(s).
+        """Safetensors-compatible API: get the file-level metadata from the safetensors file(s).
         
         This method returns the special non-tensor information stored in the
         safetensors file header (under the ``"__metadata__"`` key).
@@ -534,12 +533,12 @@ class safe_open:
             >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
             ...     meta = f.metadata()
             ...     if meta:
-            ...         print(f"Model version: {meta.get('version', 'unknown')}")
+            ...         print(f"File format: {meta.get('format', 'pt')}")
         """
         return dict(self.file_metadata)
 
     def offset_keys(self) -> list[str]:
-        """Get the names of all tensors, ordered by their offset in the file.
+        """Safetensors-compatible API: get the names of all tensors, ordered by their offset in the file.
         
         This method returns tensor names in the order they appear in the
         safetensors file(s), sorted by their data offset. This is the order
@@ -570,6 +569,13 @@ class safe_open:
         
         Returns:
             A tuple containing the dtype and shape of the tensor.
+
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     tensor_names = f.keys()
+            ...     for name in tensor_names:
+            ...         dtype, shape = f.get_tensor_metadata(name)
+            ...         print(f"Tensor {name} has dtype {dtype} and shape {shape}")
         """
         tensor_metadata = self.ordered_tensor_metadatas[self.tensor_name_to_index[name]][1]
         return safetensors_dtype_to_torch_dtype(tensor_metadata["dtype"]), torch.Size(tensor_metadata["shape"])
