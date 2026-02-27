@@ -1,38 +1,44 @@
 #!/usr/bin/env python
 import os
 from setuptools import setup
-import torch
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension # CppExtension
 
-# optionally read these from env or conda if you need custom CUDA
-# but BuildExtension will auto-discover them in most cases.
-# CUDA_HOME = os.environ.get('CUDA_HOME', None)
+# extra_link_args = [
+#     "-Wl,-rpath,$ORIGIN/../torch/lib",
+#     "-Wl,-rpath,$ORIGIN/../nvidia/cuda_runtime/lib",
+# ]
 
-conda_prefix = os.environ.get('CONDA_PREFIX', None) or os.sys.prefix
-conda_lib    = os.path.join(conda_prefix, 'lib')
+def get_ext_modules():
+    try:
+        from torch.utils.cpp_extension import CUDAExtension
+    except Exception as e:
+        raise RuntimeError(
+            "Building instanttensor requires PyTorch installed in the current environment.\n"
+            "Please run:\n"
+            "  pip install torch\n"
+            "  pip install --no-build-isolation .\n"
+        ) from e
 
-if os.environ.get('DEBUG', '0') == '1':
-    optimization_args = ['-g', '-O0']
-else:
-    optimization_args = []
+    debug = os.environ.get("DEBUG", "0") == "1"
+    cxx_flags = ["-std=c++17", "-DUSE_C10D_NCCL"]
+    cxx_flags += ["-O0", "-g"] if debug else [] # use defualt optimization level
+
+    ext = CUDAExtension( # CUDA related headers and libraries are automatically provided
+        name="instanttensor._C",
+        sources=["csrc/main.cpp"],
+        include_dirs=["csrc"],
+        library_dirs=[],
+        libraries=["aio"],  # libaio from system
+        extra_compile_args={"cxx": cxx_flags, "nvcc": []},
+        # extra_link_args=extra_link_args,
+        runtime_library_dirs=["$ORIGIN/../torch/lib", "$ORIGIN/../nvidia/cuda_runtime/lib"],  # same rpath policy as PyTorch
+    )
+    return [ext]
+
+def get_cmdclass():
+    from torch.utils.cpp_extension import BuildExtension
+    return {"build_ext": BuildExtension}
 
 setup(
-    name='instanttensor',
-    version='0.1',
-    ext_modules=[
-        CUDAExtension(
-            name='instanttensor._C',
-            sources=['csrc/main.cpp',],
-            include_dirs=['csrc/',],
-            libraries=['aio'], # 'uring', 'numa'
-            library_dirs=[conda_lib], # prefer to use conda lib instead of global lib at compile time
-            runtime_library_dirs=[conda_lib], # prefer to use conda lib instead of global lib at runtime
-            # you can override arch or add flags here:
-            extra_compile_args=['-DUSE_C10D_NCCL'] + optimization_args,
-            # link cuda runtime explicitly (BuildExtension will handle this too)
-        )
-    ],
-    cmdclass={
-        'build_ext': BuildExtension
-    },
+    ext_modules=get_ext_modules(),
+    cmdclass=get_cmdclass(),
 )

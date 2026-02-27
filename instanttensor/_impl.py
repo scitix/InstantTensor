@@ -327,7 +327,12 @@ class safe_open:
 
         if self.buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
-            recommended_buffer_size = max(tensor_sizes[i]+2*tensor_sizes[i+1] for i in range(len(tensor_sizes) - 1))
+            if len(tensor_sizes) >= 2:
+                recommended_buffer_size = max(tensor_sizes[i]+2*tensor_sizes[i+1] for i in range(len(tensor_sizes) - 1))
+            elif len(tensor_sizes) == 1:
+                recommended_buffer_size = tensor_sizes[0]
+            else:
+                recommended_buffer_size = 4096 # avoid setting it to 0 to avoid potential issues
             self.buffer_size = recommended_buffer_size
         else:
             min_buffer_size = max(tensor_sizes)

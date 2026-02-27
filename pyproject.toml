@@ -2,8 +2,9 @@
 [build-system]
 requires = [
     "setuptools>=77.0.3,<80.0.0", 
-    "torch>=2.8.0" 
-    # pybind11 headers are contained in torch, so that we use consistent pybind11 version with torch
+    "wheel",
+    # Install with `pip install --no-build-isolation`: the build needs torch from the current environment.
+    # pybind11 headers are contained in torch
 ]
 build-backend = "setuptools.build_meta"
 

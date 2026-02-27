@@ -33,14 +33,13 @@ See [Usage](#usage) for more details (multi-file and distributed usage).
   - Tuned I/O size and concurrency: Maximize hardware throughput.
   - Pipelining and prefetching: Parallelize and overlap the various stages of transmission.
 - **Distributed loading**: Use `torch.distributed` (NCCL) to speed up loading under any parallelism policy (TP/PP/EP/CP/DP).
+- **Minimal device buffer**: ≤ ~3× largest-tensor size; far below single-file size.
 - **Multiple I/O backends**:
   - GPUDirect Storage
   - Legacy Storage
   - Memory-based Storage
 
 ## Installation
-
-### Build from source
 
 **Prerequisites**
 - **Linux**
@@ -70,6 +69,7 @@ For Ubuntu/Debian with CUDA pre-installed, the typical installation steps are as
     pip install --no-build-isolation .
     # For a debug build, set "DEBUG=1" before "pip"
     ```
+    > **NOTE:** If you reinstall PyTorch (upgrade or downgrade), reinstall InstantTensor afterward by `pip install --no-build-isolation .`
 
 ## Usage
 
