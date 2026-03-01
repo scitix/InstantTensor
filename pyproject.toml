@@ -1,10 +1,9 @@
 # consistent with vLLM v0.10.2
 [build-system]
 requires = [
-    "setuptools>=77.0.3,<80.0.0", 
+    "setuptools>=77.0.3,<80.0.0",
     "wheel",
-    # Install with `pip install --no-build-isolation`: the build needs torch from the current environment.
-    # pybind11 headers are contained in torch
+    "pybind11==2.13.6",
 ]
 build-backend = "setuptools.build_meta"
 

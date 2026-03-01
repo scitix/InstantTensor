@@ -2,10 +2,20 @@
 import os
 from setuptools import setup
 
-# extra_link_args = [
-#     "-Wl,-rpath,$ORIGIN/../torch/lib",
-#     "-Wl,-rpath,$ORIGIN/../nvidia/cuda_runtime/lib",
-# ]
+# setuptools requires paths relative to setup.py directory, /-separated (no absolute paths)
+runtime_library_dirs = [
+    "$ORIGIN/../nvidia/cuda_runtime/lib",
+    "$ORIGIN/../nvidia/nccl/lib",
+    "$ORIGIN/../nvidia/cufile/lib",
+]
+
+root_path = os.path.dirname(os.path.abspath(__file__))
+
+include_dirs = [
+    f"{root_path}/csrc",
+    f"{root_path}/csrc/third_party/boost/include",
+    f"{root_path}/csrc/third_party/dlpack/include",
+]
 
 def get_ext_modules():
     try:
@@ -24,13 +34,13 @@ def get_ext_modules():
 
     ext = CUDAExtension( # CUDA related headers and libraries are automatically provided
         name="instanttensor._C",
-        sources=["csrc/main.cpp"],
-        include_dirs=["csrc"],
+        sources=["csrc/main.cpp"], # always relative to setup.py
+        include_dirs=include_dirs, # should be absolute paths
         library_dirs=[],
-        libraries=["aio"],  # libaio from system
+        libraries=["aio", "cudart", "nccl", "cufile"],  # libaio from system
         extra_compile_args={"cxx": cxx_flags, "nvcc": []},
         # extra_link_args=extra_link_args,
-        runtime_library_dirs=["$ORIGIN/../torch/lib", "$ORIGIN/../nvidia/cuda_runtime/lib"],  # same rpath policy as PyTorch
+        runtime_library_dirs=runtime_library_dirs,  # same rpath policy as PyTorch
     )
     return [ext]
 

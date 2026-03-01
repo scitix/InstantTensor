@@ -1,11 +1,5 @@
-#include <torch/extension.h>
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-// requires compile flag -DUSE_C10D_NCCL to include ProcessGroupNCCL.hpp
-#include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
-#include <c10/util/intrusive_ptr.h>
-#include <pybind11/pybind11.h> // use pybind11 provided by torch
+#include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/detail/type_caster_base.h>
 
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -16,8 +10,9 @@
 #include <sys/mman.h>
 #include <sys/vfs.h> 
 #include <linux/magic.h>
-# include <libaio.h>
+#include <libaio.h>
 
+#include <iostream>
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +24,7 @@
 
 #include "queue.hpp"
 #include "async_executor.hpp"
+#include "dlpack_utils.hpp"
 
 #define MAX_PREFETCH_CHUNKS 1024
 const size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);// typically 4096
@@ -1063,7 +1059,7 @@ public:
         }
 
         if (index < this->current_tensor_index) {
-            print_and_throw(std::runtime_error("Should call get_tensor(key) with keys in order of keys()."));
+            print_and_throw(std::runtime_error("Should call get_tensor_ptr(key) with keys in order of keys()."));
         }
         if (index > this->current_tensor_index + 1) { 
             fprintf(stderr, "WARNING: index jumped from %zu to %zu\n", this->current_tensor_index, index);
@@ -1119,38 +1115,38 @@ void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQu
 }
 
 // forcely cast the Python object to the C++ holder pointer
-template <typename Holder>
-Holder *get_holder(pybind11::handle obj) {
-    using namespace pybind11::detail;
-    // 1) get the PyTypeObject* of the Python object
-    //    use C-API macro Py_TYPE:
-    PyTypeObject *pytype = reinterpret_cast<PyTypeObject*>(Py_TYPE(obj.ptr()));
-    // 2) look up the registration table, get the corresponding pybind11::detail::type_info*
-    type_info *ti = get_type_info(pytype);
-    if (!ti) {
-        throw std::runtime_error("get_holder: Python type not registered with pybind11");
-    }
-    // 3) cast to instance* and use it to query value_and_holder
-    instance *inst = reinterpret_cast<instance *>(obj.ptr());
-    // throw_if_missing=true: if not found or holder not constructed, will throw exception
-    auto vh = inst->get_value_and_holder(ti, /*throw_if_missing=*/true);
-    // 4) get the Holder reference, the holder is placed in vh.vh[1] when placement-new
-    Holder &h = vh.holder<Holder>();
-    return &h;
-}
+// template <typename Holder>
+// Holder *get_holder(pybind11::handle obj) {
+//     using namespace pybind11::detail;
+//     // 1) get the PyTypeObject* of the Python object
+//     //    use C-API macro Py_TYPE:
+//     PyTypeObject *pytype = reinterpret_cast<PyTypeObject*>(Py_TYPE(obj.ptr()));
+//     // 2) look up the registration table, get the corresponding pybind11::detail::type_info*
+//     type_info *ti = get_type_info(pytype);
+//     if (!ti) {
+//         throw std::runtime_error("get_holder: Python type not registered with pybind11");
+//     }
+//     // 3) cast to instance* and use it to query value_and_holder
+//     instance *inst = reinterpret_cast<instance *>(obj.ptr());
+//     // throw_if_missing=true: if not found or holder not constructed, will throw exception
+//     auto vh = inst->get_value_and_holder(ti, /*throw_if_missing=*/true);
+//     // 4) get the Holder reference, the holder is placed in vh.vh[1] when placement-new
+//     Holder &h = vh.holder<Holder>();
+//     return &h;
+// }
 
 // Copied and modified from ProcessGroupNCCL.getCommPtr() of PyTorch 2.9 to adapt to PyTorch 2.7
-ncclComm_t get_nccl_comm_from_pg(c10d::ProcessGroup* pg) {
-    // 1. get CUDA backend
-    // auto backend = pg->getBackend(c10::DeviceType::CUDA);// no "d" in "c10"
-    auto backend = pg->getBackend(c10d::ProcessGroup::BackendType::NCCL);// this may fail and exit(1)
-    // 2. convert to ProcessGroupNCCL
-    auto* nccl_pg = dynamic_cast<c10d::ProcessGroupNCCL*>(backend.get());
-    TORCH_CHECK(nccl_pg != nullptr, "ProcessGroup backend must be NCCL");
-    int64_t comm_addr = nccl_pg->getCommPtr();
-    ncclComm_t comm = reinterpret_cast<ncclComm_t>(comm_addr);
-    return comm;
-}
+// ncclComm_t get_nccl_comm_from_pg(c10d::ProcessGroup* pg) {
+//     // 1. get CUDA backend
+//     // auto backend = pg->getBackend(c10::DeviceType::CUDA);// no "d" in "c10"
+//     auto backend = pg->getBackend(c10d::ProcessGroup::BackendType::NCCL);// this may fail and exit(1)
+//     // 2. convert to ProcessGroupNCCL
+//     auto* nccl_pg = dynamic_cast<c10d::ProcessGroupNCCL*>(backend.get());
+//     TORCH_CHECK(nccl_pg != nullptr, "ProcessGroup backend must be NCCL");
+//     int64_t comm_addr = nccl_pg->getCommPtr();
+//     ncclComm_t comm = reinterpret_cast<ncclComm_t>(comm_addr);
+//     return comm;
+// }
 
 struct RPCHandle {
     int latest_req_id;
@@ -1185,7 +1181,7 @@ public:
 
     int open(const vector<string> &filenames, 
             int device_idx, 
-            py::object process_group,
+            size_t process_group,
             size_t buffer_size, 
             size_t chunk_size, 
             size_t num_threads,
@@ -1205,11 +1201,16 @@ public:
         ncclComm_t nccl_group_communicator = nullptr;
         int rank = 0;
         int world_size = 1;
-        if(!process_group.is_none()) {
-            c10::intrusive_ptr<c10d::ProcessGroup> process_group_ptr = *(get_holder<c10::intrusive_ptr<c10d::ProcessGroup>>(process_group));
-            nccl_group_communicator = get_nccl_comm_from_pg(process_group_ptr.get());
-            rank = process_group_ptr->getRank();
-            world_size = process_group_ptr->getSize();
+        // if(!process_group.is_none()) {
+            // c10::intrusive_ptr<c10d::ProcessGroup> process_group_ptr = *(get_holder<c10::intrusive_ptr<c10d::ProcessGroup>>(process_group));
+            // nccl_group_communicator = get_nccl_comm_from_pg(process_group_ptr.get());
+            // rank = process_group_ptr->getRank();
+            // world_size = process_group_ptr->getSize();
+        // }
+        if(process_group != 0) { 
+            nccl_group_communicator = reinterpret_cast<ncclComm_t>(process_group);
+            NCCL_CHECK(ncclCommUserRank(nccl_group_communicator, &rank));
+            NCCL_CHECK(ncclCommCount(nccl_group_communicator, &world_size));
         }
 
         int req_id = this->call(loader_handle, OPEN, std::make_any<OpenArgs>(filenames, device_idx, nccl_group_communicator, rank, world_size, buffer_size, chunk_size, num_threads, io_depth, tensor_offsets));
@@ -1223,11 +1224,14 @@ public:
         this->loader_handle_to_queue.erase(loader_handle);
     }
 
-    at::Tensor get_tensor(int loader_handle, int tensor_index, vector<int64_t> shape, c10::ScalarType dtype) {
+    py::object get_dl_tensor(int loader_handle, int tensor_index, vector<int64_t> shape, string dtype) {
         int req_id = this->call(loader_handle, GET_TENSOR_PTR, std::make_any<GetTensorArgs>(tensor_index));
         std::any data_ptr_any = this->get_result(loader_handle, req_id);
         void *data_ptr = std::any_cast<void*>(data_ptr_any);
-        auto ret = at::from_blob(data_ptr, shape, at::TensorOptions().dtype(dtype).device(at::Device(at::DeviceType::CUDA, static_cast<at::DeviceIndex>(this->device_idx)))); // target_device can be inferred
+        // at::Tensor
+        // auto ret = at::from_blob(data_ptr, shape, at::TensorOptions().dtype(dtype).device(at::Device(at::DeviceType::CUDA, static_cast<at::DeviceIndex>(this->device_idx)))); // target_device can be inferred
+        auto ret = pack_dlpack((uint64_t)data_ptr, shape, dtype, this->device_idx);
+
         return ret;
     }
 };
@@ -1246,7 +1250,7 @@ void init() {
 
 int open(const vector<string> &filenames, 
         int device_idx, 
-        py::object process_group,
+        size_t process_group,
         size_t buffer_size, 
         size_t chunk_size,
         size_t num_threads,
@@ -1266,11 +1270,11 @@ void close(int loader_handle) {
     manager->close(loader_handle);
 }
 
-at::Tensor get_tensor(int loader_handle, int tensor_index, vector<int64_t> shape, c10::ScalarType dtype) {
+py::object get_dl_tensor(int loader_handle, int tensor_index, vector<int64_t> shape, string dtype) {
     if(!manager) {
         print_and_throw(std::runtime_error("Internal error: manager is not initialized"));
     }
-    return manager->get_tensor(loader_handle, tensor_index, shape, dtype);
+    return manager->get_dl_tensor(loader_handle, tensor_index, shape, dtype);
 }
 
 // Clean global cuda-related objects before python exit and cudaDeviceReset() is called 
@@ -1306,7 +1310,7 @@ PYBIND11_MODULE(_C, m) {
           "Close the loader handle and cleanup resources",
           pybind11::arg("loader_handle"));
     
-    m.def("get_tensor", &instanttensor::get_tensor,
+    m.def("get_dl_tensor", &instanttensor::get_dl_tensor,
           "Get a tensor by index from the opened file",
           pybind11::arg("loader_handle"),
           pybind11::arg("tensor_index"),

@@ -30,7 +30,9 @@ def instanttensor_use_cufile():
         _instanttensor_use_cufile = os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
     return _instanttensor_use_cufile
 
-def safetensors_dtype_to_torch_dtype(dtype: str) -> torch.dtype:
+_safetensors_to_torch_dtype_map = {}
+
+def safetensors_to_torch_dtype(dtype: str) -> torch.dtype:
     """Convert a safetensors dtype string to the corresponding PyTorch dtype.
     
     Args:
@@ -51,46 +53,60 @@ def safetensors_dtype_to_torch_dtype(dtype: str) -> torch.dtype:
         ValueError: If the dtype string is not supported by safetensors.
     
     Example:
-        >>> dtype = safetensors_dtype_to_torch_dtype("F32")
+        >>> dtype = safetensors_to_torch_dtype("F32")
         >>> print(dtype)
         torch.float32
     """
+    # torch ref: https://docs.pytorch.org/docs/stable/tensor_attributes.html
+    # safetensors ref: https://docs.rs/safetensors/latest/safetensors/tensor/enum.Dtype.html
+    if dtype in _safetensors_to_torch_dtype_map:
+        return _safetensors_to_torch_dtype_map[dtype]
+    
     if dtype == "BOOL":
-        return torch.bool
-    elif dtype == "I8":
-        return torch.int8
-    elif dtype == "U8":
-        return torch.uint8
-    elif dtype == "I16":
-        return torch.int16
-    elif dtype == "U16":
-        return torch.uint16
-    elif dtype == "I32":
-        return torch.int32
-    elif dtype == "U32":
-        return torch.uint32
-    elif dtype == "I64":
-        return torch.int64
-    elif dtype == "U64":
-        return torch.uint64
-    elif dtype == "F16":
-        return torch.float16
-    elif dtype == "F32":
-        return torch.float32
-    elif dtype == "F64":
-        return torch.float64
-    elif dtype == "BF16":
-        return torch.bfloat16
-    elif dtype == "F8_E4M3":
-        return torch.float8_e4m3fn
-    elif dtype == "F8_E5M2":
-        return torch.float8_e5m2
-    elif dtype == "F8_E8M0":
-        return torch.float8_e8m0fnu
+        ret = torch.bool
     elif dtype == "F4":
-        return torch.float4_e2m1fn_x2
+        ret = torch.float4_e2m1fn_x2
+    # F6_E2M3
+    # F6_E3M2
+    elif dtype == "U8":
+        ret = torch.uint8
+    elif dtype == "I8":
+        ret = torch.int8
+    elif dtype == "F8_E5M2":
+        ret = torch.float8_e5m2
+    elif dtype == "F8_E4M3":
+        ret = torch.float8_e4m3fn
+    elif dtype == "F8_E8M0":
+        ret = torch.float8_e8m0fnu
+    elif dtype == "I16":
+        ret = torch.int16
+    elif dtype == "U16":
+        ret = torch.uint16
+    elif dtype == "F16":
+        ret = torch.float16
+    elif dtype == "BF16":
+        ret = torch.bfloat16
+    elif dtype == "I32":
+        ret = torch.int32
+    elif dtype == "U32":
+        ret = torch.uint32
+    elif dtype == "F32":
+        ret = torch.float32
+    elif dtype == "C64":
+        ret = torch.complex64
+    elif dtype == "F64":
+        ret = torch.float64
+    elif dtype == "I64":
+        ret = torch.int64
+    elif dtype == "U64":
+        ret = torch.uint64
     else:
         raise ValueError(f"Safetensors does not support dtype: {dtype}")
+
+    _safetensors_to_torch_dtype_map[dtype] = ret
+    return ret
+
+
 
 def read_safetensors_metadata(filename: str) -> tuple:
     """Read the safetensors metadata from a file.
@@ -388,8 +404,9 @@ class safe_open:
 
     def _open(self):
         self.open_time = time.perf_counter()
+        nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
         self.loader_handle = instanttensor._C.open(
-            self.filename, self.device_idx, self.process_group, self.buffer_size, 
+            self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.tensor_offsets)
 
     def __enter__(self) -> 'safe_open':
@@ -452,10 +469,11 @@ class safe_open:
             stream = torch.cuda.current_stream()
             stream.synchronize()
             shape = metadata["shape"]
-            dtype = safetensors_dtype_to_torch_dtype(metadata["dtype"])
-            tensor = instanttensor._C.get_tensor(self.loader_handle, tensor_index, shape, dtype)
+            safetensors_dtype = metadata["dtype"]
+            dl_tensor = instanttensor._C.get_dl_tensor(self.loader_handle, tensor_index, shape, safetensors_dtype)
+            tensor = torch.from_dlpack(dl_tensor)
             if tensor.data_ptr() % tensor.element_size() != 0:
-                raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {dtype} size {tensor.element_size()}B")
+                raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {safetensors_to_torch_dtype(safetensors_dtype)} size {tensor.element_size()}B")
             yield name, tensor
 
     def get_tensor(self, name: str) -> torch.Tensor:
@@ -583,4 +601,4 @@ class safe_open:
             ...         print(f"Tensor {name} has dtype {dtype} and shape {shape}")
         """
         tensor_metadata = self.ordered_tensor_metadatas[self.tensor_name_to_index[name]][1]
-        return safetensors_dtype_to_torch_dtype(tensor_metadata["dtype"]), torch.Size(tensor_metadata["shape"])
+        return safetensors_to_torch_dtype(tensor_metadata["dtype"]), torch.Size(tensor_metadata["shape"])
