@@ -1,12 +1,13 @@
 #pragma once
 
-#include "queue.hpp"
 #include <any>
 #include <atomic>
 #include <functional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
+
+#include <instant_tensor/queue.hpp>
 
 namespace instanttensor {
 

@@ -1,5 +1,4 @@
-#ifndef DLPACK_HPP
-#define DLPACK_HPP
+#pragma once
 
 #include <Python.h>
 #include <pybind11/pybind11.h>
@@ -145,5 +144,3 @@ py::object pack_dlpack(uint64_t ptr,
 }
 
 } // namespace instanttensor
-
-#endif // DLPACK_HPP

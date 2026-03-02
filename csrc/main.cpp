@@ -1,10 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include <cuda_runtime.h>
-#include <nccl.h>
-#include <cufile.h>
-
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -22,9 +18,16 @@
 #include <chrono>
 #include <any>
 
-#include "queue.hpp"
-#include "async_executor.hpp"
-#include "dlpack_utils.hpp"
+#include <instant_tensor/queue.hpp>
+#include <instant_tensor/async_executor.hpp>
+#include <instant_tensor/dlpack_utils.hpp>
+#include <instant_tensor/dl_loader/cuda_loader.hpp>
+#include <instant_tensor/dl_loader/cufile_loader.hpp>
+#include <instant_tensor/dl_loader/nccl_loader.hpp>
+
+using namespace instanttensor::cuda_loader;
+using namespace instanttensor::cufile_loader;
+using namespace instanttensor::nccl_loader;
 
 #define MAX_PREFETCH_CHUNKS 1024
 const size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);// typically 4096
@@ -98,17 +101,28 @@ std::optional<string> get_env(const string& name) {
 
 namespace instanttensor {
 
-static bool _use_cufile(){
-    static bool ret = get_env("INSTANTTENSOR_USE_CUFILE").value_or("0") == "1";
+bool _determine_use_cufile(){
+    bool ret = get_env("INSTANTTENSOR_USE_CUFILE").value_or("0") == "1";
+    if (ret) {
+        if (!cufile_loader::init()) {
+            fprintf(stderr, "cuFile not found, fallback to aio.\n");
+            ret = false;
+        }
+    }
     return ret;
 }
 
-static bool _use_internal_memory_register(){
+static bool _env_use_cufile(){
+    static bool ret = _determine_use_cufile();
+    return ret;
+}
+
+static bool _env_use_internal_memory_register(){
     static bool ret = get_env("INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER").value_or("0") == "1";
     return ret;
 }
 
-static bool _debug() {
+static bool _env_debug() {
     static bool ret = get_env("INSTANTTENSOR_DEBUG").value_or("0") == "1";
     return ret;
 }
@@ -208,13 +222,13 @@ public:
         CUFILE_CHECK(cuFileDriverOpen());// This costs a long time (~2s)
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> dt = t1 - t0;
-        if(_debug()) {
+        if(_env_debug()) {
             fprintf(stderr, "cuFile Driver Opened in %.2f seconds\n", dt.count());
         }
     }
     ~CufileContext() {
         CUFILE_CHECK(cuFileDriverClose());
-        if(_debug()) {
+        if(_env_debug()) {
             fprintf(stderr, "cuFile Driver Closed\n");
         }
     }
@@ -353,8 +367,8 @@ public:
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
         this->input_queue = std::move(input_queue);
         this->output_queue = std::move(output_queue);
-        this->use_internal_memory_register = _use_internal_memory_register();
-        this->use_cufile = _use_cufile();
+        this->use_internal_memory_register = _env_use_internal_memory_register();
+        this->use_cufile = _env_use_cufile();
     }
 
     void open_file() {
@@ -467,7 +481,7 @@ public:
         this->world_chunk_alignment = this->rank_alignment * this->world_size;
         if(this->thread_chunk_size % this->thread_alignment != 0) {
             size_t new_chunk_size = ROUND_UP(this->thread_chunk_size, this->thread_alignment); 
-            if(_debug()) {
+            if(_env_debug()) {
                 fprintf(stderr, "Enlarge thread_chunk_size from %zu to %zu to align to %zu\n", this->thread_chunk_size, new_chunk_size, this->thread_alignment);
             }
             this->thread_chunk_size = new_chunk_size;
@@ -762,7 +776,7 @@ public:
         std::chrono::duration<double> d4 = t4 - t3;
         std::chrono::duration<double> d5 = t5 - t4;
         std::chrono::duration<double> d6 = t6 - t5;
-        if(_debug()) {
+        if(_env_debug()) {
             fprintf(stderr, "Config: rank=%d/%d, num_threads=%zu, buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p\n", 
                 this->rank, this->world_size, this->num_threads, this->buffer_size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
             fprintf(stderr, "Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f\n", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
@@ -783,7 +797,7 @@ public:
         std::chrono::duration<double> d2 = t2 - t1;
         std::chrono::duration<double> d3 = t3 - t2;
         std::chrono::duration<double> d4 = t4 - t3;
-        if(_debug()) {
+        if(_env_debug()) {
             fprintf(stderr, "Close time: threads=%f, buffer=%f, file=%f, comm=%f\n", d1.count(), d2.count(), d3.count(), d4.count());
         }
         this->stop = true;
@@ -852,7 +866,7 @@ public:
                     if(this->world_size > 1) {
                         CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
                         // In-place AllGather
-                        NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclUint8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
+                        NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclInt8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
                         CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
                     }
                 };
@@ -871,7 +885,7 @@ public:
                 CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
                 if(this->world_size > 1) {
                     CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
-                    NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclUint8, this->group_communicator, this->nccl_stream));
+                    NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclInt8, this->group_communicator, this->nccl_stream));
                     CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
                 }
                 
@@ -921,7 +935,7 @@ public:
                         }
                     }
                     if(this->world_size > 1) {
-                        NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclUint8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
+                        NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclInt8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
                         CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
                     }
                 };
@@ -981,7 +995,7 @@ public:
                     CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
                     if(this->world_size > 1) {
                         CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
-                        NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclUint8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
+                        NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclInt8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
                         CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
                     }
                 };
@@ -1207,7 +1221,17 @@ public:
             // rank = process_group_ptr->getRank();
             // world_size = process_group_ptr->getSize();
         // }
-        if(process_group != 0) { 
+        if(!cuda_loader::init()) {
+            print_and_throw(std::runtime_error(
+                "cuda_loader: CUDA not found in process. "
+                "Ensure torch (or another CUDA user) has been imported and CUDA is loaded."));
+        }
+        if(process_group != 0) {
+            if (!nccl_loader::init()) {
+                print_and_throw(std::runtime_error(
+                    "nccl_loader: process_group non-zero but NCCL not found in process. "
+                    "Ensure torch (or another NCCL user) has been imported and NCCL is loaded."));
+            }
             nccl_group_communicator = reinterpret_cast<ncclComm_t>(process_group);
             NCCL_CHECK(ncclCommUserRank(nccl_group_communicator, &rank));
             NCCL_CHECK(ncclCommCount(nccl_group_communicator, &world_size));
@@ -1240,7 +1264,7 @@ public:
 unique_ptr<LoaderManager> manager;
 
 void init() {
-    if(_use_cufile()) {
+    if(_env_use_cufile()) {
         cufile_context_initializer->initialize();
     }
     if(!manager) {

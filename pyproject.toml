@@ -1,9 +1,6 @@
-# consistent with vLLM v0.10.2
 [build-system]
 requires = [
-    "setuptools>=77.0.3,<80.0.0",
-    "wheel",
-    "pybind11==2.13.6",
+    "setuptools>=65.0",
 ]
 build-backend = "setuptools.build_meta"
 

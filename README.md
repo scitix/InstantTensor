@@ -41,35 +41,19 @@ See [Usage](#usage) for more details (multi-file and distributed usage).
 
 ## Installation
 
-**Prerequisites**
-- **Linux**
-- **CUDA**
-- **PyTorch >= 2.8.0**
-- System libraries/headers:
-  - **libaio**
-  - **Boost**
-  - **NCCL**
-  - **cuFile** 
+First, we need a Linux environment with CUDA driver installed. The typical installation steps are as follows:
 
-For Ubuntu/Debian with CUDA pre-installed, the typical installation steps are as follows:
+### Method 1: Install from pip
+  ```bash
+  pip install instanttensor
+  ```
 
-1. **Install libaio and Boost:**
-    ```bash
-    apt install libaio-dev libboost-dev
-    ```
-
-2. **Install PyTorch** (skip if already installed):
-    ```bash
-    pip install torch>=2.8.0
-    ```
-
-3. **Install InstantTensor:**
-    ```bash
-    cd ./instanttensor
-    pip install --no-build-isolation .
-    # For a debug build, set "DEBUG=1" before "pip"
-    ```
-    > **NOTE:** If you reinstall PyTorch (upgrade or downgrade), reinstall InstantTensor afterward by `pip install --no-build-isolation .`
+### Method 2: Build from source
+  ```bash
+  cd ./instanttensor
+  pip install .
+  # For a debug build, set "DEBUG=1" before "pip"
+  ```
 
 ## Usage
 

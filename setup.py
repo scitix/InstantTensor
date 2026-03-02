@@ -1,54 +1,69 @@
 #!/usr/bin/env python
 import os
-from setuptools import setup
+import shutil
+from setuptools import setup, Extension
+from setuptools.command.build_ext import build_ext
 
 # setuptools requires paths relative to setup.py directory, /-separated (no absolute paths)
-runtime_library_dirs = [
-    "$ORIGIN/../nvidia/cuda_runtime/lib",
-    "$ORIGIN/../nvidia/nccl/lib",
-    "$ORIGIN/../nvidia/cufile/lib",
-]
 
 root_path = os.path.dirname(os.path.abspath(__file__))
+libaio_dir = f"{root_path}/csrc/third_party/libaio"
+libaio_src = f"{libaio_dir}/src"
+# libaio three names: link name (for -laio), real file (make output), soname (DT_SONAME / loader lookup)
+LIBAIO_SO_LINKNAME = "libaio.so"       # -laio looks for this; we symlink it in src after make
+LIBAIO_SO_FILENAME = "libaio.so.1.0.2"  # actual file built by Makefile
+LIBAIO_SONAME = "libaio.so.1"         # embedded in .so; runtime loader looks for this
 
 include_dirs = [
     f"{root_path}/csrc",
-    f"{root_path}/csrc/third_party/boost/include",
+    f"{root_path}/csrc/third_party/lockfree/include",
     f"{root_path}/csrc/third_party/dlpack/include",
+    f"{root_path}/csrc/third_party/pybind11/include",
+    libaio_src,  # for <libaio.h>
 ]
 
-def get_ext_modules():
-    try:
-        from torch.utils.cpp_extension import CUDAExtension
-    except Exception as e:
-        raise RuntimeError(
-            "Building instanttensor requires PyTorch installed in the current environment.\n"
-            "Please run:\n"
-            "  pip install torch\n"
-            "  pip install --no-build-isolation .\n"
-        ) from e
 
+class BuildExt(build_ext):
+    def run(self):
+        # Build libaio (shared lib) using its own Makefile
+        if os.system(f"make --silent -C {libaio_dir}") != 0:
+            raise RuntimeError("libaio make failed")
+        # Makefile produces LIBAIO_SO_FILENAME only; -laio needs LIBAIO_SO_LINKNAME. Create symlink so we link to .so not .a.
+        link_path = os.path.join(libaio_src, LIBAIO_SO_LINKNAME)
+        real_path = os.path.join(libaio_src, LIBAIO_SO_FILENAME)
+        if os.path.isfile(real_path) and not os.path.lexists(link_path):
+            os.symlink(LIBAIO_SO_FILENAME, link_path)
+        super().run()
+        # Copy real .so + soname symlink next to extension so rpath $ORIGIN finds LIBAIO_SONAME at runtime.
+        pkg_dir = os.path.join(self.build_lib, "instanttensor")
+        os.makedirs(pkg_dir, exist_ok=True)
+        if os.path.isfile(real_path):
+            shutil.copy2(real_path, os.path.join(pkg_dir, LIBAIO_SO_FILENAME))
+            soname_link = os.path.join(pkg_dir, LIBAIO_SONAME)
+            if os.path.lexists(soname_link):
+                os.remove(soname_link)
+            os.symlink(LIBAIO_SO_FILENAME, soname_link)
+
+
+def get_ext_modules():
     debug = os.environ.get("DEBUG", "0") == "1"
     cxx_flags = ["-std=c++17", "-DUSE_C10D_NCCL"]
-    cxx_flags += ["-O0", "-g"] if debug else [] # use defualt optimization level
+    cxx_flags += ["-O0", "-g"] if debug else []
 
-    ext = CUDAExtension( # CUDA related headers and libraries are automatically provided
-        name="instanttensor._C",
-        sources=["csrc/main.cpp"], # always relative to setup.py
-        include_dirs=include_dirs, # should be absolute paths
-        library_dirs=[],
-        libraries=["aio", "cudart", "nccl", "cufile"],  # libaio from system
-        extra_compile_args={"cxx": cxx_flags, "nvcc": []},
-        # extra_link_args=extra_link_args,
-        runtime_library_dirs=runtime_library_dirs,  # same rpath policy as PyTorch
-    )
-    return [ext]
+    return [
+        Extension(
+            name="instanttensor._C",
+            sources=["csrc/main.cpp"],
+            include_dirs=include_dirs,
+            library_dirs=[libaio_src],
+            libraries=["dl", "aio"],
+            extra_compile_args=cxx_flags,
+            extra_link_args=["-Wl,-rpath,$ORIGIN"],
+        )
+    ]
 
-def get_cmdclass():
-    from torch.utils.cpp_extension import BuildExtension
-    return {"build_ext": BuildExtension}
 
 setup(
     ext_modules=get_ext_modules(),
-    cmdclass=get_cmdclass(),
+    cmdclass={"build_ext": BuildExt},
 )

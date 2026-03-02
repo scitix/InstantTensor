@@ -1,0 +1,12 @@
+[submodule "csrc/third_party/lockfree"]
+	path = csrc/third_party/lockfree
+	url = git@github.com:boostorg/lockfree.git
+[submodule "csrc/third_party/dlpack"]
+	path = csrc/third_party/dlpack
+	url = git@github.com:dmlc/dlpack.git
+[submodule "csrc/third_party/pybind11"]
+	path = csrc/third_party/pybind11
+	url = git@github.com:pybind/pybind11.git
+[submodule "csrc/third_party/libaio"]
+	path = csrc/third_party/libaio
+	url = https://pagure.io/libaio.git
