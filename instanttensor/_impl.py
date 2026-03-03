@@ -30,81 +30,49 @@ def instanttensor_use_cufile():
         _instanttensor_use_cufile = os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
     return _instanttensor_use_cufile
 
-_safetensors_to_torch_dtype_map = {}
+# reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
+def get_safetensors_dtype_map() -> dict:
+    safetensors_to_torch_dtype = {
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "I64": torch.int64,
+        "I32": torch.int32,
+        "I16": torch.int16,
+        "I8":  torch.int8,
+        "U8":  torch.uint8,
+        "BOOL": torch.bool,
+        "C64": torch.complex64,
+    }
 
-def safetensors_to_torch_dtype(dtype: str) -> torch.dtype:
-    """Convert a safetensors dtype string to the corresponding PyTorch dtype.
-    
-    Args:
-        dtype: The safetensors dtype string. Supported values include:
-            - "BOOL" -> ``torch.bool``
-            - "I8", "I16", "I32", "I64" -> ``torch.int8``, ``torch.int16``, ``torch.int32``, ``torch.int64``
-            - "U8", "U16", "U32", "U64" -> ``torch.uint8``, ``torch.uint16``, ``torch.uint32``, ``torch.uint64``
-            - "F16", "F32", "F64" -> ``torch.float16``, ``torch.float32``, ``torch.float64``
-            - "BF16" -> ``torch.bfloat16``
-            - "F8_E4M3", "F8_E5M2" -> ``torch.float8`` variants
-            - "F8_E8M0" -> ``torch.float8_e8m0fnu``
-            - "F4" -> ``torch.float4_e2m1fn_x2``
-    
-    Returns:
-        The corresponding PyTorch dtype object (e.g., ``torch.float32``).
-    
-    Raises:
-        ValueError: If the dtype string is not supported by safetensors.
-    
-    Example:
-        >>> dtype = safetensors_to_torch_dtype("F32")
-        >>> print(dtype)
-        torch.float32
-    """
-    # torch ref: https://docs.pytorch.org/docs/stable/tensor_attributes.html
-    # safetensors ref: https://docs.rs/safetensors/latest/safetensors/tensor/enum.Dtype.html
-    if dtype in _safetensors_to_torch_dtype_map:
-        return _safetensors_to_torch_dtype_map[dtype]
-    
-    if dtype == "BOOL":
-        ret = torch.bool
-    elif dtype == "F4":
-        ret = torch.float4_e2m1fn_x2
-    # F6_E2M3
-    # F6_E3M2
-    elif dtype == "U8":
-        ret = torch.uint8
-    elif dtype == "I8":
-        ret = torch.int8
-    elif dtype == "F8_E5M2":
-        ret = torch.float8_e5m2
-    elif dtype == "F8_E4M3":
-        ret = torch.float8_e4m3fn
-    elif dtype == "F8_E8M0":
-        ret = torch.float8_e8m0fnu
-    elif dtype == "I16":
-        ret = torch.int16
-    elif dtype == "U16":
-        ret = torch.uint16
-    elif dtype == "F16":
-        ret = torch.float16
-    elif dtype == "BF16":
-        ret = torch.bfloat16
-    elif dtype == "I32":
-        ret = torch.int32
-    elif dtype == "U32":
-        ret = torch.uint32
-    elif dtype == "F32":
-        ret = torch.float32
-    elif dtype == "C64":
-        ret = torch.complex64
-    elif dtype == "F64":
-        ret = torch.float64
-    elif dtype == "I64":
-        ret = torch.int64
-    elif dtype == "U64":
-        ret = torch.uint64
-    else:
-        raise ValueError(f"Safetensors does not support dtype: {dtype}")
+    # Add unsigned types if available (PyTorch >= 2.3.0)
+    for st_name, torch_name in [("U64", "uint64"), ("U32", "uint32"), ("U16", "uint16")]:
+        if hasattr(torch, torch_name):
+            safetensors_to_torch_dtype[st_name] = getattr(torch, torch_name)
 
-    _safetensors_to_torch_dtype_map[dtype] = ret
-    return ret
+    # Experimental types with their PyTorch attribute names
+    # Note: If a type is listed here but not available in the current PyTorch version,
+    # it won't be added to the type map. If a file contains such a dtype (e.g., "F4"),
+    # get_torch_dtype() will raise a clear ValueError: "Unsupported dtype 'F4'".
+    # This is correct forward-compatible behavior - fail fast with a clear error message.
+    _EXPERIMENTAL_ALIASES = {
+        "F8_E4M3": ["float8_e4m3fn", "float8_e4m3fnuz"],
+        "F8_E5M2": ["float8_e5m2", "float8_e5m2fnuz"],
+        "F8_E8M0": ["float8_e8m0fnu", "float8_e8m0fnuz"],
+        "F4":      ["float4_e2m1fn_x2"],  # Not yet in PyTorch (as of 2.5.1)
+        # FP6 is not supported by PyTorch yet
+    }
+
+    for st_type, torch_aliases in _EXPERIMENTAL_ALIASES.items():
+        for alias in torch_aliases:
+            if hasattr(torch, alias):
+                safetensors_to_torch_dtype[st_type] = getattr(torch, alias)
+                break
+
+    return safetensors_to_torch_dtype
+
+safetensors_to_torch_dtype = get_safetensors_dtype_map()
 
 
 
@@ -470,10 +438,14 @@ class safe_open:
             stream.synchronize()
             shape = metadata["shape"]
             safetensors_dtype = metadata["dtype"]
-            dl_tensor = instanttensor._C.get_dl_tensor(self.loader_handle, tensor_index, shape, safetensors_dtype)
+            torch_dtype = safetensors_to_torch_dtype.get(safetensors_dtype, None)
+            if torch_dtype is None:
+                raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
+            torch_dtype_str = str(torch_dtype).replace("torch.", "")
+            dl_tensor = instanttensor._C.get_dl_tensor(self.loader_handle, tensor_index, shape, torch_dtype_str)
             tensor = torch.from_dlpack(dl_tensor)
             if tensor.data_ptr() % tensor.element_size() != 0:
-                raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {safetensors_to_torch_dtype(safetensors_dtype)} size {tensor.element_size()}B")
+                raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
             yield name, tensor
 
     def get_tensor(self, name: str) -> torch.Tensor:
@@ -601,4 +573,7 @@ class safe_open:
             ...         print(f"Tensor {name} has dtype {dtype} and shape {shape}")
         """
         tensor_metadata = self.ordered_tensor_metadatas[self.tensor_name_to_index[name]][1]
-        return safetensors_to_torch_dtype(tensor_metadata["dtype"]), torch.Size(tensor_metadata["shape"])
+        torch_dtype = safetensors_to_torch_dtype.get(tensor_metadata["dtype"], None)
+        if torch_dtype is None:
+            raise ValueError(f"Unsupported safetensors dtype: {tensor_metadata['dtype']}")
+        return torch_dtype, torch.Size(tensor_metadata["shape"])

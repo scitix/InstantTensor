@@ -28,67 +28,73 @@ static void dl_managed_tensor_deleter(DLManagedTensor* self) {
     delete self;
 }
 
-static inline DLDataType safetensors_to_dlpack_dtype(const std::string& s) {
+static DLDataType torch_to_dlpack_dtype(const std::string& s) {
     DLDataType t;
     t.lanes = 1;
-    if (s == "BOOL") {
+    if (s == "bool") {
         t.code = kDLBool; t.bits = 8; return t;
     } 
-    else if (s == "F4") {
+    else if (s == "float4_e2m1fn_x2") {
         t.code = kDLFloat4_e2m1fn; t.bits = 4; return t;
     }
-    else if (s == "F6_E2M3") {
-        t.code = kDLFloat6_e2m3fn; t.bits = 6; return t;
-    } 
-    else if (s == "F6_E3M2") {
-        t.code = kDLFloat6_e3m2fn; t.bits = 6; return t;
-    } 
-    else if (s == "U8") {
+    // else if (s == "F6_E2M3") {
+    //     t.code = kDLFloat6_e2m3fn; t.bits = 6; return t;
+    // } 
+    // else if (s == "F6_E3M2") {
+    //     t.code = kDLFloat6_e3m2fn; t.bits = 6; return t;
+    // } 
+    else if (s == "uint8") {
         t.code = kDLUInt; t.bits = 8; return t;
     }
-    else if (s == "I8") {
+    else if (s == "int8") {
         t.code = kDLInt; t.bits = 8; return t;
     } 
-    else if (s == "F8_E5M2") {
+    else if (s == "float8_e5m2") { // Is this correct for float8_e5m2fnuz?
         t.code = kDLFloat8_e5m2; t.bits = 8; return t;
     } 
-    else if (s == "F8_E4M3") {
-        t.code = kDLFloat8_e4m3; t.bits = 8; return t;
+    else if (s == "float8_e5m2fnuz") {
+        t.code = kDLFloat8_e5m2fnuz; t.bits = 8; return t;
     }
-    else if (s == "F8_E8M0") {
+    else if (s == "float8_e4m3fn") {
+        t.code = kDLFloat8_e4m3fn; t.bits = 8; return t;
+    }
+    else if (s == "float8_e4m3fnuz") {
+        t.code = kDLFloat8_e4m3fnuz; t.bits = 8; return t;
+    }
+    else if (s == "float8_e8m0fnu") {
         t.code = kDLFloat8_e8m0fnu; t.bits = 8; return t;
     } 
-    else if (s == "I16") {
+    else if (s == "int16") {
         t.code = kDLInt; t.bits = 16; return t;
     } 
-    else if (s == "U16") {
+    else if (s == "uint16") {
         t.code = kDLUInt; t.bits = 16; return t;
     }
-    else if (s == "F16") {
+    else if (s == "float16") {
         t.code = kDLFloat; t.bits = 16; return t;
     } 
-    else if (s == "BF16") {
+    else if (s == "bfloat16") {
         t.code = kDLBfloat; t.bits = 16; return t;
     } 
-    else if (s == "I32") {
+    else if (s == "int32") {
         t.code = kDLInt; t.bits = 32; return t;
     }
-    else if (s == "U32") {
+    else if (s == "uint32") {
         t.code = kDLUInt; t.bits = 32; return t;
     } 
-    else if (s == "F32") {
+    else if (s == "float32") {
         t.code = kDLFloat; t.bits = 32; return t;
     } 
-    else if (s == "C64") {
+    else if (s == "complex64") {
         t.code = kDLComplex; t.bits = 64; return t;
     }
-    else if (s == "F64") {
+    else if (s == "float64") {
         t.code = kDLFloat; t.bits = 64; return t;
     } 
-    else if (s == "I64") {
+    else if (s == "int64") {
         t.code = kDLInt; t.bits = 64; return t;
     } 
-    else if (s == "U64") {
+    else if (s == "uint64") {
         t.code = kDLUInt; t.bits = 64; return t;
     }
     else {
@@ -129,7 +135,7 @@ py::object pack_dlpack(uint64_t ptr,
     managed->dl_tensor.data = reinterpret_cast<void*>(ptr);
     managed->dl_tensor.device = DLDevice{kDLCUDA, device_id};
     managed->dl_tensor.ndim = ctx->ndim;
-    managed->dl_tensor.dtype = safetensors_to_dlpack_dtype(dtype);
+    managed->dl_tensor.dtype = torch_to_dlpack_dtype(dtype);
     managed->dl_tensor.shape = ctx->shape;
     managed->dl_tensor.strides = ctx->strides;
     managed->dl_tensor.byte_offset = 0;

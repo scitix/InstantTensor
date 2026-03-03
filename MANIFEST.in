@@ -1,0 +1,3 @@
+recursive-include csrc *
+prune csrc/third_party/*/.git
+prune csrc/third_party/*/.github

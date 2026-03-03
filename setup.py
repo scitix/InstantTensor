@@ -16,12 +16,51 @@ LIBAIO_SONAME = "libaio.so.1"         # embedded in .so; runtime loader looks fo
 
 include_dirs = [
     f"{root_path}/csrc",
-    f"{root_path}/csrc/third_party/lockfree/include",
     f"{root_path}/csrc/third_party/dlpack/include",
     f"{root_path}/csrc/third_party/pybind11/include",
     libaio_src,  # for <libaio.h>
 ]
 
+boost_libs_dir = f"{root_path}/csrc/third_party/boost/libs"
+# boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in os.listdir(boost_libs_dir) if os.path.isdir(f"{boost_libs_dir}/{dir}") and not dir.startswith("old")]
+
+# for boost 1.74.0
+boost_submodules = [
+    "lockfree",
+    "align",
+    "array",
+    "assert",
+    "atomic",
+    "config",
+    "core",
+    "integer",
+    "iterator",
+    "mpl",
+    "parameter",
+    "predef",
+    "static_assert",
+    "tuple",
+    "type_traits",
+    "utility",
+    "winapi"
+    "concept_check",
+    "mp11",
+    "conversion",
+    "typeof",
+    "move",
+    "detail",
+    "function_types",
+    "fusion",
+    "optional",
+    "smart_ptr",
+    "container_hash",
+    "io",
+    "preprocessor",
+    "throw_exception",
+]
+boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in boost_submodules]
+
+include_dirs += boost_include_dirs
 
 class BuildExt(build_ext):
     def run(self):
@@ -38,11 +77,7 @@ class BuildExt(build_ext):
         pkg_dir = os.path.join(self.build_lib, "instanttensor")
         os.makedirs(pkg_dir, exist_ok=True)
         if os.path.isfile(real_path):
-            shutil.copy2(real_path, os.path.join(pkg_dir, LIBAIO_SO_FILENAME))
-            soname_link = os.path.join(pkg_dir, LIBAIO_SONAME)
-            if os.path.lexists(soname_link):
-                os.remove(soname_link)
-            os.symlink(LIBAIO_SO_FILENAME, soname_link)
+            shutil.copy2(real_path, os.path.join(pkg_dir, LIBAIO_SONAME))
 
 
 def get_ext_modules():
