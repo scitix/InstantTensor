@@ -106,7 +106,7 @@ static DLDataType torch_to_dlpack_dtype(const std::string& s) {
 // shape: vector<int64_t>
 // dtype: string ("float32" etc.)
 // device_id: int
-py::object pack_dlpack(uint64_t ptr,
+static py::object pack_dlpack(uint64_t ptr,
                        const std::vector<int64_t>& shape,
                        const std::string& dtype,
                        int device_id) {

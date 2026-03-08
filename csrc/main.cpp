@@ -1248,12 +1248,14 @@ public:
         this->loader_handle_to_queue.erase(loader_handle);
     }
 
-    py::object get_dl_tensor(int loader_handle, int tensor_index, vector<int64_t> shape, string dtype) {
+    py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
         int req_id = this->call(loader_handle, GET_TENSOR_PTR, std::make_any<GetTensorArgs>(tensor_index));
         std::any data_ptr_any = this->get_result(loader_handle, req_id);
         void *data_ptr = std::any_cast<void*>(data_ptr_any);
         // at::Tensor
         // auto ret = at::from_blob(data_ptr, shape, at::TensorOptions().dtype(dtype).device(at::Device(at::DeviceType::CUDA, static_cast<at::DeviceIndex>(this->device_idx)))); // target_device can be inferred
+        vector<int64_t> shape = {(int64_t)size};
+        string dtype = "int8";
         auto ret = pack_dlpack((uint64_t)data_ptr, shape, dtype, this->device_idx);
 
         return ret;
@@ -1294,11 +1296,11 @@ void close(int loader_handle) {
     manager->close(loader_handle);
 }
 
-py::object get_dl_tensor(int loader_handle, int tensor_index, vector<int64_t> shape, string dtype) {
+py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
     if(!manager) {
         print_and_throw(std::runtime_error("Internal error: manager is not initialized"));
     }
-    return manager->get_dl_tensor(loader_handle, tensor_index, shape, dtype);
+    return manager->get_dl_tensor(loader_handle, tensor_index, size);
 }
 
 // Clean global cuda-related objects before python exit and cudaDeviceReset() is called 
@@ -1338,8 +1340,7 @@ PYBIND11_MODULE(_C, m) {
           "Get a tensor by index from the opened file",
           pybind11::arg("loader_handle"),
           pybind11::arg("tensor_index"),
-          pybind11::arg("shape"),
-          pybind11::arg("dtype"));
+          pybind11::arg("size"));
 
     m.def("file_in_memory", &instanttensor::file_in_memory,
           "Check if the file is in memory",
