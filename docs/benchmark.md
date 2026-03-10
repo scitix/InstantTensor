@@ -35,7 +35,7 @@ Versions:
 
 *In multi-GPU loading, the load time is defined as the time until the last (slowest) GPU finishes loading.
 
-# Test on in-memory file system (tmpfs)
+## Test on in-memory file system (tmpfs)
 
 Testbed: 2 numa nodes * 8 channels DDR5 per numa node
 

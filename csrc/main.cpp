@@ -489,7 +489,11 @@ public:
         this->rank_chunk_size = this->thread_chunk_size * this->num_threads;
         this->world_chunk_size = this->rank_chunk_size * this->world_size;
 
-        size_t padded_size = 3 * (this->first_tensor_alignment + this->world_chunk_alignment); // can be any value that >= 0
+        // At most first_tensor_alignment bytes are padded both before and after the chunk
+        // At most thread_alignment bytes are padded before a chunk if the previous chunk's size < world_chunk_size
+        // At most world_chunk_alignment bytes are padded after a chunk if its size < world_chunk_size
+        // For three tensors, these paddings exist at most 3 times
+        size_t padded_size = 3 * (this->first_tensor_alignment + this->thread_alignment + this->world_chunk_alignment); // can be any value that >= 0
         this->buffer_size += padded_size;
         CUDA_CHECK(cudaMalloc(&this->device_buffer, this->buffer_size));
 

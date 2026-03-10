@@ -7,6 +7,7 @@ import instanttensor._C
 from typing import Union, Generator
 import threading
 import atexit
+from collections import defaultdict
 
 
 try:
@@ -147,6 +148,42 @@ def get_tensor_size(shape: list[int], dtype: torch.dtype) -> int:
     for s in shape:
         ret *= s
     return ret
+
+def compute_recommended_buffer_size(tensor_sizes: list[int], overlap_factor: float = 0.9) -> int:
+    """
+    Compute the recommended buffer size for the given tensor sizes.
+
+    Args:
+        tensor_sizes: The sizes of the tensors.
+        overlap_factor: How much tensor loading (in size) can be overlapped 
+            with user processing if the user processes tensor at the same speed
+            as we load.
+    
+    Returns:
+        The recommended buffer size.
+    """
+    if len(tensor_sizes) == 0:
+        return 4096
+    
+    max_tensor_size = max(tensor_sizes)
+    overlapped_size_of_buffer_size = defaultdict(int)
+    overlapped_size_of_buffer_size[tensor_sizes[0]] = tensor_sizes[0]
+
+    for i in range(len(tensor_sizes)-1):
+        tensor_size = tensor_sizes[i+1]
+        expected_buffer_size = tensor_sizes[i] + 2 * tensor_sizes[i+1]
+        overlapped_size_of_buffer_size[expected_buffer_size] += tensor_size
+    
+    buffer_sizes = sorted(overlapped_size_of_buffer_size.keys())
+    total_tensor_size = sum(overlapped_size_of_buffer_size.values())
+    total_overlapped_size = 0
+    for buffer_size in buffer_sizes:
+        total_overlapped_size += overlapped_size_of_buffer_size[buffer_size]
+        if total_overlapped_size >= total_tensor_size * overlap_factor:
+            return max(buffer_size, max_tensor_size)
+    
+    assert False, "Should not reach here"
+
 
 
 group_communicator_cache = {}
@@ -318,13 +355,7 @@ class safe_open:
 
         if self.buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
-            if len(tensor_sizes) >= 2:
-                recommended_buffer_size = max(tensor_sizes[i]+2*tensor_sizes[i+1] for i in range(len(tensor_sizes) - 1))
-            elif len(tensor_sizes) == 1:
-                recommended_buffer_size = tensor_sizes[0]
-            else:
-                recommended_buffer_size = 4096 # avoid setting it to 0 to avoid potential issues
-            self.buffer_size = recommended_buffer_size
+            self.buffer_size = compute_recommended_buffer_size(tensor_sizes)
         else:
             min_buffer_size = max(tensor_sizes)
             if self.buffer_size < min_buffer_size:
