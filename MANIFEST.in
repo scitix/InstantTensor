@@ -1,3 +1,16 @@
 recursive-include csrc *
-prune csrc/third_party/*/.git
-prune csrc/third_party/*/.github
+
+global-exclude *.py[cod] __pycache__ *.o *.os *.ol *.a *.so *.so.* *.dylib *.dll
+prune build
+prune dist
+prune .eggs
+prune *.egg-info
+prune .pytest_cache
+prune .mypy_cache
+prune .ruff_cache
+prune .tox
+prune .nox
+prune .venv
+prune venv
+prune .git
+prune .github
