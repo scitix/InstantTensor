@@ -777,8 +777,8 @@ public:
         std::chrono::duration<double> d5 = t5 - t4;
         std::chrono::duration<double> d6 = t6 - t5;
         if(_env_debug()) {
-            fprintf(stderr, "Config: rank=%d/%d, num_threads=%zu, buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p\n", 
-                this->rank, this->world_size, this->num_threads, this->buffer_size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
+            fprintf(stderr, "Config: rank=%d/%d, num_threads=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p\n", 
+                this->rank, this->world_size, this->num_threads, this->buffer_size, this->host_buffer_entry.size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
             fprintf(stderr, "Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f\n", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
         }
     }

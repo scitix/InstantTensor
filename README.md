@@ -6,10 +6,12 @@ InstantTensor is an **ultra-fast, distributed Safetensors loader** designed to m
 
 | Model | GPU | Backend | Load Time (s) | Throughput (GB/s) | Speedup |
 |---|---:|---|---:|---:|---|
-| Qwen3-30B-A3B | 1*H200 | Safetensors   | 57.4  | 1.2 | 1x |
-| Qwen3-30B-A3B | 1*H200 | InstantTensor | 1.77 | 39  | <span style="color: green">**32.5x**</span> |
+| Qwen3-30B-A3B | 1*H200 | Safetensors   | 57.4  | 1.1 | 1x |
+| Qwen3-30B-A3B | 1*H200 | InstantTensor | 1.77 | 35  | <span style="color: green">**32.4x**</span> |
 | DeepSeek-R1   | 8*H200 | Safetensors   | 160  | 4.3 | 1x |
 | DeepSeek-R1   | 8*H200 | InstantTensor | 15.3 | 45  | <span style="color: green">**10.5x**</span> |
+
+See [Benchmark](./docs/benchmark.md) for full benchmarks.
 
 ### Quickstart
 
