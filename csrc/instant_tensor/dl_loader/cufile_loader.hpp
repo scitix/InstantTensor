@@ -58,7 +58,15 @@ inline bool init() {
         return true;
     }
 
+    // Try cuFile first (NVIDIA GPUDirect Storage)
     lib_handle = dl_loader_utils::find_loaded_so("cufile");
+
+    // If cuFile not found, try hipFile (AMD GPUDirect Storage, if available)
+    // Note: AMD's hipFile may not be widely available yet, so this is forward-compatible
+    if (lib_handle == nullptr) {
+        lib_handle = dl_loader_utils::find_loaded_so("hipfile");
+    }
+
     if (lib_handle == nullptr) {
         lib_handle = (void*)0x1;
         return false;

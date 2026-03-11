@@ -37,5 +37,29 @@ inline T resolve(void* handle, const char* name) {
     return reinterpret_cast<T>(sym);
 }
 
+// Try to resolve a symbol with a primary name, falling back to an alternative name so that CUDA and HIP are supported.
+template <typename T>
+inline T try_resolve(void* handle, const char* primary_name, const char* fallback_name) {
+    // Clear any previous error
+    dlerror();
+
+    void* sym = dlsym(handle, primary_name);
+    if (sym) {
+        return reinterpret_cast<T>(sym);
+    }
+
+    // Try fallback name
+    dlerror(); // Clear error from first attempt
+    sym = dlsym(handle, fallback_name);
+    if (sym) {
+        return reinterpret_cast<T>(sym);
+    }
+
+    throw std::runtime_error(
+        std::string("failed to resolve ") + primary_name +
+        " or " + fallback_name + ": " + dlerror()
+    );
+}
+
 } // namespace dl_loader_utils
 } // namespace instanttensor
