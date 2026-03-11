@@ -489,6 +489,9 @@ public:
         this->rank_chunk_size = this->thread_chunk_size * this->num_threads;
         this->world_chunk_size = this->rank_chunk_size * this->world_size;
 
+        size_t inflight_device_buffer_size = this->io_depth * this->world_chunk_size;
+        if (this->buffer_size < inflight_device_buffer_size) this->buffer_size = inflight_device_buffer_size;
+
         // At most first_tensor_alignment bytes are padded both before and after the chunk
         // At most thread_alignment bytes are padded before a chunk if the previous chunk's size < world_chunk_size
         // At most world_chunk_alignment bytes are padded after a chunk if its size < world_chunk_size
@@ -501,7 +504,8 @@ public:
             CUFILE_CHECK(cuFileBufRegister(this->device_buffer, this->buffer_size, 0));
         }
         if (this->need_host_buffer) {
-            size_t host_buffer_size = this->io_depth * this->rank_chunk_size;
+            size_t inflight_host_buffer_size = this->io_depth * this->rank_chunk_size;
+            size_t host_buffer_size = inflight_host_buffer_size;
             this->host_buffer_entry = host_buffer_cache->get(host_buffer_size);
             if (this->host_buffer_entry.ptr == NULL) {
                 // aligned_alloc + cudaHostRegister is faster than cudaHostAlloc

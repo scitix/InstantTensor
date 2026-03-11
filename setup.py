@@ -13,6 +13,7 @@ libaio_src = f"{libaio_dir}/src"
 LIBAIO_SO_LINKNAME = "libaio.so"       # -laio looks for this; we symlink it in src after make
 LIBAIO_SO_FILENAME = "libaio.so.1.0.2"  # actual file built by Makefile
 LIBAIO_SONAME = "libaio.so.1"         # embedded in .so; runtime loader looks for this
+package_name = "instanttensor"
 
 include_dirs = [
     f"{root_path}/csrc",
@@ -62,22 +63,41 @@ boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in boost_submodu
 
 include_dirs += boost_include_dirs
 
+def rm_rf(path: str) -> None:
+    """Remove a file or directory, even if it is a symlink."""
+    if not os.path.lexists(path):   # Remove even if it is a symlink
+        return
+    if os.path.islink(path):        # Remove symlink
+        os.unlink(path)
+    elif os.path.isdir(path):       # Remove directory
+        shutil.rmtree(path)
+    else:                           # Remove file
+        os.unlink(path)
+
 class BuildExt(build_ext):
     def run(self):
-        # Build libaio (shared lib) using its own Makefile
-        if os.system(f"make --silent -C {libaio_dir}") != 0:
+        # Build libaio using its own Makefile (force rebuild with -B)
+        make_cmd = f"make --silent -B -C {libaio_dir}"
+        print(make_cmd)
+        if os.system(make_cmd) != 0:
             raise RuntimeError("libaio make failed")
         # Makefile produces LIBAIO_SO_FILENAME only; -laio needs LIBAIO_SO_LINKNAME. Create symlink so we link to .so not .a.
         link_path = os.path.join(libaio_src, LIBAIO_SO_LINKNAME)
         real_path = os.path.join(libaio_src, LIBAIO_SO_FILENAME)
-        if os.path.isfile(real_path) and not os.path.lexists(link_path):
-            os.symlink(LIBAIO_SO_FILENAME, link_path)
+        assert os.path.isfile(real_path), f"{LIBAIO_SO_FILENAME} not found after make"
+        if os.path.lexists(link_path):
+            print(f"removing existing {link_path}")
+            rm_rf(link_path)
+        print(f"creating symlink {link_path} -> {LIBAIO_SO_FILENAME} ({real_path})")
+        os.symlink(LIBAIO_SO_FILENAME, link_path)
         super().run()
-        # Copy real .so + soname symlink next to extension so rpath $ORIGIN finds LIBAIO_SONAME at runtime.
-        pkg_dir = os.path.join(self.build_lib, "instanttensor")
-        os.makedirs(pkg_dir, exist_ok=True)
-        if os.path.isfile(real_path):
-            shutil.copy2(real_path, os.path.join(pkg_dir, LIBAIO_SONAME))
+        # Copy LIBAIO_SONAME next to extension so rpath $ORIGIN finds it at runtime.
+        ext_fullpath = self.get_ext_fullpath(f"{package_name}._C")
+        target_dir = os.path.dirname(os.path.abspath(ext_fullpath))
+        os.makedirs(target_dir, exist_ok=True)
+        install_path = os.path.join(target_dir, LIBAIO_SONAME)
+        print(f"copying {real_path} to {install_path}")
+        shutil.copy2(real_path, install_path)
 
 
 def get_ext_modules():
@@ -87,7 +107,7 @@ def get_ext_modules():
 
     return [
         Extension(
-            name="instanttensor._C",
+            name=f"{package_name}._C",
             sources=["csrc/main.cpp"],
             include_dirs=include_dirs,
             library_dirs=[libaio_src],
