@@ -33,13 +33,21 @@ inline bool init() {
         return true;
     }
 
+    // Try NCCL first (NVIDIA)
     lib_handle = dl_loader_utils::find_loaded_so("nccl");
+
+    // If NCCL not found, try RCCL (AMD's NCCL for ROCm)
+    if (lib_handle == nullptr) {
+        lib_handle = dl_loader_utils::find_loaded_so("rccl");
+    }
+
     if (lib_handle == nullptr) {
         lib_handle = (void*)0x1;
         return false;
     }
 
     using dl_loader_utils::resolve;
+    // RCCL provides NCCL-compatible API (same function names and signatures)
     ncclAllGather_fn = resolve<decltype(ncclAllGather_fn)>(lib_handle, "ncclAllGather");
     ncclCommUserRank_fn = resolve<decltype(ncclCommUserRank_fn)>(lib_handle, "ncclCommUserRank");
     ncclCommCount_fn = resolve<decltype(ncclCommCount_fn)>(lib_handle, "ncclCommCount");

@@ -1,12 +1,13 @@
 [submodule "csrc/third_party/dlpack"]
 	path = csrc/third_party/dlpack
-	url = git@github.com:dmlc/dlpack.git
+	url = https://github.com/dmlc/dlpack.git
 [submodule "csrc/third_party/pybind11"]
 	path = csrc/third_party/pybind11
-	url = git@github.com:pybind/pybind11.git
+	url = https://github.com/pybind/pybind11.git
 [submodule "csrc/third_party/libaio"]
 	path = csrc/third_party/libaio
 	url = https://pagure.io/libaio.git
 [submodule "csrc/third_party/boost"]
 	path = csrc/third_party/boost
-	url = git@github.com:boostorg/boost.git
+	url = https://github.com/boostorg/boost.git
+	branch = boost-1.74.0
