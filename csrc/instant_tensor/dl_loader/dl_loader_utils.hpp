@@ -29,36 +29,37 @@ inline void* find_loaded_so(const char* prefix) {
 }
 
 template <typename T>
-inline T resolve(void* handle, const char* name) {
-    void* sym = dlsym(handle, name);
+inline T resolve(void* handle, const std::string& name) {
+    // Clear any previous error
+    dlerror();
+    void* sym = dlsym(handle, name.c_str());
     if (!sym) {
-        throw std::runtime_error(std::string("failed to resolve ") + name + ": " + dlerror());
+        throw std::runtime_error(std::string("failed to resolve ") + name.c_str() + ": " + dlerror());
     }
     return reinterpret_cast<T>(sym);
 }
 
-// Try to resolve a symbol with a primary name, falling back to an alternative name so that CUDA and HIP are supported.
 template <typename T>
-inline T try_resolve(void* handle, const char* primary_name, const char* fallback_name) {
-    // Clear any previous error
-    dlerror();
-
-    void* sym = dlsym(handle, primary_name);
-    if (sym) {
-        return reinterpret_cast<T>(sym);
+inline T resolve(void* handle, std::initializer_list<std::string> names) {
+    void* sym = nullptr;
+    for (const auto& name : names) {
+        dlerror();
+        sym = dlsym(handle, name.c_str());
+        if (sym) break;
     }
-
-    // Try fallback name
-    dlerror(); // Clear error from first attempt
-    sym = dlsym(handle, fallback_name);
-    if (sym) {
-        return reinterpret_cast<T>(sym);
+    if (!sym) {
+        std::string error_message = "failed to resolve any of the following names: ";
+        size_t i = 0;
+        for(auto& name : names) {
+            if (i) {
+                error_message += ", ";
+            }
+            error_message += name;
+            i++;
+        }
+        throw std::runtime_error(error_message);
     }
-
-    throw std::runtime_error(
-        std::string("failed to resolve ") + primary_name +
-        " or " + fallback_name + ": " + dlerror()
-    );
+    return reinterpret_cast<T>(sym);
 }
 
 } // namespace dl_loader_utils

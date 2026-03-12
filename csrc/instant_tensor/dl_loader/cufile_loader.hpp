@@ -11,6 +11,8 @@
 namespace instanttensor {
 namespace cufile_loader {
 
+bool is_rocm = false;
+    
 // Minimal types matching cufile.h ABI
 typedef void* CUfileHandle_t;
 
@@ -62,9 +64,12 @@ inline bool init() {
     lib_handle = dl_loader_utils::find_loaded_so("cufile");
 
     // If cuFile not found, try hipFile (AMD GPUDirect Storage, if available)
-    // Note: AMD's hipFile may not be widely available yet, so this is forward-compatible
+    // Note: AMD's hipFile may not be widely available yet, so this is forward-compatible, use it carefully
     if (lib_handle == nullptr) {
         lib_handle = dl_loader_utils::find_loaded_so("hipfile");
+        if (lib_handle != nullptr) {
+            is_rocm = true;
+        }
     }
 
     if (lib_handle == nullptr) {
@@ -73,13 +78,13 @@ inline bool init() {
     }
 
     using dl_loader_utils::resolve;
-    cuFileDriverOpen_fn = resolve<decltype(cuFileDriverOpen_fn)>(lib_handle, "cuFileDriverOpen");
-    cuFileDriverClose_fn = resolve<decltype(cuFileDriverClose_fn)>(lib_handle, "cuFileDriverClose");
-    cuFileHandleRegister_fn = resolve<decltype(cuFileHandleRegister_fn)>(lib_handle, "cuFileHandleRegister");
-    cuFileHandleDeregister_fn = resolve<decltype(cuFileHandleDeregister_fn)>(lib_handle, "cuFileHandleDeregister");
-    cuFileBufRegister_fn = resolve<decltype(cuFileBufRegister_fn)>(lib_handle, "cuFileBufRegister");
-    cuFileBufDeregister_fn = resolve<decltype(cuFileBufDeregister_fn)>(lib_handle, "cuFileBufDeregister");
-    cuFileRead_fn = resolve<decltype(cuFileRead_fn)>(lib_handle, "cuFileRead");
+    cuFileDriverOpen_fn = resolve<decltype(cuFileDriverOpen_fn)>(lib_handle, {"cuFileDriverOpen", "hipFileDriverOpen"});
+    cuFileDriverClose_fn = resolve<decltype(cuFileDriverClose_fn)>(lib_handle, {"cuFileDriverClose", "hipFileDriverClose"});
+    cuFileHandleRegister_fn = resolve<decltype(cuFileHandleRegister_fn)>(lib_handle, {"cuFileHandleRegister", "hipFileHandleRegister"});
+    cuFileHandleDeregister_fn = resolve<decltype(cuFileHandleDeregister_fn)>(lib_handle, {"cuFileHandleDeregister", "hipFileHandleDeregister"});
+    cuFileBufRegister_fn = resolve<decltype(cuFileBufRegister_fn)>(lib_handle, {"cuFileBufRegister", "hipFileBufRegister"});
+    cuFileBufDeregister_fn = resolve<decltype(cuFileBufDeregister_fn)>(lib_handle, {"cuFileBufDeregister", "hipFileBufDeregister"});
+    cuFileRead_fn = resolve<decltype(cuFileRead_fn)>(lib_handle, {"cuFileRead", "hipFileRead"});
 
     return true;
 }

@@ -21,6 +21,8 @@
 namespace instanttensor {
 namespace cuda_loader {
 
+bool is_rocm = false;
+
 // Opaque types (match CUDA runtime ABI)
 typedef void* cudaStream_t;
 typedef void* cudaEvent_t;
@@ -66,6 +68,9 @@ inline bool init() {
     // If CUDA runtime not found, try HIP runtime (for AMD GPUs)
     if (lib_handle == nullptr) {
         lib_handle = dl_loader_utils::find_loaded_so("amdhip64");
+        if (lib_handle != nullptr) {
+            is_rocm = true;
+        }
     }
 
     if (lib_handle == nullptr) {
@@ -74,24 +79,23 @@ inline bool init() {
     }
 
     using dl_loader_utils::resolve;
-    using dl_loader_utils::try_resolve;
 
     // Try CUDA function names first (cuda* prefix), then HIP names (hip* prefix) as fallback
     // On NVIDIA: libcudart.so has cuda* functions - uses CUDA path
     // On AMD: libamdhip64.so only has hip* functions - uses HIP fallback path
-    cudaMalloc_fn = try_resolve<decltype(cudaMalloc_fn)>(lib_handle, "cudaMalloc", "hipMalloc");
-    cudaFree_fn = try_resolve<decltype(cudaFree_fn)>(lib_handle, "cudaFree", "hipFree");
-    cudaSetDevice_fn = try_resolve<decltype(cudaSetDevice_fn)>(lib_handle, "cudaSetDevice", "hipSetDevice");
-    cudaStreamCreateWithFlags_fn = try_resolve<decltype(cudaStreamCreateWithFlags_fn)>(lib_handle, "cudaStreamCreateWithFlags", "hipStreamCreateWithFlags");
-    cudaStreamDestroy_fn = try_resolve<decltype(cudaStreamDestroy_fn)>(lib_handle, "cudaStreamDestroy", "hipStreamDestroy");
-    cudaMemcpyAsync_fn = try_resolve<decltype(cudaMemcpyAsync_fn)>(lib_handle, "cudaMemcpyAsync", "hipMemcpyAsync");
-    cudaEventCreateWithFlags_fn = try_resolve<decltype(cudaEventCreateWithFlags_fn)>(lib_handle, "cudaEventCreateWithFlags", "hipEventCreateWithFlags");
-    cudaEventRecord_fn = try_resolve<decltype(cudaEventRecord_fn)>(lib_handle, "cudaEventRecord", "hipEventRecord");
-    cudaEventSynchronize_fn = try_resolve<decltype(cudaEventSynchronize_fn)>(lib_handle, "cudaEventSynchronize", "hipEventSynchronize");
-    cudaStreamWaitEvent_fn = try_resolve<decltype(cudaStreamWaitEvent_fn)>(lib_handle, "cudaStreamWaitEvent", "hipStreamWaitEvent");
-    cudaHostRegister_fn = try_resolve<decltype(cudaHostRegister_fn)>(lib_handle, "cudaHostRegister", "hipHostRegister");
-    cudaHostUnregister_fn = try_resolve<decltype(cudaHostUnregister_fn)>(lib_handle, "cudaHostUnregister", "hipHostUnregister");
-    cudaGetErrorString_fn = try_resolve<decltype(cudaGetErrorString_fn)>(lib_handle, "cudaGetErrorString", "hipGetErrorString");
+    cudaMalloc_fn = resolve<decltype(cudaMalloc_fn)>(lib_handle, {"cudaMalloc", "hipMalloc"});
+    cudaFree_fn = resolve<decltype(cudaFree_fn)>(lib_handle, {"cudaFree", "hipFree"});
+    cudaSetDevice_fn = resolve<decltype(cudaSetDevice_fn)>(lib_handle, {"cudaSetDevice", "hipSetDevice"});
+    cudaStreamCreateWithFlags_fn = resolve<decltype(cudaStreamCreateWithFlags_fn)>(lib_handle, {"cudaStreamCreateWithFlags", "hipStreamCreateWithFlags"});
+    cudaStreamDestroy_fn = resolve<decltype(cudaStreamDestroy_fn)>(lib_handle, {"cudaStreamDestroy", "hipStreamDestroy"});
+    cudaMemcpyAsync_fn = resolve<decltype(cudaMemcpyAsync_fn)>(lib_handle, {"cudaMemcpyAsync", "hipMemcpyAsync"});
+    cudaEventCreateWithFlags_fn = resolve<decltype(cudaEventCreateWithFlags_fn)>(lib_handle, {"cudaEventCreateWithFlags", "hipEventCreateWithFlags"});
+    cudaEventRecord_fn = resolve<decltype(cudaEventRecord_fn)>(lib_handle, {"cudaEventRecord", "hipEventRecord"});
+    cudaEventSynchronize_fn = resolve<decltype(cudaEventSynchronize_fn)>(lib_handle, {"cudaEventSynchronize", "hipEventSynchronize"});
+    cudaStreamWaitEvent_fn = resolve<decltype(cudaStreamWaitEvent_fn)>(lib_handle, {"cudaStreamWaitEvent", "hipStreamWaitEvent"});
+    cudaHostRegister_fn = resolve<decltype(cudaHostRegister_fn)>(lib_handle, {"cudaHostRegister", "hipHostRegister"});
+    cudaHostUnregister_fn = resolve<decltype(cudaHostUnregister_fn)>(lib_handle, {"cudaHostUnregister", "hipHostUnregister"});
+    cudaGetErrorString_fn = resolve<decltype(cudaGetErrorString_fn)>(lib_handle, {"cudaGetErrorString", "hipGetErrorString"});
 
     return true;
 }

@@ -104,41 +104,9 @@ static DLDataType torch_to_dlpack_dtype(const std::string& s) {
     }
 }
 
-// Detect the device type based on the loaded runtime library
 static DLDeviceType get_device_type() {
-    static DLDeviceType cached_type = static_cast<DLDeviceType>(-1);
-    if (cached_type != static_cast<DLDeviceType>(-1)) {
-        return cached_type;
-    }
-
-    // Ensure cuda_loader is initialized
-    if (!cuda_loader::init()) {
-        // Failed to initialize - default to CUDA for backward compatibility
-        cached_type = kDLCUDA;
-        return cached_type;
-    }
-
-    // Check which runtime library is loaded
-    void* cudart_handle = cuda_loader::lib_handle;
-    if (cudart_handle == nullptr || cudart_handle == (void*)0x1) {
-        // Default to CUDA for NVIDIA compatibility
-        cached_type = kDLCUDA;
-        return cached_type;
-    }
-
-    // Detect AMD HIP by checking for HIP-specific symbol
-    // This only affects AMD systems - NVIDIA CUDA runtime won't have this symbol
-    dlerror(); // Clear any previous error
-    void* hip_symbol = dlsym(cudart_handle, "hipGetDeviceCount");
-    if (hip_symbol != nullptr) {
-        // It's HIP (AMD ROCm) - use kDLROCM device type
-        cached_type = kDLROCM;
-    } else {
-        // It's CUDA (NVIDIA) - use kDLCUDA device type (default)
-        cached_type = kDLCUDA;
-    }
-
-    return cached_type;
+    cuda_loader::init();
+    return cuda_loader::is_rocm ? kDLROCM : kDLCUDA;
 }
 
 // ptr: uint64 (CUDA/HIP device pointer)
@@ -149,6 +117,8 @@ static py::object pack_dlpack(uint64_t ptr,
                        const std::vector<int64_t>& shape,
                        const std::string& dtype,
                        int device_id) {
+    static DLDeviceType device_type = get_device_type();
+
     auto* managed = new DLManagedTensor();
     std::memset(managed, 0, sizeof(DLManagedTensor));
     // ctx is used to free shape/strides etc.
@@ -173,7 +143,7 @@ static py::object pack_dlpack(uint64_t ptr,
     }
     managed->dl_tensor.data = reinterpret_cast<void*>(ptr);
     // Use the appropriate device type (kDLCUDA for NVIDIA, kDLROCM for AMD)
-    managed->dl_tensor.device = DLDevice{get_device_type(), device_id};
+    managed->dl_tensor.device = DLDevice{device_type, device_id};
     managed->dl_tensor.ndim = ctx->ndim;
     managed->dl_tensor.dtype = torch_to_dlpack_dtype(dtype);
     managed->dl_tensor.shape = ctx->shape;

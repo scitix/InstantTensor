@@ -7,6 +7,8 @@
 namespace instanttensor {
 namespace nccl_loader {
 
+bool is_rocm = false;
+
 // Minimal types matching nccl.h ABI
 typedef void* ncclComm_t;
 typedef cuda_loader::cudaStream_t cudaStream_t;
@@ -39,6 +41,9 @@ inline bool init() {
     // If NCCL not found, try RCCL (AMD's NCCL for ROCm)
     if (lib_handle == nullptr) {
         lib_handle = dl_loader_utils::find_loaded_so("rccl");
+        if (lib_handle != nullptr) {
+            is_rocm = true;
+        }
     }
 
     if (lib_handle == nullptr) {
@@ -47,7 +52,7 @@ inline bool init() {
     }
 
     using dl_loader_utils::resolve;
-    // RCCL provides NCCL-compatible API (same function names and signatures)
+    // RCCL provides NCCL-compatible API (same function names and signatures), thus we don't need things like "rcclAllGather"
     ncclAllGather_fn = resolve<decltype(ncclAllGather_fn)>(lib_handle, "ncclAllGather");
     ncclCommUserRank_fn = resolve<decltype(ncclCommUserRank_fn)>(lib_handle, "ncclCommUserRank");
     ncclCommCount_fn = resolve<decltype(ncclCommCount_fn)>(lib_handle, "ncclCommCount");
