@@ -22,7 +22,7 @@ Versions:
 | DeepSeek-R1   | 8*H200 | Safetensors            | 160           | 4.30              | 1x        |
 |               |        | fastsafetensors        | 75.8          | 9.08              | 2.11x     |
 |               |        | RMS                    | 101           | 6.82              | 1.58x     |
-|               |        | RMS (distributed mode) | 192           | 3.59              |  0.83x    |
+|               |        | RMS (distributed mode) | 192           | 3.59              | 0.83x    |
 |               |        | InstantTensor          | 15.3          | 45.0              | **10.5x** |
 
 <!-- Qwen3-30B-A3B: 61.07GB -->
@@ -43,7 +43,7 @@ Testbed: 2 numa nodes * 8 channels DDR5 per numa node
 |---            |---     | ---                    |---            |---                |---        |
 | Qwen3-30B-A3B | 1*H200 | Safetensors            | 12.7          | 4.81              | 1x        |
 |               |        | fastsafetensors        | 16.7          | 3.66              | 0.76x     |
-|               |        | RMS                    | 9.39          | 6.50              | 1.35x     |
+|               |        | RMS                    | 8.21          | 7.44              | 1.55x     |
 |               |        | InstantTensor          | 1.26          | 48.5              | **10.1x** |
 | DeepSeek-R1   | 8*H200 | Safetensors            | 22.6          | 30.5              | 1x        |
 |               |        | fastsafetensors        | 63.4          | 10.9              | 0.36x     |
