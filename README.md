@@ -1,8 +1,12 @@
 # InstantTensor
 
+[![PyPI](https://img.shields.io/pypi/v/instanttensor?logo=pypi&logoColor=white&label=PyPI&color=3775A9)](https://pypi.org/project/instanttensor/) 
+[![Downloads](https://img.shields.io/pypi/dm/instanttensor?logo=pypi&logoColor=white&label=PyPI&color=3775A9)](https://pypi.org/project/instanttensor/) 
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
+
 InstantTensor is an **ultra-fast, distributed Safetensors loader** designed to maximize I/O throughput when moving model weights from Safetensors files to GPU memory.
 
-**Model loading benchmark on inference engines:**
+### Model loading benchmark on inference engines
 
 | Model | GPU | Backend | Load Time (s) | Throughput (GB/s) | Speedup |
 |---|---|---|---|---|---|
@@ -28,6 +32,11 @@ with safe_open("model.safetensors", framework="pt", device=0) as f:
 
 See [Usage](#usage) for more details (multi-file and distributed usage).
 
+### Used by
+
+- **[vLLM](https://github.com/vllm-project/vllm)**: [Loading Model Weights with InstantTensor](https://docs.vllm.ai/en/latest/models/extensions/instanttensor/)
+<!-- - **[SGLang](https://github.com/sgl-project/sglang)**:  -->
+
 ## Why InstantTensor?
 
 - **Fast weight loading**: 
@@ -35,7 +44,7 @@ See [Usage](#usage) for more details (multi-file and distributed usage).
   - Tuned I/O size and concurrency: Maximize hardware throughput.
   - Pipelining and prefetching: Parallelize and overlap the various stages of transmission.
 - **Distributed loading**: Use `torch.distributed` (NCCL) to speed up loading under any parallelism policy (TP/PP/EP/CP/DP).
-- **Minimal device buffer**: ≤ ~3× largest-tensor size; far below single-file size.
+- **Minimal device buffer**: Only occupies the size of 2–3 tensors; far below single-file size.
 - **Multiple I/O backends**:
   - GPUDirect Storage
   - Legacy Storage
@@ -43,7 +52,11 @@ See [Usage](#usage) for more details (multi-file and distributed usage).
 
 ## Installation
 
-First, we need a Linux environment with CUDA driver installed. The typical installation steps are as follows:
+### Requirements
+
+- GPU platforms: CUDA, ROCm
+- Framework: PyTorch
+
 
 ### Method 1: Install from pip
   ```bash
@@ -52,14 +65,16 @@ First, we need a Linux environment with CUDA driver installed. The typical insta
 
 ### Method 2: Build from source
   ```bash
-  cd ./instanttensor
+  git clone https://github.com/scitix/InstantTensor.git
+  cd InstantTensor
+  git submodule update --init --recursive --jobs 16
   pip install .
   # For a debug build, set "DEBUG=1" before "pip"
   ```
 
 ## Usage
 
-### Multi-file mode (recommended)
+### Multi-file loading
 
 Passing a list of files allows the backend to plan reads and provides higher throughput than making multiple calls to load single files:
 
