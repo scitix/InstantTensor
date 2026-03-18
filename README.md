@@ -39,16 +39,28 @@ See [Usage](#usage) for more details (multi-file and distributed usage).
 
 ## Why InstantTensor?
 
-- **Fast weight loading**: 
+- **Fast weight loading**
   - Direct I/O: Avoid the slow page cache allocation on cold start. Friendly for large models and tight memory budgets.
   - Tuned I/O size and concurrency: Maximize hardware throughput.
   - Pipelining and prefetching: Parallelize and overlap the various stages of transmission.
-- **Distributed loading**: Use `torch.distributed` (NCCL) to speed up loading under any parallelism policy (TP/PP/EP/CP/DP).
-- **Minimal device buffer**: Only occupies the size of 2–3 tensors; far below single-file size.
-- **Multiple I/O backends**:
-  - GPUDirect Storage
-  - Legacy Storage
-  - Memory-based Storage
+- **Distributed loading**
+  - Use `torch.distributed` (NCCL) to speed up loading under any parallelism policy (TP/PP/EP/CP/DP).
+- **Minimal device buffer**
+  - Uses a buffer of only 2-3 tensors, much smaller than a single model file.
+- **Multiple I/O backends**
+  - Supports multiple backends: GPUDirect Storage, Legacy Storage, and Memory-based Storage.
+
+## When to Use InstantTensor
+
+InstantTensor is recommended if **any** of the following conditions are met:
+- High storage bandwidth (>= 5 GB/s).
+- Unable to keep the model cached in host memory, for example:
+  - Limited free memory for model caching (for example, when most memory is used for KV cache offloading in LLM serving).
+  - Infrequent model loading, where Linux page cache is less effective.
+  - Model switching, where multiple models cannot be cached in memory simultaneously.
+- The model is heavily sharded (for example, TP=8), resulting in small, non-contiguous I/O per GPU.
+- Loading from `tmpfs`.
+
 
 ## Installation
 
