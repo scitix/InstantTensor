@@ -2,9 +2,8 @@ name: Build and Publish Wheels
 
 on:
   push:
-    # TODO: only enable on tagged releases
-    # tags:
-    #   - "v*"
+    tags:
+      - "v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
