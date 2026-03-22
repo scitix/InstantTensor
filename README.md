@@ -79,7 +79,7 @@ InstantTensor is recommended if **any** of the following conditions are met:
   ```bash
   git clone https://github.com/scitix/InstantTensor.git
   cd InstantTensor
-  git submodule update --init --recursive --jobs 16
+  ./checkout_submodule.sh
   pip install .
   # For a debug build, set "DEBUG=1" before "pip"
   ```
