@@ -1,0 +1,27 @@
+name: Build and Publish Wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_wheels:
+    name: Build wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: pypa/cibuildwheel@v3.4.0
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels
+          path: ./wheelhouse/*.whl
+  # TODO: automatically publish
