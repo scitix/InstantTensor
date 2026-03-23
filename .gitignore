@@ -10,6 +10,7 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+wheelhouse/
 .Python
 build/
 cmake-build-*/

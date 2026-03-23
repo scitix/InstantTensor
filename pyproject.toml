@@ -46,3 +46,9 @@ test = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["instanttensor*"]
+
+[tool.cibuildwheel]
+build = "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+
+before-test = "pip install torch --index-url https://download.pytorch.org/whl/cpu"
+test-command = "python -c \"from instanttensor import safe_open\""
