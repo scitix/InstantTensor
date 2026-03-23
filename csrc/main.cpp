@@ -122,6 +122,11 @@ static bool _env_use_internal_memory_register(){
     return ret;
 }
 
+static bool _env_cache_buffer(){
+    static bool ret = get_env("INSTANTTENSOR_CACHE_BUFFER").value_or("0") == "1";
+    return ret;
+}
+
 static bool _env_debug() {
     static bool ret = get_env("INSTANTTENSOR_DEBUG").value_or("0") == "1";
     return ret;
@@ -314,7 +319,6 @@ public:
     unique_ptr<SPSCQueue<RPCRequest>> input_queue;
     unique_ptr<SPSCQueue<RPCResponse>> output_queue;
 
-    bool stop = false;
     vector<FileInfo> file_info;
     bool use_internal_memory_register = false;
     bool use_cufile = false;
@@ -332,12 +336,11 @@ public:
     vector<unique_ptr<AsyncExecutor>> worker_threads;
     unique_ptr<AsyncExecutor> cuda_thread;
     unique_ptr<AsyncExecutor> wait_thread;
+    std::thread io_depth_sample_thread;
     cudaStream_t cuda_stream = nullptr;
     cudaStream_t nccl_stream = nullptr;
     vector<cudaEvent_t> cuda_events;
     size_t world_chunk_alignment = 0;
-    chunk_id_t chunk_reading = -1;
-    chunk_id_t chunk_read = -1;
     size_t thread_chunk_size = 0;
     size_t rank_chunk_size = 0;
     size_t world_chunk_size = 0;
@@ -363,6 +366,15 @@ public:
     size_t buffer_size = 0;
     size_t num_threads = 0;
     size_t io_depth = 0;
+
+    alignas(64)
+    atomic<bool> stop = false;
+    atomic<chunk_id_t> chunk_reading = -1;
+    atomic<chunk_id_t> chunk_read = -1;
+    
+    alignas(64)
+    atomic<size_t> io_depth_sum = 0;
+    atomic<size_t> io_depth_sample = 0;
 
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
         this->input_queue = std::move(input_queue);
@@ -533,7 +545,13 @@ public:
         }
         CUDA_CHECK(cudaFree(this->device_buffer));
         if (this->need_host_buffer) {
-            host_buffer_cache->put(std::move(this->host_buffer_entry));
+            if (_env_cache_buffer()) {
+                host_buffer_cache->put(std::move(this->host_buffer_entry));
+            }
+            else {
+                this->host_buffer_entry.deleter(this->host_buffer_entry.ptr);
+                this->host_buffer_entry.ptr = nullptr;
+            }
         }
     }
 
@@ -574,6 +592,16 @@ public:
         for(size_t i = 0; i < this->io_depth; i++) {
             CUDA_CHECK(cudaEventCreateWithFlags(&this->cuda_events[i], cudaEventDisableTiming));
         }
+
+        if(_env_debug()) {
+            this->io_depth_sample_thread = std::thread([=]() {
+                while(!this->stop) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    this->io_depth_sum += this->chunk_reading - this->chunk_read;
+                    this->io_depth_sample ++;
+                }
+            });
+        }
     }
 
     void destroy_threads() {
@@ -591,6 +619,9 @@ public:
         }
         if (this->nccl_stream) {
             CUDA_CHECK(cudaStreamDestroy(this->nccl_stream));
+        }
+        if(this->io_depth_sample_thread.joinable()) {
+            this->io_depth_sample_thread.join();
         }
     }
 
@@ -792,6 +823,7 @@ public:
     }
 
     void close(CloseArgs args) {
+        this->stop = true;
         auto t0 = std::chrono::high_resolution_clock::now();
         this->destroy_threads();
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -807,13 +839,13 @@ public:
         std::chrono::duration<double> d4 = t4 - t3;
         if(_env_debug()) {
             fprintf(stderr, "Close time: threads=%f, buffer=%f, file=%f, comm=%f\n", d1.count(), d2.count(), d3.count(), d4.count());
+            fprintf(stderr, "Average io_depth = %.2lf\n", 1.0 * this->io_depth_sum / this->io_depth_sample);
         }
-        this->stop = true;
     }
 
     void post_read_chunk() {
-        this->chunk_reading++;
-        chunk_id_t chunk_id = this->chunk_reading;
+        this->chunk_reading.store(this->chunk_reading.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        chunk_id_t chunk_id = this->chunk_reading.load(std::memory_order_relaxed);
         Chunk &chunk = this->chunks[chunk_id];
         // for debugging
         // fprintf(stderr, "post_read_chunk: chunk_reading = %zd, chunk_read = %zd, file_offset = %zu, buffer_offset = %zu\n", this->chunk_reading, this->chunk_read, chunk.file_offset, chunk.device_buffer_offset);
@@ -1023,24 +1055,24 @@ public:
     }
 
     void poll_read_chunk() {
-        chunk_id_t next_chunck_id = this->chunk_read + 1;
-        while(next_chunck_id <= this->chunk_reading
+        chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
+        while(next_chunck_id <= this->chunk_reading.load(std::memory_order_relaxed)
             && this->chunks[next_chunck_id].request.executor->test(this->chunks[next_chunck_id].request.wait_handle)) {
             next_chunck_id++;
         }
-        this->chunk_read = next_chunck_id - 1;
+        this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
     }
 
     void wait_read_chunk(chunk_id_t chunk_id) {
-        chunk_id_t next_chunck_id = this->chunk_read + 1;
-        if(chunk_id > this->chunk_reading) {
+        chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
+        if(chunk_id > this->chunk_reading.load(std::memory_order_relaxed)) {
             print_and_throw(std::runtime_error("Internal error: chunk_id out of range."));
         }
         while(next_chunck_id <= chunk_id) {
             this->chunks[next_chunck_id].request.executor->wait(this->chunks[next_chunck_id].request.wait_handle);
             next_chunck_id++;
         }
-        this->chunk_read = next_chunck_id - 1;
+        this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
     }
 
     void step() {
@@ -1058,10 +1090,10 @@ public:
         TensorMetadate& tensor = this->tensors[this->current_tensor_index];
         chunk_id_t prefetch_chunk_id = tensor.prefetch_chunk_id;
 
-        if(this->chunk_reading > prefetch_chunk_id) {
+        if(this->chunk_reading.load(std::memory_order_relaxed) > prefetch_chunk_id) {
             print_and_throw(std::runtime_error("Internal error: chunk_reading is greater than prefetch_chunk_id."));
         }
-        return this->chunk_reading < prefetch_chunk_id;
+        return this->chunk_reading.load(std::memory_order_relaxed) < prefetch_chunk_id;
     }
 
     void try_step() {
@@ -1091,7 +1123,7 @@ public:
         TensorMetadate& tensor = this->tensors[this->current_tensor_index];
         chunk_id_t last_chunk_id = tensor.last_chunk_id;
 
-        while (this->chunk_read < last_chunk_id) {
+        while (this->chunk_read.load(std::memory_order_relaxed) < last_chunk_id) {
             if(this->can_step()) {
                 this->step();
             }
@@ -1119,7 +1151,7 @@ public:
     }
 
     void run() {
-        while (!this->stop) {
+        while (!this->stop.load(std::memory_order_relaxed)) {
             if (!this->can_step() || !this->input_queue->empty()) {
                 RPCRequest m; 
                 this->input_queue->pop(m);

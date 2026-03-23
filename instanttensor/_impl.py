@@ -16,20 +16,40 @@ except AttributeError:
     # _C module is mocked (e.g., during Sphinx documentation build)
     print("instanttensor._C is mocked, skipping cleanup registration")
 
-_instanttensor_debug = None
-_instanttensor_use_cufile = None
+_env_debug = None
+_env_use_cufile = None
 
-def instanttensor_debug():
-    global _instanttensor_debug
-    if _instanttensor_debug is None:
-        _instanttensor_debug = os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
-    return _instanttensor_debug
+def env_debug():
+    global _env_debug
+    if _env_debug is None:
+        _env_debug = os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
+    return _env_debug
 
-def instanttensor_use_cufile():
-    global _instanttensor_use_cufile
-    if _instanttensor_use_cufile is None:
-        _instanttensor_use_cufile = os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
-    return _instanttensor_use_cufile
+def env_use_cufile():
+    global _env_use_cufile
+    if _env_use_cufile is None:
+        _env_use_cufile = os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
+    return _env_use_cufile
+
+def env_chunk_size():
+    ret = os.environ.get("INSTANTTENSOR_CHUNK_SIZE")
+    return int(ret) if ret is not None else None
+
+def env_concurrency():
+    ret = os.environ.get("INSTANTTENSOR_CONCURRENCY")
+    return int(ret) if ret is not None else None
+
+def env_io_depth():
+    ret = os.environ.get("INSTANTTENSOR_IO_DEPTH")
+    return int(ret) if ret is not None else None
+
+def env_max_free_mem_usage():
+    ret = os.environ.get("INSTANTTENSOR_MAX_FREE_MEM_USAGE")
+    return float(ret) if ret is not None else None
+
+def env_buffer_size():
+    ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
+    return int(ret) if ret is not None else None
 
 # reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
 def get_safetensors_dtype_map() -> dict:
@@ -149,7 +169,7 @@ def get_tensor_size(shape: list[int], dtype: torch.dtype) -> int:
         ret *= s
     return ret
 
-def compute_recommended_buffer_size(tensor_sizes: list[int], overlap_factor: float = 0.9) -> int:
+def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor: float = 0.9) -> int:
     """
     Compute the recommended buffer size for the given tensor sizes.
 
@@ -222,6 +242,9 @@ class safe_open:
             automatically determined based on storage type and system capabilities.
             Increasing this value can improve throughput, but values that are
             too large may conversely reduce throughput.
+        io_depth: The number of queued I/O operations per thread. If ``None`` (default),
+            automatically determined based on storage type and system capabilities.
+        max_free_mem_usage: Max ratio of idle memory used. If ``None`` (default), 0.5 is used.
         load_now: Whether to load tensors immediately. If ``True`` (default), starts
             loading immediately. If ``False``, only reads file metadata initially;
             tensors will be loaded when the context manager is entered. Useful
@@ -261,8 +284,9 @@ class safe_open:
         ...         tensors[name] = tensor.clone()
     """
     def __init__(self, filename: Union[str, list[str]], framework: str, 
-            device: Union[int, str, torch.device], process_group=None, 
-            buffer_size=None, chunk_size=None, concurrency=None, load_now=True):
+            device: Union[int, str, torch.device], process_group=None, *,
+            buffer_size=None, chunk_size=None, concurrency=None, io_depth=None, 
+            max_free_mem_usage=None, load_now=True):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -273,46 +297,19 @@ class safe_open:
             filename = [filename]
 
         filename.sort()
-        
-        all_file_in_memory = all(file_in_memory(file) for file in filename)
-
-        self.world_size = 1 if process_group is None else dist.get_world_size(process_group)
-        self.rank = 0 if process_group is None else dist.get_rank(process_group)
-
-        if all_file_in_memory:
-            if chunk_size is None:
-                chunk_size = 2*1024*1024
-            if concurrency is None:
-                concurrency = max(min(32, os.cpu_count()) // self.world_size, 1)
-            io_depth = 3 # memcpy + cudaMemcpyAsync + ncclAllGather
-        else:
-            if instanttensor_use_cufile():
-                if chunk_size is None:
-                    chunk_size = 4*1024*1024
-                if concurrency is None:
-                    # Since these are all IO-intensive threads, using more threads than CPU cores is acceptable
-                    concurrency = max(64 // self.world_size, 1) 
-                io_depth = 2 # cuFileRead + ncclAllGather
-            else: # aio
-                if chunk_size is None:
-                    chunk_size = 4*1024*1024
-                if concurrency is None:
-                    concurrency = max(32 // self.world_size, 1)
-                io_depth = 3 # aio read + cudaMemcpyAsync + ncclAllGather
 
         device = torch.device(device)
         assert device.type == "cuda", "InstantTensor only supports CUDA devices for now"
         assert framework == "pt", "InstantTensor only supports pytorch for now"
+
+        self.world_size = 1 if process_group is None else dist.get_world_size(process_group)
+        self.rank = 0 if process_group is None else dist.get_rank(process_group)
 
         self.filename = filename
         self.framework = framework
         self.device = device
         self.device_idx = device.index
         self.process_group = process_group
-        self.buffer_size = buffer_size
-        self.chunk_size = chunk_size
-        self.concurrency = concurrency
-        self.io_depth = io_depth
         self.loader_handle = None
         self.distributed_metadata_read = False
 
@@ -320,14 +317,8 @@ class safe_open:
         self.tensor_offsets = []
         self.iterated = False
         self.tmp_generator = None
-        
-        self.sync_time = time.perf_counter()
-        if self.process_group is not None:
-            # Warm up nccl to ensure ncclComm_t is initialized
-            # Even set async_op=True, the first call may still block to initialize ncclComm_t
-            # Most of the time is spent on NCCL initialization rather than on the all_reduce itself.
-            dist.all_reduce(torch.zeros(1, device=self.device), group=self.process_group) 
-            # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
+
+        self._determine_io_params(chunk_size, concurrency, io_depth, max_free_mem_usage)
 
         self.meta_read_time = time.perf_counter()
 
@@ -350,14 +341,97 @@ class safe_open:
         self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
 
         # adjust buffer size    
-        tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
-        self.total_tensor_size = sum(tensor_sizes)
+        self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
+        self.total_tensor_size = sum(self.tensor_sizes)
 
-        if self.buffer_size is None:
-            # make sure any two contiguous tensors will not be overlapped with each other in the buffer
-            self.buffer_size = compute_recommended_buffer_size(tensor_sizes)
+        self._determine_buffer_size(buffer_size)
+
+        if load_now:
+            self._open()
+
+    def _determine_io_params(self, chunk_size, concurrency, io_depth, max_free_mem_usage):
+        if chunk_size is None:
+            chunk_size = env_chunk_size()
+        if concurrency is None:
+            concurrency = env_concurrency()
+        if io_depth is None:
+            io_depth = env_io_depth()
+        if max_free_mem_usage is None:
+            max_free_mem_usage = env_max_free_mem_usage()
+
+        all_file_in_memory = all(file_in_memory(file) for file in self.filename)
+
+        if all_file_in_memory:
+            if chunk_size is None:
+                chunk_size = 2*1024*1024
+            if concurrency is None:
+                concurrency = max(min(32, os.cpu_count()) // self.world_size, 1)
+            if io_depth is None:
+                io_depth = 3 # memcpy + cudaMemcpyAsync + ncclAllGather
         else:
-            min_buffer_size = max(tensor_sizes)
+            if env_use_cufile():
+                if chunk_size is None:
+                    chunk_size = 8*1024*1024
+                if concurrency is None:
+                    # Since these are all IO-intensive threads, using more threads than CPU cores is acceptable
+                    concurrency = max(32 // self.world_size, 1) 
+                if io_depth is None:
+                    io_depth = 16 # cuFileRead + ncclAllGather # why this has effect?
+            else: # aio
+                if chunk_size is None:
+                    chunk_size = 8*1024*1024
+                if concurrency is None:
+                    concurrency = 1 # max(1 // self.world_size, 1)
+                if io_depth is None:
+                    io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+        
+        if max_free_mem_usage is None:
+            max_free_mem_usage = 0.5
+        
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        avail_bytes = int(free_bytes * max_free_mem_usage)
+
+        self.sync_time = time.perf_counter()
+        if self.process_group is not None:
+            # Warm up nccl to ensure ncclComm_t is initialized
+            # Even set async_op=True, the first call may still block to initialize ncclComm_t
+            # Most of the time is spent on NCCL initialization rather than on the all_reduce itself.
+            avail_bytes_tensor = torch.tensor([avail_bytes], device=self.device)
+            dist.all_reduce(avail_bytes_tensor, op=torch.distributed.ReduceOp.MIN, group=self.process_group) 
+            avail_bytes = avail_bytes_tensor.item()
+            # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
+
+
+        if chunk_size * concurrency * io_depth * self.world_size > avail_bytes:
+            shrinked_io_depth = max(avail_bytes // (chunk_size * concurrency * self.world_size), 3)
+            if shrinked_io_depth != io_depth:
+                print(f"Warning: Shrink io_depth from {io_depth} to {shrinked_io_depth} due to memory limit")
+                io_depth = shrinked_io_depth
+        
+        if chunk_size * concurrency * io_depth * self.world_size > avail_bytes:
+            shrinked_concurrency = max(avail_bytes // (chunk_size * io_depth * self.world_size), 1)
+            if shrinked_concurrency != concurrency:
+                print(f"Warning: Shrink concurrency from {concurrency} to {shrinked_concurrency} due to memory limit")
+                concurrency = shrinked_concurrency
+
+        assert chunk_size * concurrency * io_depth * self.world_size <= avail_bytes, "Device memory is not enough"
+
+        self.chunk_size = chunk_size
+        self.concurrency = concurrency
+        self.io_depth = io_depth
+
+    def _determine_buffer_size(self, buffer_size):
+        if buffer_size is None:
+            buffer_size = env_buffer_size()
+        
+        if buffer_size is None:
+            # make sure any two contiguous tensors will not be overlapped with each other in the buffer
+            buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
+            buffer_size_for_io = self.chunk_size * self.concurrency * self.io_depth * self.world_size
+            self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
+        else:
+            self.buffer_size = buffer_size
+            min_buffer_size = max(self.tensor_sizes)
             if self.buffer_size < min_buffer_size:
                 print(f"Warning: Enlarge buffer size from {self.buffer_size} to {min_buffer_size} to match the largest tensor size.")
                 self.buffer_size = min_buffer_size
@@ -366,9 +440,6 @@ class safe_open:
             if self.buffer_size > max_buffer_size:
                 print(f"Warning: Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste")
                 self.buffer_size = max_buffer_size
-
-        if load_now:
-            self._open()
 
     def _read_metadata(self):
         meta_read_threads = []
@@ -434,7 +505,7 @@ class safe_open:
         open_time = self.enter_time - self.open_time
         load_time = self.exit_time - self.enter_time
         close_time = self.close_time - self.exit_time
-        if instanttensor_debug():
+        if env_debug():
             print(f"Time: total={total_time:.2f}s, init={init_time:.2f}s, sync={sync_time:.2f}s, meta_read={meta_read_time:.2f}s, open={open_time:.2f}s, load={load_time:.2f}s, close={close_time:.2f}s")
             print(f"Throughput: total={self.total_tensor_size * 1e-9 / total_time:.2f}GB/s, load={self.total_tensor_size * 1e-9 / load_time:.2f}GB/s")
 
