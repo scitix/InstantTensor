@@ -9,10 +9,14 @@ from setuptools.command.build_ext import build_ext
 root_path = os.path.dirname(os.path.abspath(__file__))
 libaio_dir = f"{root_path}/csrc/third_party/libaio"
 libaio_src = f"{libaio_dir}/src"
-# libaio three names: link name (for -laio), real file (make output), soname (DT_SONAME / loader lookup)
-LIBAIO_SO_LINKNAME = "libaio.so"       # -laio looks for this; we symlink it in src after make
-LIBAIO_SO_FILENAME = "libaio.so.1.0.2"  # actual file built by Makefile
-LIBAIO_SONAME = "libaio.so.1"         # embedded in .so; runtime loader looks for this
+# Vendored libaio: use a private SONAME so DT_NEEDED is not "libaio.so.1" (avoids clashing with
+# the system library in RPATH/LD_LIBRARY_PATH). Same flow for pip install . / -e . / wheel / sdist:
+# build_ext always runs make + link + copy beside _C.so. Makefile: libname=$(soname).0.2 (minor/micro).
+LIBAIO_SONAME = "libinstanttensor_aio.so.1"
+LIBAIO_SO_FILENAME = "libinstanttensor_aio.so.1.0.2"
+LIBAIO_SO_LINKNAME = "libinstanttensor_aio.so"  # -linstanttensor_aio resolves via this symlink
+LIBAIO_LINK_SHORT = "instanttensor_aio"  # gcc -l{LIBAIO_LINK_SHORT} -> libinstanttensor_aio.so
+package_name = "instanttensor"
 
 include_dirs = [
     f"{root_path}/csrc",
@@ -64,8 +68,11 @@ include_dirs += boost_include_dirs
 
 class BuildExt(build_ext):
     def run(self):
-        # Build libaio (shared lib) using its own Makefile
-        if os.system(f"make --silent -C {libaio_dir}") != 0:
+        # Build libaio using its own Makefile (force rebuild with -B)
+        # Override upstream soname=libaio.so.1 so the shared object is not named like distro libaio.
+        make_cmd = f"make --silent -B -C {libaio_dir} soname={LIBAIO_SONAME}"
+        print(make_cmd)
+        if os.system(make_cmd) != 0:
             raise RuntimeError("libaio make failed")
         # Makefile produces LIBAIO_SO_FILENAME only; -laio needs LIBAIO_SO_LINKNAME. Create symlink so we link to .so not .a.
         link_path = os.path.join(libaio_src, LIBAIO_SO_LINKNAME)
@@ -73,16 +80,22 @@ class BuildExt(build_ext):
         if os.path.isfile(real_path) and not os.path.lexists(link_path):
             os.symlink(LIBAIO_SO_FILENAME, link_path)
         super().run()
-        # Copy real .so + soname symlink next to extension so rpath $ORIGIN finds LIBAIO_SONAME at runtime.
-        pkg_dir = os.path.join(self.build_lib, "instanttensor")
-        os.makedirs(pkg_dir, exist_ok=True)
-        if os.path.isfile(real_path):
-            shutil.copy2(real_path, os.path.join(pkg_dir, LIBAIO_SONAME))
+        # Copy LIBAIO_SONAME next to extension so rpath $ORIGIN finds it at runtime.
+        ext_fullpath = self.get_ext_fullpath(f"{package_name}._C")
+        target_dir = os.path.dirname(os.path.abspath(ext_fullpath))
+        os.makedirs(target_dir, exist_ok=True)
+        install_path = os.path.join(target_dir, LIBAIO_SONAME)
+        print(f"copying {real_path} to {install_path}")
+        shutil.copy2(real_path, install_path)
+        clean_cmd = f"make --silent -C {libaio_dir} clean soname={LIBAIO_SONAME}"
+        print(clean_cmd)
+        if os.system(clean_cmd) != 0:
+            raise RuntimeError("libaio make clean failed")
 
 
 def get_ext_modules():
     debug = os.environ.get("DEBUG", "0") == "1"
-    cxx_flags = ["-std=c++17", "-DUSE_C10D_NCCL"]
+    cxx_flags = ["-std=c++17"]
     cxx_flags += ["-O0", "-g"] if debug else []
 
     return [
@@ -91,7 +104,7 @@ def get_ext_modules():
             sources=["csrc/main.cpp"],
             include_dirs=include_dirs,
             library_dirs=[libaio_src],
-            libraries=["dl", "aio"],
+            libraries=["dl", LIBAIO_LINK_SHORT],
             extra_compile_args=cxx_flags,
             extra_link_args=["-Wl,-rpath,$ORIGIN"],
         )
