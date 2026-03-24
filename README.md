@@ -45,8 +45,6 @@ See [Usage](#usage) for more details (multi-file and distributed usage).
   - Pipelining and prefetching: Parallelize and overlap the various stages of transmission.
 - **Distributed loading**
   - Use `torch.distributed` (NCCL) to speed up loading under any parallelism policy (TP/PP/EP/CP/DP).
-- **Minimal device buffer**
-  - Uses a buffer of only 2-3 tensors, much smaller than a single model file.
 - **Multiple I/O backends**
   - Supports multiple backends: GPUDirect Storage, Legacy Storage, and Memory-based Storage.
 
