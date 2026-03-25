@@ -52,7 +52,9 @@ First, we need a Linux environment with CUDA driver installed. The typical insta
 
 ### Method 2: Build from source
   ```bash
-  cd ./instanttensor
+  git clone https://github.com/scitix/InstantTensor.git
+  cd InstantTensor
+  ./checkout_submodules.sh
   pip install .
   # For a debug build, set "DEBUG=1" before "pip"
   ```
