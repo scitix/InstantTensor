@@ -28,41 +28,7 @@ include_dirs = [
 boost_libs_dir = f"{root_path}/csrc/third_party/boost/libs"
 # boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in os.listdir(boost_libs_dir) if os.path.isdir(f"{boost_libs_dir}/{dir}") and not dir.startswith("old")]
 
-# for boost 1.74.0
-boost_submodules = [
-    "lockfree",
-    "align",
-    "array",
-    "assert",
-    "atomic",
-    "config",
-    "core",
-    "integer",
-    "iterator",
-    "mpl",
-    "parameter",
-    "predef",
-    "static_assert",
-    "tuple",
-    "type_traits",
-    "utility",
-    "winapi",
-    "concept_check",
-    "mp11",
-    "conversion",
-    "typeof",
-    "move",
-    "detail",
-    "function_types",
-    "fusion",
-    "optional",
-    "smart_ptr",
-    "container_hash",
-    "io",
-    "preprocessor",
-    "throw_exception",
-]
-boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in boost_submodules]
+boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in os.listdir(boost_libs_dir) if os.path.isdir(f"{boost_libs_dir}/{dir}")]
 
 include_dirs += boost_include_dirs
 
