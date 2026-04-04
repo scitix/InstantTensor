@@ -7,7 +7,7 @@
 namespace instanttensor {
 namespace nccl_loader {
 
-bool is_rocm = false;
+inline bool is_rocm = false;
 
 // Minimal types matching nccl.h ABI
 typedef void* ncclComm_t;
@@ -21,13 +21,13 @@ enum ncclDataType_t {
     ncclInt8 = 0,
 };
 
-static void* lib_handle = nullptr;
+inline void* lib_handle = nullptr;
 
-static ncclResult_t (*ncclAllGather_fn)(const void* sendbuff, void* recvbuff, size_t sendcount,
+inline ncclResult_t (*ncclAllGather_fn)(const void* sendbuff, void* recvbuff, size_t sendcount,
     ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream) = nullptr;
-static ncclResult_t (*ncclCommUserRank_fn)(const ncclComm_t comm, int* rank) = nullptr;
-static ncclResult_t (*ncclCommCount_fn)(const ncclComm_t comm, int* count) = nullptr;
-static const char* (*ncclGetErrorString_fn)(ncclResult_t result) = nullptr;
+inline ncclResult_t (*ncclCommUserRank_fn)(const ncclComm_t comm, int* rank) = nullptr;
+inline ncclResult_t (*ncclCommCount_fn)(const ncclComm_t comm, int* count) = nullptr;
+inline const char* (*ncclGetErrorString_fn)(ncclResult_t result) = nullptr;
 
 inline bool init() {
     if (lib_handle != nullptr) {

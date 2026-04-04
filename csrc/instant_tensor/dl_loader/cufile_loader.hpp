@@ -11,7 +11,7 @@
 namespace instanttensor {
 namespace cufile_loader {
 
-bool is_rocm = false;
+inline bool is_rocm = false;
     
 // Minimal types matching cufile.h ABI
 typedef void* CUfileHandle_t;
@@ -44,15 +44,15 @@ typedef struct CUfileDescr_t {
     const void *fs_ops;     /* Unused. Original type is "const CUfileFSOps_t *". file system operation table */
 } CUfileDescr_t;
 
-static void* lib_handle = nullptr;
+inline void* lib_handle = nullptr;
 
-static CUfileError_t (*cuFileDriverOpen_fn)() = nullptr;
-static CUfileError_t (*cuFileDriverClose_fn)() = nullptr;
-static CUfileError_t (*cuFileHandleRegister_fn)(CUfileHandle_t *fh, CUfileDescr_t *descr) = nullptr;
-static void (*cuFileHandleDeregister_fn)(CUfileHandle_t fh) = nullptr;
-static CUfileError_t (*cuFileBufRegister_fn)(const void* devPtr_base, size_t size, int flags) = nullptr;
-static CUfileError_t (*cuFileBufDeregister_fn)(const void* devPtr_base) = nullptr;
-static ssize_t (*cuFileRead_fn)(CUfileHandle_t fh, void *bufPtr_base, size_t size, off_t file_offset, off_t devPtr_offset) = nullptr;
+inline CUfileError_t (*cuFileDriverOpen_fn)() = nullptr;
+inline CUfileError_t (*cuFileDriverClose_fn)() = nullptr;
+inline CUfileError_t (*cuFileHandleRegister_fn)(CUfileHandle_t *fh, CUfileDescr_t *descr) = nullptr;
+inline void (*cuFileHandleDeregister_fn)(CUfileHandle_t fh) = nullptr;
+inline CUfileError_t (*cuFileBufRegister_fn)(const void* devPtr_base, size_t size, int flags) = nullptr;
+inline CUfileError_t (*cuFileBufDeregister_fn)(const void* devPtr_base) = nullptr;
+inline ssize_t (*cuFileRead_fn)(CUfileHandle_t fh, void *bufPtr_base, size_t size, off_t file_offset, off_t devPtr_offset) = nullptr;
 
 inline bool init() {
     if (lib_handle != nullptr) {

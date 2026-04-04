@@ -82,7 +82,13 @@ def get_ext_modules():
     return [
         Extension(
             name=f"{package_name}._C",
-            sources=["csrc/main.cpp"],
+            sources=[
+                "csrc/main.cpp",
+                "csrc/loader_common.cpp",
+                "csrc/loader_io_cufile.cpp",
+                "csrc/loader_io_aio.cpp",
+                "csrc/loader_io_inmem.cpp",
+            ],
             include_dirs=include_dirs,
             library_dirs=[libaio_src],
             libraries=["dl", LIBAIO_LINK_SHORT],

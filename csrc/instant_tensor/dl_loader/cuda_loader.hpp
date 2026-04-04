@@ -21,7 +21,7 @@
 namespace instanttensor {
 namespace cuda_loader {
 
-bool is_rocm = false;
+inline bool is_rocm = false;
 
 // Opaque types (match CUDA runtime ABI)
 typedef void* cudaStream_t;
@@ -40,21 +40,21 @@ enum cudaMemcpyKind {
     cudaMemcpyDefault = 4,
 };
 
-static void* lib_handle = nullptr;
+inline void* lib_handle = nullptr;
 
-static cudaError_t (*cudaMalloc_fn)(void** devPtr, size_t size) = nullptr;
-static cudaError_t (*cudaFree_fn)(void* devPtr) = nullptr;
-static cudaError_t (*cudaSetDevice_fn)(int device) = nullptr;
-static cudaError_t (*cudaStreamCreateWithFlags_fn)(cudaStream_t* pStream, unsigned int flags) = nullptr;
-static cudaError_t (*cudaStreamDestroy_fn)(cudaStream_t stream) = nullptr;
-static cudaError_t (*cudaMemcpyAsync_fn)(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) = nullptr;
-static cudaError_t (*cudaEventCreateWithFlags_fn)(cudaEvent_t* event, unsigned int flags) = nullptr;
-static cudaError_t (*cudaEventRecord_fn)(cudaEvent_t event, cudaStream_t stream) = nullptr;
-static cudaError_t (*cudaEventSynchronize_fn)(cudaEvent_t event) = nullptr;
-static cudaError_t (*cudaStreamWaitEvent_fn)(cudaStream_t stream, cudaEvent_t event, unsigned int flags) = nullptr;
-static cudaError_t (*cudaHostRegister_fn)(void* ptr, size_t size, unsigned int flags) = nullptr;
-static cudaError_t (*cudaHostUnregister_fn)(void* ptr) = nullptr;
-static const char* (*cudaGetErrorString_fn)(cudaError_t error) = nullptr;
+inline cudaError_t (*cudaMalloc_fn)(void** devPtr, size_t size) = nullptr;
+inline cudaError_t (*cudaFree_fn)(void* devPtr) = nullptr;
+inline cudaError_t (*cudaSetDevice_fn)(int device) = nullptr;
+inline cudaError_t (*cudaStreamCreateWithFlags_fn)(cudaStream_t* pStream, unsigned int flags) = nullptr;
+inline cudaError_t (*cudaStreamDestroy_fn)(cudaStream_t stream) = nullptr;
+inline cudaError_t (*cudaMemcpyAsync_fn)(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) = nullptr;
+inline cudaError_t (*cudaEventCreateWithFlags_fn)(cudaEvent_t* event, unsigned int flags) = nullptr;
+inline cudaError_t (*cudaEventRecord_fn)(cudaEvent_t event, cudaStream_t stream) = nullptr;
+inline cudaError_t (*cudaEventSynchronize_fn)(cudaEvent_t event) = nullptr;
+inline cudaError_t (*cudaStreamWaitEvent_fn)(cudaStream_t stream, cudaEvent_t event, unsigned int flags) = nullptr;
+inline cudaError_t (*cudaHostRegister_fn)(void* ptr, size_t size, unsigned int flags) = nullptr;
+inline cudaError_t (*cudaHostUnregister_fn)(void* ptr) = nullptr;
+inline const char* (*cudaGetErrorString_fn)(cudaError_t error) = nullptr;
 
 inline bool init() {
     if (lib_handle != nullptr) {
