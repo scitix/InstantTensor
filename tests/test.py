@@ -61,11 +61,6 @@ def parse_args():
         action='store_true',
         help='Compute checksum of the tensors'
     )
-    parser.add_argument(
-        '--rank0-only',
-        action='store_true',
-        help='Only run safe_open() on rank0. For debug purpose. May blocks the script.'
-    )
     # parser.add_argument(
     #     '--grouped',
     #     action='store_true',
@@ -86,22 +81,11 @@ tp = args.tp
 pp = args.pp
 load_group_size = args.load_group_size
 compute_checksum = args.checksum
-rank0_only = args.rank0_only
 grouped = True if backend == 'instanttensor' else False
 
 if os.environ.get("NCCL_IB_GID_INDEX") != "3":
     print("Setting NCCL_IB_GID_INDEX to 3")
     os.environ["NCCL_IB_GID_INDEX"] = "3"
-
-safe_open_dict = {
-    'instanttensor': instant_safe_open,
-    'safetensors': safetensors_safe_open,
-}
-
-device_dict = {
-    'instanttensor': 'cuda',
-    'safetensors': 'cpu', # NOTE: safetensors performs best when the intermediate tensors are on CPU
-}
 
 def collective_print(*args, **kwargs):
     if dist.is_initialized():
@@ -157,11 +141,54 @@ def tensor_checksum(x: torch.Tensor) -> str:
     # s = torch.sum(t, dtype=torch.int64) # NOTE: sum of uint64 is not implemented, use int64 instead
     # return (s.item() + (1<<64)) % (1<<64)
 
+t_open = 0
+t_close = 0
+t_keys = 0
+t_first = 0
+
+def safetensors_iterator(files):
+    global t_open, t_close, t_keys, t_first
+    for file in files:
+        t_open_record = time.perf_counter()
+        with safetensors_safe_open(file, framework='pt', device="cpu") as f:
+            t_open_once = time.perf_counter() - t_open_record
+            # print(f"[TEST] Time taken to open: {t_open_once:.3f} seconds")
+            t_open += t_open_once
+
+            t_keys_record = time.perf_counter()
+            keys = f.keys()
+            t_keys += time.perf_counter() - t_keys_record
+
+            for key_idx, key in enumerate(keys):
+                t_get_record = time.perf_counter()
+                loaded_tensor = f.get_tensor(key)
+                t_get = time.perf_counter() - t_get_record
+                # if key_idx < 20:
+                #     print(f"[TEST] Time taken to get tensor {key}: {t_get:.6f} seconds")
+                if key_idx == 0:
+                    t_first += t_get
+
+                yield key, loaded_tensor
+            t_close_record = time.perf_counter()
+        t_close += time.perf_counter() - t_close_record
+
+def instanttensor_iterator(files, device, process_group):
+    global t_open, t_close, t_keys, t_first
+    t_open_record = time.perf_counter()
+    with instant_safe_open(files, framework='pt', device=device, process_group=process_group) as f:
+        t_open += time.perf_counter() - t_open_record
+        for name, tensor in f.tensors():
+            yield name, tensor
+        t_close_record = time.perf_counter()
+    t_close += time.perf_counter() - t_close_record
+
+tensor_iterator_map = {
+    "safetensors": safetensors_iterator,
+    "instanttensor": instanttensor_iterator,
+}
+
 def distributed_load():
     global load_group_size
-    safe_open = safe_open_dict[backend]
-    buffer_device = device_dict[backend]
-
     
     if os.environ.get('RANK') is None:
         global_world_size = 1
@@ -188,9 +215,6 @@ def distributed_load():
     
     collective_print(f"[TEST] Rank {load_group_rank} in group {load_group_id} of size {load_group_size}")
     
-    if buffer_device == 'cuda':
-        buffer_device = f'cuda:{local_rank}'
-    
     if backend == 'instanttensor':
         instanttensor._impl.init() # can be commented out
         # NOTE: process_group can be the world group or a sub-group, 
@@ -206,7 +230,6 @@ def distributed_load():
                     if gid == load_group_id:
                         process_group = new_process_group
                 dist.all_reduce(torch.zeros(1, device='cuda'), group=process_group)
-        safe_open = partial(safe_open, process_group=process_group) 
     
     tp_rank = global_rank % tp
     pp_rank = global_rank // tp % pp
@@ -217,54 +240,26 @@ def distributed_load():
     
     pbar = tqdm(total=len(full_ordered_keys), position=local_rank, desc=f"{load_group_id}-{load_group_rank}") # add a header in format that shows which group it is
 
-    grouped_files = [files] if grouped else files
-
-    if rank0_only and load_group_rank != 0 and backend == 'instanttensor':
-        for file in grouped_files:
-            safe_open(file, framework='pt', device=buffer_device, open_now=False) # run allreduce inside
-    
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    t_open = 0
-    t_close = 0
-    t_keys = 0
-    t_first = 0
+    
+    tensor_iterator = tensor_iterator_map[backend]
+    if backend == "instanttensor":
+        tensor_iterator = partial(tensor_iterator, device=local_rank, process_group=process_group)
 
-    if not rank0_only or load_group_rank == 0:
-        for file in grouped_files:
-            t_open_record = time.perf_counter()
-            with safe_open(file, framework='pt', device=buffer_device) as f:
-                t_open_once = time.perf_counter() - t_open_record
-                # print(f"[TEST] Time taken to open: {t_open_once:.3f} seconds")
-                t_open += t_open_once
-
-                t_keys_record = time.perf_counter()
-                keys = f.keys()
-                t_keys += time.perf_counter() - t_keys_record
-
-                for key_idx, key in enumerate(keys):
-                    t_get_record = time.perf_counter()
-                    loaded_tensor = f.get_tensor(key)
-                    pbar.update(1)
-                    t_get = time.perf_counter() - t_get_record
-                    # if key_idx < 20:
-                    #     print(f"[TEST] Time taken to get tensor {key}: {t_get:.6f} seconds")
-                    if key_idx == 0:
-                        t_first += t_get
-
-                    gpu_tensor = tensors.get(key)
-                    if gpu_tensor is None: # skip tensors on other pp ranks
-                        continue 
-                    
-                    shape = loaded_tensor.shape
-                    tp_shard_l = (shape[0]+tp-1) // tp * tp_rank
-                    tp_shard_r = (shape[0]+tp-1) // tp * (tp_rank+1)
-                    tp_shard_r = min(tp_shard_r, max(shape[0], tp_shard_l))
-                    shape = (tp_shard_r - tp_shard_l, *shape[1:])
-                    loaded_tensor = loaded_tensor[tp_shard_l:tp_shard_r]
-                    gpu_tensor.copy_(loaded_tensor)
-                t_close_record = time.perf_counter()
-            t_close += time.perf_counter() - t_close_record
+    for name, tensor in tensor_iterator(files):
+        pbar.update(1)
+        gpu_tensor = tensors.get(name)
+        if gpu_tensor is None: # skip tensors on other pp ranks
+            continue 
+        
+        shape = tensor.shape
+        tp_shard_l = (shape[0]+tp-1) // tp * tp_rank
+        tp_shard_r = (shape[0]+tp-1) // tp * (tp_rank+1)
+        tp_shard_r = min(tp_shard_r, max(shape[0], tp_shard_l))
+        shape = (tp_shard_r - tp_shard_l, *shape[1:])
+        tensor = tensor[tp_shard_l:tp_shard_r]
+        gpu_tensor.copy_(tensor)
     
     torch.cuda.synchronize()
     t1 = time.perf_counter()

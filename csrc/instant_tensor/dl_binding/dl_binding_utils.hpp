@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 namespace instanttensor {
-namespace dl_loader_utils {
+namespace dl_binding_utils {
 
 /** Find an already-loaded .so in the current process whose path contains \p prefix.
  *  Scans /proc/self/maps and returns a dlopen handle with RTLD_NOLOAD (reuse only).
@@ -62,5 +62,5 @@ inline T resolve(void* handle, std::initializer_list<std::string> names) {
     return reinterpret_cast<T>(sym);
 }
 
-} // namespace dl_loader_utils
+} // namespace dl_binding_utils
 } // namespace instanttensor

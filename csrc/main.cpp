@@ -56,15 +56,15 @@ public:
         ncclComm_t nccl_group_communicator = nullptr;
         int rank = 0;
         int world_size = 1;
-        if(!cuda_loader::init()) {
+        if(!cuda_binding::init()) {
             print_and_throw(std::runtime_error(
-                "cuda_loader: CUDA not found in process. "
+                "cuda_binding: CUDA not found in process. "
                 "Ensure torch (or another CUDA user) has been imported and CUDA is loaded."));
         }
         if(process_group != 0) {
-            if (!nccl_loader::init()) {
+            if (!nccl_binding::init()) {
                 print_and_throw(std::runtime_error(
-                    "nccl_loader: process_group non-zero but NCCL not found in process. "
+                    "nccl_binding: process_group non-zero but NCCL not found in process. "
                     "Ensure torch (or another NCCL user) has been imported and NCCL is loaded."));
             }
             nccl_group_communicator = reinterpret_cast<ncclComm_t>(process_group);

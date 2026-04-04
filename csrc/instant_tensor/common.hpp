@@ -22,13 +22,13 @@
 
 #include <instant_tensor/queue.hpp>
 #include <instant_tensor/async_executor.hpp>
-#include <instant_tensor/dl_loader/cuda_loader.hpp>
-#include <instant_tensor/dl_loader/cufile_loader.hpp>
-#include <instant_tensor/dl_loader/nccl_loader.hpp>
+#include <instant_tensor/dl_binding/cuda_binding.hpp>
+#include <instant_tensor/dl_binding/cufile_binding.hpp>
+#include <instant_tensor/dl_binding/nccl_binding.hpp>
 
-using namespace instanttensor::cuda_loader;
-using namespace instanttensor::cufile_loader;
-using namespace instanttensor::nccl_loader;
+using namespace instanttensor::cuda_binding;
+using namespace instanttensor::cufile_binding;
+using namespace instanttensor::nccl_binding;
 
 #define MAX_PREFETCH_CHUNKS 1024
 const size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);// typically 4096
@@ -103,7 +103,7 @@ namespace instanttensor {
 inline bool _determine_use_cufile(){
     bool ret = get_env("INSTANTTENSOR_USE_CUFILE").value_or("0") == "1";
     if (ret) {
-        if (!cufile_loader::init()) {
+        if (!cufile_binding::init()) {
             fprintf(stderr, "cuFile not found, fallback to aio.\n");
             ret = false;
         }

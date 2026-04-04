@@ -1,6 +1,6 @@
 #pragma once
 
-#include <instant_tensor/dl_loader/dl_loader_utils.hpp>
+#include <instant_tensor/dl_binding/dl_binding_utils.hpp>
 
 #define cudaStreamDefault 0x00
 #define cudaStreamLegacy ((cudaStream_t)0x1)
@@ -19,7 +19,7 @@
 #define cudaHostRegisterReadOnly 0x08
 
 namespace instanttensor {
-namespace cuda_loader {
+namespace cuda_binding {
 
 inline bool is_rocm = false;
 
@@ -63,11 +63,11 @@ inline bool init() {
     }
 
     // Try CUDA runtime first
-    lib_handle = dl_loader_utils::find_loaded_so("cudart");
+    lib_handle = dl_binding_utils::find_loaded_so("cudart");
 
     // If CUDA runtime not found, try HIP runtime (for AMD GPUs)
     if (lib_handle == nullptr) {
-        lib_handle = dl_loader_utils::find_loaded_so("amdhip64");
+        lib_handle = dl_binding_utils::find_loaded_so("amdhip64");
         if (lib_handle != nullptr) {
             is_rocm = true;
         }
@@ -78,7 +78,7 @@ inline bool init() {
         return false;
     }
 
-    using dl_loader_utils::resolve;
+    using dl_binding_utils::resolve;
 
     // Try CUDA function names first (cuda* prefix), then HIP names (hip* prefix) as fallback
     // On NVIDIA: libcudart.so has cuda* functions - uses CUDA path
@@ -141,5 +141,5 @@ inline const char* cudaGetErrorString(cudaError_t error) {
     return cudaGetErrorString_fn(error);
 }
 
-} // namespace cuda_loader
+} // namespace cuda_binding
 }

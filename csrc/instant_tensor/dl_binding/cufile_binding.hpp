@@ -1,6 +1,6 @@
 #pragma once
 
-#include <instant_tensor/dl_loader/dl_loader_utils.hpp>
+#include <instant_tensor/dl_binding/dl_binding_utils.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <unistd.h>
@@ -9,7 +9,7 @@
         (string("cuFile error code ") + std::to_string(err))
 
 namespace instanttensor {
-namespace cufile_loader {
+namespace cufile_binding {
 
 inline bool is_rocm = false;
     
@@ -61,12 +61,12 @@ inline bool init() {
     }
 
     // Try cuFile first (NVIDIA GPUDirect Storage)
-    lib_handle = dl_loader_utils::find_loaded_so("cufile");
+    lib_handle = dl_binding_utils::find_loaded_so("cufile");
 
     // If cuFile not found, try hipFile (AMD GPUDirect Storage, if available)
     // Note: AMD's hipFile may not be widely available yet, so this is forward-compatible, use it carefully
     if (lib_handle == nullptr) {
-        lib_handle = dl_loader_utils::find_loaded_so("hipfile");
+        lib_handle = dl_binding_utils::find_loaded_so("hipfile");
         if (lib_handle != nullptr) {
             is_rocm = true;
         }
@@ -77,7 +77,7 @@ inline bool init() {
         return false;
     }
 
-    using dl_loader_utils::resolve;
+    using dl_binding_utils::resolve;
     cuFileDriverOpen_fn = resolve<decltype(cuFileDriverOpen_fn)>(lib_handle, {"cuFileDriverOpen", "hipFileDriverOpen"});
     cuFileDriverClose_fn = resolve<decltype(cuFileDriverClose_fn)>(lib_handle, {"cuFileDriverClose", "hipFileDriverClose"});
     cuFileHandleRegister_fn = resolve<decltype(cuFileHandleRegister_fn)>(lib_handle, {"cuFileHandleRegister", "hipFileHandleRegister"});
@@ -111,5 +111,5 @@ inline ssize_t cuFileRead(CUfileHandle_t fh, void* bufPtr_base, size_t size, off
     return cuFileRead_fn(fh, bufPtr_base, size, file_offset, devPtr_offset);
 }
 
-} // namespace cufile_loader
+} // namespace cufile_binding
 } // namespace instanttensor

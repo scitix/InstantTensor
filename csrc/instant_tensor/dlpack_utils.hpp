@@ -7,7 +7,7 @@
 #include <cstring>
 #include <vector>
 #include <dlpack/dlpack.h>
-#include <instant_tensor/dl_loader/cuda_loader.hpp>
+#include <instant_tensor/dl_binding/cuda_binding.hpp>
 
 namespace py = pybind11;
 
@@ -105,8 +105,8 @@ static DLDataType torch_to_dlpack_dtype(const std::string& s) {
 }
 
 static DLDeviceType get_device_type() {
-    cuda_loader::init();
-    return cuda_loader::is_rocm ? kDLROCM : kDLCUDA;
+    cuda_binding::init();
+    return cuda_binding::is_rocm ? kDLROCM : kDLCUDA;
 }
 
 // ptr: uint64 (CUDA/HIP device pointer)
