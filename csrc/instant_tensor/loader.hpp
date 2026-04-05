@@ -86,6 +86,25 @@ public:
     atomic<size_t> io_depth_sum = 0;
     atomic<size_t> io_depth_sample = 0;
 
+    // AIO profiling: per-iocb submit and completion timestamps
+    using time_point_t = std::chrono::high_resolution_clock::time_point;
+    time_point_t aio_profile_epoch; // reference point for absolute timestamps
+    struct AIOProfile {
+        chunk_id_t chunk_id;
+        size_t thread_index;
+        size_t file_offset;
+        size_t read_size;
+        time_point_t submit_time;
+        time_point_t complete_time;
+        chunk_id_t chunk_read_at_submit;
+        chunk_id_t chunk_read_at_complete;
+        bool can_step_next;
+    };
+    // map from iocb* to profile index, used to match io_event.obj back to profile entry
+    unordered_map<struct iocb*, size_t> aio_profile_map;
+    std::mutex aio_profile_mutex;
+    vector<AIOProfile> aio_profiles;
+
     // Constructor
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
 

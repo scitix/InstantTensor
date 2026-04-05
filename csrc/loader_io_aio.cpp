@@ -1,4 +1,8 @@
 #include <instant_tensor/loader.hpp>
+#include <fstream>
+#include <iomanip>
+#include <algorithm>
+#include <numeric>
 
 namespace instanttensor {
 
@@ -27,6 +31,9 @@ void Loader::open_file_aio_context() {
         this->aio_iocb_ptrs[i] = &this->aio_iocbs[i];
     }
     this->aio_events.resize(this->io_depth * this->num_threads);
+    if(_env_debug()) {
+        this->aio_profile_epoch = std::chrono::high_resolution_clock::now();
+    }
 }
 
 void Loader::close_file_aio(FileInfo &f) {
@@ -38,12 +45,75 @@ void Loader::close_file_aio_context() {
     if(ret < 0){
         print_and_throw(std::runtime_error("Failed to destroy aio: " + std::string(strerror(-ret))));
     }
+
+    // Dump AIO profiling data to file
+    if(_env_debug() && !this->aio_profiles.empty()) {
+        string filename = "aio_latency_rank" + std::to_string(this->rank) + ".csv";
+        std::ofstream ofs(filename);
+        if(ofs.is_open()) {
+            auto epoch = this->aio_profile_epoch;
+            ofs << std::fixed << std::setprecision(1);
+            ofs << "chunk_id,thread_index,file_offset,read_size,submit_ms,complete_ms,chunk_read_at_submit,chunk_read_at_complete,win_size_at_submit,can_step_next,latency_ms\n";
+            for(auto &p : this->aio_profiles) {
+                double submit_ms = std::chrono::duration<double, std::milli>(p.submit_time - epoch).count();
+                double complete_ms = std::chrono::duration<double, std::milli>(p.complete_time - epoch).count();
+                double latency_ms = complete_ms - submit_ms;
+                ofs << p.chunk_id << ","
+                    << p.thread_index << ","
+                    << p.file_offset << ","
+                    << p.read_size << ","
+                    << submit_ms << ","
+                    << complete_ms << ","
+                    << p.chunk_read_at_submit << ","
+                    << p.chunk_read_at_complete << ","
+                    << p.chunk_id - p.chunk_read_at_submit << ","
+                    << p.can_step_next << ","
+                    << latency_ms << "\n";
+            }
+            ofs.close();
+            fprintf(stderr, "AIO profiling: wrote %zu entries to %s\n", this->aio_profiles.size(), filename.c_str());
+        }
+
+        // Compute percentile statistics
+        size_t n = this->aio_profiles.size();
+        vector<double> latencies(n), win_sizes(n);
+        auto epoch = this->aio_profile_epoch;
+        for(size_t i = 0; i < n; i++) {
+            auto &p = this->aio_profiles[i];
+            latencies[i] = std::chrono::duration<double, std::milli>(p.complete_time - p.submit_time).count();
+            win_sizes[i] = (double)(p.chunk_id - p.chunk_read_at_submit);
+        }
+        std::sort(latencies.begin(), latencies.end());
+        std::sort(win_sizes.begin(), win_sizes.end());
+
+        auto percentile = [](const vector<double> &sorted, double p) -> double {
+            if(sorted.empty()) return 0;
+            double idx = p / 100.0 * (sorted.size() - 1);
+            size_t lo = (size_t)idx;
+            size_t hi = lo + 1;
+            if(hi >= sorted.size()) return sorted.back();
+            double frac = idx - lo;
+            return sorted[lo] * (1 - frac) + sorted[hi] * frac;
+        };
+        auto avg = [](const vector<double> &v) -> double {
+            return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+        };
+
+        fprintf(stderr, "AIO latency (ms):  avg=%.1f  p50=%.1f  p90=%.1f  p99=%.1f  p99.9=%.1f  p99.99=%.1f\n",
+            avg(latencies), percentile(latencies, 50), percentile(latencies, 90),
+            percentile(latencies, 99), percentile(latencies, 99.9), percentile(latencies, 99.99));
+        fprintf(stderr, "AIO win_size:      avg=%.1f  p50=%.1f  p90=%.1f  p99=%.1f  p99.9=%.1f  p99.99=%.1f\n",
+            avg(win_sizes), percentile(win_sizes, 50), percentile(win_sizes, 90),
+            percentile(win_sizes, 99), percentile(win_sizes, 99.9), percentile(win_sizes, 99.99));
+    }
 }
 
 ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
     size_t submit_cnt = 0;
     size_t window_idx = p.window_idx;
+
+    auto submit_time = std::chrono::high_resolution_clock::now();
 
     bool unaligned_last_page = false;
 
@@ -60,6 +130,15 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         io_prep_pread(iocb, p.file.fd, (char*)this->host_buffer + p.window_offset + thread_offset, thread_size_aligned, file_offset);
         iocb->data = (void*)chunk_id;
         submit_cnt ++;
+
+        // Profile: register each iocb
+        if(_env_debug()) {
+            std::lock_guard<std::mutex> lock(this->aio_profile_mutex);
+            size_t idx = this->aio_profiles.size();
+            chunk_id_t cr = this->chunk_read.load(std::memory_order_relaxed);
+            this->aio_profiles.push_back(AIOProfile{chunk_id, i, file_offset, p.padded_thread_size, submit_time, {}, cr, -1, this->can_step()});
+            this->aio_profile_map[iocb] = idx;
+        }
     }
     this->chunks[chunk_id].extra_data.aio_unfinished_cnt = submit_cnt;
 
@@ -99,15 +178,28 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
             if(got < 0){
                 print_and_throw(std::runtime_error("Failed to get aio events: " + std::string(strerror(-got))));
             }
+
+            // Profile: record completion time per iocb
+            auto complete_time = std::chrono::high_resolution_clock::now();
+
             for(int i = 0; i < got; i++) {
-                // We do not check the expected return value of this->aio_events[i].res here.
-                // We believe checking only for errors (this->aio_events[i].res < 0) is enough.
                 if(this->aio_events[i].res < 0) {
                     print_and_throw(std::runtime_error("Failed to get aio events: " + std::string(strerror(-this->aio_events[i].res))));
                 }
                 // NOTE: event_chunk_id can be different from chunk_id
                 chunk_id_t event_chunk_id = (chunk_id_t)this->aio_events[i].data;
                 this->chunks[event_chunk_id].extra_data.aio_unfinished_cnt --;
+
+                if(_env_debug()) {
+                    struct iocb *completed_iocb = this->aio_events[i].obj;
+                    std::lock_guard<std::mutex> lock(this->aio_profile_mutex);
+                    auto it = this->aio_profile_map.find(completed_iocb);
+                    if(it != this->aio_profile_map.end()) {
+                        this->aio_profiles[it->second].complete_time = complete_time;
+                        this->aio_profiles[it->second].chunk_read_at_complete = this->chunk_read.load(std::memory_order_relaxed);
+                        this->aio_profile_map.erase(it);
+                    }
+                }
             }
         }
 

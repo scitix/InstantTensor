@@ -469,6 +469,8 @@ void Loader::poll_read_chunk() {
 }
 
 void Loader::wait_read_chunk(chunk_id_t chunk_id) {
+    // fprintf(stderr, "wait_read_chunk(reading=%d, read=%d, wait=%d)\n", 
+    //     (int)this->chunk_reading, (int)this->chunk_read, (int)chunk_id);
     chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
     if(chunk_id > this->chunk_reading.load(std::memory_order_relaxed)) {
         print_and_throw(std::runtime_error("Internal error: chunk_id out of range."));
