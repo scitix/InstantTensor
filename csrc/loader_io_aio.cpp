@@ -44,22 +44,42 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
     size_t submit_cnt = 0;
     size_t window_idx = p.window_idx;
+
+    bool unaligned_last_page = false;
+
     for(size_t i = 0; i < this->num_threads; i++) {
         size_t thread_offset = p.padded_thread_size * i;
+        // thread_size <= thread_size_aligned <= padded_thread_size
         size_t thread_size = std::min((size_t)std::max((ssize_t)(p.chunk.size - p.rank_offset - thread_offset), (ssize_t)0), p.padded_thread_size);
+        size_t thread_size_aligned = ROUND_UP(thread_size, this->thread_alignment);
+        if(thread_size != thread_size_aligned) unaligned_last_page = true;
         if(thread_size == 0) continue;
         struct iocb *iocb = this->aio_iocb_ptrs[window_idx * this->num_threads + i];
-        // NOTE: aio needs the read size padded to PAGE_SIZE
-        io_prep_pread(iocb, p.file.fd, (char*)this->host_buffer + p.window_offset + thread_offset, p.padded_thread_size, p.chunk.file_offset + p.rank_offset + thread_offset);
+        size_t file_offset = p.chunk.file_offset + p.rank_offset + thread_offset;
+        // NOTE: aio needs the read size aligned to PAGE_SIZE
+        io_prep_pread(iocb, p.file.fd, (char*)this->host_buffer + p.window_offset + thread_offset, thread_size_aligned, file_offset);
         iocb->data = (void*)chunk_id;
         submit_cnt ++;
     }
     this->chunks[chunk_id].extra_data.aio_unfinished_cnt = submit_cnt;
 
-    int ret = io_submit(this->aio_ctx, submit_cnt, this->aio_iocb_ptrs.data() + window_idx * this->num_threads);
-    if(ret < 0){
-        print_and_throw(std::runtime_error("Failed to submit aio: " + std::string(strerror(-ret))));
+    // NOTE: This will block at the last page of the file if the file is not page aligned.
+    //       So we put the last page into another thread
+    auto aio_func = [=]() {
+        int ret = io_submit(this->aio_ctx, submit_cnt, this->aio_iocb_ptrs.data() + window_idx * this->num_threads);
+        if(ret < 0){
+            print_and_throw(std::runtime_error("Failed to submit aio: " + std::string(strerror(-ret))));
+        }
+    };
+
+    int aio_req_id = 0;
+    if(unaligned_last_page) {
+        aio_req_id = this->aio_fallback_thread->post(std::move(aio_func));
     }
+    else {
+        aio_func();
+    }
+    
 
     void *rank_mid = (char*)this->host_buffer + p.window_offset;
     void *rank_dst = p.rank_dst;
@@ -68,6 +88,9 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     size_t padded_rank_size = p.padded_rank_size;
     cudaEvent_t event = p.event;
     auto cuda_func = [=]() {
+        if(unaligned_last_page) {
+            this->aio_fallback_thread->pop(aio_req_id);
+        }
         // disk to host
         size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.aio_unfinished_cnt;
         while(unfinished_cnt > 0) {

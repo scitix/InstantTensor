@@ -124,6 +124,11 @@ void Loader::init_threads() {
             this->cuda_thread = std::make_unique<AsyncExecutor>();
         }
     }
+    if(this->need_aio) {
+        if(!this->aio_fallback_thread) {
+            this->aio_fallback_thread = std::make_unique<AsyncExecutor>();
+        }
+    }
 
     if(!this->cuda_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->cuda_stream, cudaStreamNonBlocking));
@@ -140,6 +145,9 @@ void Loader::init_threads() {
     }
     if(this->cuda_thread) {
         this->cuda_thread->post(set_device_func);
+    }
+    if(this->aio_fallback_thread) {
+        this->aio_fallback_thread->post(set_device_func);
     }
     if(this->wait_thread) {
         this->wait_thread->post(set_device_func);
@@ -166,6 +174,9 @@ void Loader::destroy_threads() {
     }
     if (this->cuda_thread) {
         this->cuda_thread->join();
+    }
+    if (this->aio_fallback_thread) {
+        this->aio_fallback_thread->join();
     }
     if (this->wait_thread) {
         this->wait_thread->join();
@@ -308,6 +319,27 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
     reset_chunk_buffer_offset(tensor_id);
     // set prefetch_chunk_id of all last layer tensors to the last chunk
     reset_chunk_buffer_offset(tensor_id);
+
+
+    // // for debugging. Uncomment to print the layout of the tensors and chunks
+    // if(this->rank == 0) {
+    //     size_t min_alignment = this->tensors[0].file_offset & -this->tensors[0].file_offset;
+    //     for(size_t i = 0; i < this->tensors.size(); i++) {
+    //         min_alignment = std::min(min_alignment, this->tensors[i].file_offset & -this->tensors[i].file_offset);
+    //     }
+    //     fprintf(stderr, "min_alignment = %zu\n", min_alignment);
+    //     for(size_t i = 0; i < this->tensors.size(); i++) {
+    //         fprintf(stderr, "tensor %zu: size = %zu, file_index = %zu, file_offset = %zu, buffer_offset = %zu, last_chunk_id = %zu, prefetch_chunk_id = %zu\n", 
+    //             i, this->tensors[i].size, this->tensors[i].file_index, this->tensors[i].file_offset, this->tensors[i].device_buffer_offset, this->tensors[i].last_chunk_id, this->tensors[i].prefetch_chunk_id);
+    //     }
+    //     for(size_t i = 0; i < this->chunks.size(); i++) {
+    //         fprintf(stderr, "chunk %zu: size = %zu, file_index = %zu, file_offset = %zu, buffer_offset = %zu, file_page = %zu-%zu, buffer_page = %zu-%zu\n", 
+    //             i, this->chunks[i].size, this->chunks[i].file_index, this->chunks[i].file_offset, this->chunks[i].device_buffer_offset,
+    //             this->chunks[i].file_offset / PAGE_SIZE, (this->chunks[i].file_offset + this->chunks[i].size - 1) / PAGE_SIZE,
+    //             this->chunks[i].device_buffer_offset / PAGE_SIZE, (this->chunks[i].device_buffer_offset + this->chunks[i].size - 1) / PAGE_SIZE
+    //         );
+    //     }
+    // }
 }
 
 void Loader::open(OpenArgs args) {
@@ -404,12 +436,12 @@ void Loader::post_read_chunk() {
         this->wait_read_chunk(wait_chunk_id);
     }
 
-    if(_env_debug()) {
-        if (this->rank == 0 && this->prev_file_index != chunk.file_index) {
-            this->prev_file_index = chunk.file_index;
-            fprintf(stderr, "file_index = %zu\n", chunk.file_index);
-        }
-    }
+    // if(_env_debug()) {
+    //     if (this->rank == 0 && this->prev_file_index != chunk.file_index) {
+    //         this->prev_file_index = chunk.file_index;
+    //         fprintf(stderr, "file_index = %zu\n", chunk.file_index);
+    //     }
+    // }
 
     FileInfo &f = this->file_info[chunk.file_index];
     ChunkIOParams params{chunk_id, chunk, f, padded_world_chunk_size, padded_rank_size, padded_thread_size,

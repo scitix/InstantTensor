@@ -43,6 +43,7 @@ public:
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
     vector<unique_ptr<AsyncExecutor>> worker_threads;
+    unique_ptr<AsyncExecutor> aio_fallback_thread;
     unique_ptr<AsyncExecutor> cuda_thread;
     unique_ptr<AsyncExecutor> wait_thread;
     std::thread io_depth_sample_thread;
@@ -60,7 +61,7 @@ public:
     const size_t first_tensor_alignment = 16;
     // NOTE: cudaHostRegisterMapped can be automatically determined.
     int cuda_host_register_flags = 0;
-    size_t prev_file_index = (size_t)-1;
+    // size_t prev_file_index = (size_t)-1;
 
     // aio
     io_context_t aio_ctx = {};
