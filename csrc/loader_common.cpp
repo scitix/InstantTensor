@@ -7,6 +7,7 @@ Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQue
     this->output_queue = std::move(output_queue);
     this->use_internal_memory_register = _env_use_internal_memory_register();
     this->use_cufile = _env_use_cufile();
+    // _env_use_uring() is checked at open_file() time, stored in need_uring
 }
 
 void Loader::open_file() {
@@ -18,12 +19,17 @@ void Loader::open_file() {
             this->open_file_inmem(f);
         } else if (this->use_cufile) {
             this->open_file_cufile(f);
+        } else if (_env_use_uring()) {
+            this->open_file_uring(f);
         } else {
             this->open_file_aio(f);
         }
     }
     if(this->need_aio) {
         this->open_file_aio_context();
+    }
+    if(this->need_uring) {
+        this->open_uring_context();
     }
 }
 
@@ -34,12 +40,17 @@ void Loader::close_file() {
             this->close_file_inmem(f);
         } else if (this->use_cufile) {
             this->close_file_cufile(f);
+        } else if (this->need_uring) {
+            this->close_file_uring(f);
         } else {
             this->close_file_aio(f);
         }
     }
     if(this->need_aio) {
         this->close_file_aio_context();
+    }
+    if(this->need_uring) {
+        this->close_uring_context();
     }
 }
 
@@ -129,6 +140,11 @@ void Loader::init_threads() {
             this->aio_fallback_thread = std::make_unique<AsyncExecutor>();
         }
     }
+    if(this->need_uring) {
+        if(!this->uring_thread) {
+            this->uring_thread = std::make_unique<AsyncExecutor>();
+        }
+    }
 
     if(!this->cuda_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->cuda_stream, cudaStreamNonBlocking));
@@ -177,6 +193,9 @@ void Loader::destroy_threads() {
     }
     if (this->aio_fallback_thread) {
         this->aio_fallback_thread->join();
+    }
+    if (this->uring_thread) {
+        this->uring_thread->join();
     }
     if (this->wait_thread) {
         this->wait_thread->join();
@@ -452,6 +471,8 @@ void Loader::post_read_chunk() {
         result = this->post_read_chunk_inmem(params);
     } else if (this->use_cufile) {
         result = this->post_read_chunk_cufile(params);
+    } else if (this->need_uring) {
+        result = this->post_read_chunk_uring(params);
     } else {
         result = this->post_read_chunk_aio(params);
     }

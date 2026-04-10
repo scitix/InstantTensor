@@ -3,6 +3,7 @@
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/types.hpp>
 #include <instant_tensor/io_context.hpp>
+#include <liburing.h>
 
 namespace instanttensor {
 
@@ -69,6 +70,14 @@ public:
     vector<struct iocb*> aio_iocb_ptrs;
     vector<struct io_event> aio_events;
 
+    // io_uring (loader_io_uring.cpp)
+    // All io_uring calls happen exclusively on uring_thread (SPSC: main posts, cuda_thread pops).
+    // This matches the aio_fallback_thread pattern and avoids concurrent SQ/CQ access.
+    bool need_uring = false;
+    struct io_uring uring_ring = {};
+    size_t uring_ring_size = 0;
+    unique_ptr<AsyncExecutor> uring_thread;
+
     int device_idx = -1;
     ncclComm_t group_communicator = nullptr;
     int rank = -1;
@@ -125,6 +134,13 @@ public:
     void close_file_aio(FileInfo &f);    // close fd
     void close_file_aio_context();       // io_destroy
     ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
+
+    // io_uring path (loader_io_uring.cpp)
+    void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
+    void open_uring_context();           // io_uring_queue_init
+    void close_file_uring(FileInfo &f);  // close fd
+    void close_uring_context();          // io_uring_queue_exit
+    ChunkRequest post_read_chunk_uring(const ChunkIOParams &p);
 };
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);

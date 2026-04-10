@@ -377,6 +377,19 @@ class safe_open:
                     concurrency = max(32 // self.world_size, 1) 
                 if io_depth is None:
                     io_depth = 16 # cuFileRead + ncclAllGather # why this has effect?
+            elif os.environ.get('INSTANTTENSOR_USE_URING', '0') == '1': # io_uring buffered
+                if chunk_size is None:
+                    chunk_size = 8*1024*1024
+                if concurrency is None:
+                    # Each SQE dispatches to a separate io-wq kernel worker thread,
+                    # so higher concurrency = more parallel page-cache fills.
+                    # Match fastsafetensors' default of 16 concurrent reads.
+                    concurrency = max(16 // self.world_size, 1)
+                if io_depth is None:
+                    # Pipeline depth: uring_read + cudaMemcpyAsync + ncclAllGather.
+                    # uring_thread is sequential (one chunk at a time), so we only
+                    # need 3 in-flight device buffers, not 512.
+                    io_depth = 3
             else: # aio
                 if chunk_size is None:
                     chunk_size = 8*1024*1024

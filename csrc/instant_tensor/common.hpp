@@ -126,6 +126,11 @@ inline bool _env_cache_buffer(){
     return ret;
 }
 
+inline bool _env_use_uring(){
+    static bool ret = get_env("INSTANTTENSOR_USE_URING").value_or("0") == "1";
+    return ret;
+}
+
 inline bool _env_debug() {
     static bool ret = get_env("INSTANTTENSOR_DEBUG").value_or("0") == "1";
     return ret;
