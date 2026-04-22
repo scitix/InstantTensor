@@ -8,7 +8,7 @@ namespace instanttensor {
 // uring_thread (an SPSCAsyncExecutor).  The main loader thread is the only
 // producer; cuda_thread is the only consumer (via uring_thread->pop).
 //
-// This mirrors the existing aio_fallback_thread pattern and avoids any
+// This mirrors the existing last_page_reader_thread pattern and avoids any
 // concurrent access to the liburing userspace state, which is not thread-safe.
 //
 // Within each chunk, the uring_func submits num_threads SQEs simultaneously
@@ -22,7 +22,11 @@ namespace instanttensor {
 void Loader::open_file_uring(FileInfo &f) {
     // Buffered fd — no O_DIRECT.  Page-cache reads are done by kernel io-wq
     // workers, which is what makes them truly async with io_uring.
-    f.fd = ::open(f.filename.c_str(), O_RDONLY);
+    int open_flags = O_RDONLY;
+    if (_env_direct_io()) {
+        open_flags |= O_DIRECT;
+    }
+    f.fd = ::open(f.filename.c_str(), open_flags);
     if (f.fd < 0) {
         throw std::runtime_error("Failed to open file: " + f.filename);
     }
@@ -34,7 +38,9 @@ void Loader::open_file_uring(FileInfo &f) {
 
     // Hint sequential access so the VFS read-ahead fills the page cache ahead
     // of our reads and reduces the time spent in the io-wq workers.
-    posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    if (!_env_direct_io()) {
+        posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
 
     this->need_uring       = true;
     this->need_host_buffer = true;
@@ -42,15 +48,7 @@ void Loader::open_file_uring(FileInfo &f) {
 }
 
 void Loader::open_uring_context() {
-    // Ring depth must cover io_depth × num_threads in-flight SQEs.
-    // io_uring_queue_init rounds up internally, but we round up ourselves too
-    // to ensure the ring can hold all in-flight entries without blocking.
-    unsigned needed = (unsigned)(this->io_depth * this->num_threads);
-    unsigned ring_entries = 1;
-    while (ring_entries < needed) ring_entries <<= 1;
-    this->uring_ring_size = ring_entries;
-
-    int ret = io_uring_queue_init(ring_entries, &this->uring_ring, 0);
+    int ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring, 0);
     if (ret < 0) {
         throw std::runtime_error(
             "io_uring_queue_init failed: " + std::string(strerror(-ret)));
@@ -79,14 +77,19 @@ struct UringReadOp {
 ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     // Build the per-thread read descriptors on the main thread (no io_uring
     // calls here — those happen exclusively on uring_thread below).
+    chunk_id_t chunk_id = p.chunk_id;
     std::vector<UringReadOp> ops;
     ops.reserve(this->num_threads);
+
+    bool unaligned_last_page = false;
 
     for (size_t i = 0; i < this->num_threads; i++) {
         size_t thread_offset = p.padded_thread_size * i;
         size_t thread_size   = std::min(
             (size_t)std::max((ssize_t)(p.chunk.size - p.rank_offset - thread_offset), (ssize_t)0),
             p.padded_thread_size);
+        size_t thread_size_aligned = ROUND_UP(thread_size, this->thread_alignment);
+        if(thread_size != thread_size_aligned) unaligned_last_page = true;
         if (thread_size == 0) continue;
 
         ops.push_back(UringReadOp{
@@ -97,55 +100,39 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
         });
     }
 
-    // ── uring_func: runs on uring_thread ─────────────────────────────────────
-    // Submits all SQEs then waits for exactly that many CQEs.
-    // Because uring_thread is sequential and chunk N's SQEs are the only ones
-    // in-flight at this point, every CQE must belong to chunk N — no cross-
-    // chunk dispatch needed.
-    auto uring_func = [this, ops = std::move(ops)]() {
-        const size_t submit_cnt = ops.size();
-        if (submit_cnt == 0) return;
-
-        for (const auto &op : ops) {
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
-            if (!sqe) {
-                throw std::runtime_error(
-                    "io_uring SQ full (ring_entries=" +
-                    std::to_string(this->uring_ring_size) + ")");
-            }
-            // Buffered read: no alignment constraints, use exact byte range.
-            io_uring_prep_read(sqe, op.fd, op.buf,
-                               (unsigned)op.size, op.file_offset);
+    for (const auto &op : ops) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
+        if (!sqe) {
+            throw std::runtime_error(
+                "io_uring SQ full");
         }
+        // Buffered read: no alignment constraints, use exact byte range.
+        io_uring_prep_read(sqe, op.fd, op.buf,
+                        (unsigned)op.size, op.file_offset);
+        io_uring_sqe_set_data(sqe, (void*)p.chunk_id); // type of user_data is __u64
+    }
+    this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
+    const size_t submit_cnt = ops.size();
 
+    int uring_req_id = 0;
+    auto uring_func = [=]() {
         int submitted = io_uring_submit(&this->uring_ring);
         if (submitted < 0) {
             throw std::runtime_error(
                 "io_uring_submit failed: " + std::string(strerror(-submitted)));
         }
-
-        // Wait for all submitted reads to complete.
-        // io_uring_wait_cqe blocks until at least one CQE is available;
-        // the kernel's io-wq workers are doing the actual I/O in parallel.
-        for (size_t done = 0; done < submit_cnt; done++) {
-            struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(&this->uring_ring, &cqe);
-            if (ret < 0) {
-                throw std::runtime_error(
-                    "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
-            }
-            if (cqe->res < 0) {
-                std::string msg =
-                    "io_uring read error: " + std::string(strerror(-cqe->res));
-                io_uring_cqe_seen(&this->uring_ring, cqe);
-                throw std::runtime_error(msg);
-            }
-            io_uring_cqe_seen(&this->uring_ring, cqe);
-        }
-        // All reads for this chunk are complete; host_buffer is populated.
     };
 
-    int uring_req_id = this->uring_thread->post(std::move(uring_func));
+    if(submit_cnt > 0) {
+        if(unaligned_last_page) {
+            uring_req_id = this->last_page_reader_thread->post(std::move(uring_func));
+        }
+        else {
+            uring_func();
+        }
+    }
+
+    // int uring_req_id = this->uring_thread->post(std::move(uring_func));
 
     // ── cuda_func: runs on cuda_thread ───────────────────────────────────────
     // Waits for uring_thread to finish (SPSC pop: cuda_thread is the sole
@@ -158,7 +145,28 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     cudaEvent_t event       = p.event;
 
     auto cuda_func = [=]() {
-        this->uring_thread->pop(uring_req_id);  // wait for I/O completion
+        if(uring_req_id) {
+            this->last_page_reader_thread->pop(uring_req_id);
+        }
+
+        size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.unfinished_cnt;
+        while(unfinished_cnt > 0) {
+            struct io_uring_cqe *cqe;
+            int ret = io_uring_wait_cqe(&this->uring_ring, &cqe);
+            if (ret != 0) {
+                throw std::runtime_error(
+                    "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
+            }
+            if (cqe->res < 0) {
+                std::string msg =
+                    "io_uring read error: " + std::string(strerror(-cqe->res));
+                io_uring_cqe_seen(&this->uring_ring, cqe);
+                throw std::runtime_error(msg);
+            }
+            chunk_id_t cqe_chunk_id = (chunk_id_t)io_uring_cqe_get_data(cqe);
+            this->chunks[cqe_chunk_id].extra_data.unfinished_cnt --;
+            io_uring_cqe_seen(&this->uring_ring, cqe);
+        }
 
         CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_mid, rank_size,
                                    cudaMemcpyHostToDevice, this->cuda_stream));

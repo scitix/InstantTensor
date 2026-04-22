@@ -27,7 +27,9 @@ public:
 
     template<typename F>
     int post(F&& f) {
-        int id = next_id.fetch_add(1, std::memory_order_relaxed);
+        int id = next_id;
+        if(next_id < INT_MAX) next_id++;
+        else next_id = 1; // skip 0
 
         Task t = [fn = std::forward<F>(f)]() mutable -> std::any {
             using R = std::invoke_result_t<decltype(fn)>;
@@ -138,8 +140,8 @@ private:
     SPSCQueue<WorkPair, OutputQueueCapacity>      output_queue;
     std::unordered_map<int,std::any> result_buffer; // cache out-of-order results
 
-    std::atomic<int>         next_id;
-    std::thread              worker;
+    int         next_id;
+    std::thread worker;
 
     void run() {
         WorkItem w;

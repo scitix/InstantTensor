@@ -135,14 +135,9 @@ void Loader::init_threads() {
             this->cuda_thread = std::make_unique<AsyncExecutor>();
         }
     }
-    if(this->need_aio) {
-        if(!this->aio_fallback_thread) {
-            this->aio_fallback_thread = std::make_unique<AsyncExecutor>();
-        }
-    }
-    if(this->need_uring) {
-        if(!this->uring_thread) {
-            this->uring_thread = std::make_unique<AsyncExecutor>();
+    if(this->need_aio || this->need_uring) {
+        if(!this->last_page_reader_thread) {
+            this->last_page_reader_thread = std::make_unique<AsyncExecutor>();
         }
     }
 
@@ -162,8 +157,8 @@ void Loader::init_threads() {
     if(this->cuda_thread) {
         this->cuda_thread->post(set_device_func);
     }
-    if(this->aio_fallback_thread) {
-        this->aio_fallback_thread->post(set_device_func);
+    if(this->last_page_reader_thread) {
+        this->last_page_reader_thread->post(set_device_func);
     }
     if(this->wait_thread) {
         this->wait_thread->post(set_device_func);
@@ -191,11 +186,8 @@ void Loader::destroy_threads() {
     if (this->cuda_thread) {
         this->cuda_thread->join();
     }
-    if (this->aio_fallback_thread) {
-        this->aio_fallback_thread->join();
-    }
-    if (this->uring_thread) {
-        this->uring_thread->join();
+    if (this->last_page_reader_thread) {
+        this->last_page_reader_thread->join();
     }
     if (this->wait_thread) {
         this->wait_thread->join();

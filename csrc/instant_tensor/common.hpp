@@ -131,6 +131,12 @@ inline bool _env_use_uring(){
     return ret;
 }
 
+// Enable O_DIRECT for libaio/io_uring
+inline bool _env_direct_io(){
+    static bool ret = get_env("INSTANTTENSOR_DIRECT_IO").value_or("1") == "1";
+    return ret;
+}
+
 inline bool _env_debug() {
     static bool ret = get_env("INSTANTTENSOR_DEBUG").value_or("0") == "1";
     return ret;

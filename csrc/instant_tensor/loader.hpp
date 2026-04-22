@@ -35,6 +35,7 @@ public:
     bool need_host_buffer = false;
     bool need_cufile = false;
     bool need_aio = false;
+    bool need_uring = false;
     bool need_worker_threads = false;
     bool need_cuda_thread = false;
     void *device_buffer = nullptr;
@@ -44,7 +45,9 @@ public:
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
     vector<unique_ptr<AsyncExecutor>> worker_threads;
-    unique_ptr<AsyncExecutor> aio_fallback_thread;
+    // A special thread to read the last page of a file when the file size is not page aligned, 
+    // which results in blocking I/O even with O_DIRECT and libaio/io_uring.
+    unique_ptr<AsyncExecutor> last_page_reader_thread; 
     unique_ptr<AsyncExecutor> cuda_thread;
     unique_ptr<AsyncExecutor> wait_thread;
     std::thread io_depth_sample_thread;
@@ -71,12 +74,7 @@ public:
     vector<struct io_event> aio_events;
 
     // io_uring (loader_io_uring.cpp)
-    // All io_uring calls happen exclusively on uring_thread (SPSC: main posts, cuda_thread pops).
-    // This matches the aio_fallback_thread pattern and avoids concurrent SQ/CQ access.
-    bool need_uring = false;
     struct io_uring uring_ring = {};
-    size_t uring_ring_size = 0;
-    unique_ptr<AsyncExecutor> uring_thread;
 
     int device_idx = -1;
     ncclComm_t group_communicator = nullptr;
