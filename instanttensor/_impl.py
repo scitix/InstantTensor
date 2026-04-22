@@ -16,20 +16,17 @@ except AttributeError:
     # _C module is mocked (e.g., during Sphinx documentation build)
     print("instanttensor._C is mocked, skipping cleanup registration")
 
-_env_debug = None
-_env_use_cufile = None
-
 def env_debug():
-    global _env_debug
-    if _env_debug is None:
-        _env_debug = os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
-    return _env_debug
+    return os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
 
 def env_use_cufile():
-    global _env_use_cufile
-    if _env_use_cufile is None:
-        _env_use_cufile = os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
-    return _env_use_cufile
+    return os.environ.get("INSTANTTENSOR_USE_CUFILE", "0") == "1"
+
+def env_use_uring():
+    return os.environ.get("INSTANTTENSOR_USE_URING", "0") == "1"
+
+def env_direct_io():
+    return os.environ.get("INSTANTTENSOR_DIRECT_IO", "1") == "1"
 
 def env_chunk_size():
     ret = os.environ.get("INSTANTTENSOR_CHUNK_SIZE")
@@ -377,13 +374,21 @@ class safe_open:
                     concurrency = max(32 // self.world_size, 1) 
                 if io_depth is None:
                     io_depth = 16 # cuFileRead + ncclAllGather # why this has effect?
-            else: # aio
-                if chunk_size is None:
-                    chunk_size = 8*1024*1024
-                if concurrency is None:
-                    concurrency = 1 # max(1 // self.world_size, 1)
-                if io_depth is None:
-                    io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+            else: 
+                if env_direct_io(): # io_uring or libaio with O_DIRECT
+                    if chunk_size is None:
+                        chunk_size = 8*1024*1024
+                    if concurrency is None:
+                        concurrency = 1 # max(1 // self.world_size, 1)
+                    if io_depth is None:
+                        io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+                else: # buffered io_uring or libaio
+                    if chunk_size is None:
+                        chunk_size = 8*1024*1024
+                    if concurrency is None:
+                        concurrency = 16
+                    if io_depth is None:
+                        io_depth = max(32 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
         
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5

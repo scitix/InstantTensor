@@ -3,6 +3,7 @@
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/types.hpp>
 #include <instant_tensor/io_context.hpp>
+#include <liburing.h>
 
 namespace instanttensor {
 
@@ -34,6 +35,7 @@ public:
     bool need_host_buffer = false;
     bool need_cufile = false;
     bool need_aio = false;
+    bool need_uring = false;
     bool need_worker_threads = false;
     bool need_cuda_thread = false;
     void *device_buffer = nullptr;
@@ -43,7 +45,9 @@ public:
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
     vector<unique_ptr<AsyncExecutor>> worker_threads;
-    unique_ptr<AsyncExecutor> aio_fallback_thread;
+    // A special thread to read the last page of a file when the file size is not page aligned, 
+    // which results in blocking I/O even with O_DIRECT and libaio/io_uring.
+    unique_ptr<AsyncExecutor> last_page_reader_thread; 
     unique_ptr<AsyncExecutor> cuda_thread;
     unique_ptr<AsyncExecutor> wait_thread;
     std::thread io_depth_sample_thread;
@@ -68,6 +72,9 @@ public:
     vector<struct iocb> aio_iocbs;
     vector<struct iocb*> aio_iocb_ptrs;
     vector<struct io_event> aio_events;
+
+    // io_uring (loader_io_uring.cpp)
+    struct io_uring uring_ring = {};
 
     int device_idx = -1;
     ncclComm_t group_communicator = nullptr;
@@ -125,6 +132,13 @@ public:
     void close_file_aio(FileInfo &f);    // close fd
     void close_file_aio_context();       // io_destroy
     ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
+
+    // io_uring path (loader_io_uring.cpp)
+    void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
+    void open_uring_context();           // io_uring_queue_init
+    void close_file_uring(FileInfo &f);  // close fd
+    void close_uring_context();          // io_uring_queue_exit
+    ChunkRequest post_read_chunk_uring(const ChunkIOParams &p);
 };
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);

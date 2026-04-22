@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <instant_tensor/common.hpp>
 
 namespace instanttensor {
@@ -69,7 +70,7 @@ struct TensorMetadate {
 };
 
 struct ChunkExtraData {
-    size_t aio_unfinished_cnt;
+    size_t unfinished_cnt;
 };
 
 struct ChunkRequest {

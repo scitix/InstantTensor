@@ -88,10 +88,11 @@ def get_ext_modules():
                 "csrc/loader_io_cufile.cpp",
                 "csrc/loader_io_aio.cpp",
                 "csrc/loader_io_inmem.cpp",
+                "csrc/loader_io_uring.cpp",
             ],
             include_dirs=include_dirs,
             library_dirs=[libaio_src],
-            libraries=["dl", LIBAIO_LINK_SHORT],
+            libraries=["dl", LIBAIO_LINK_SHORT, "uring"],
             extra_compile_args=cxx_flags,
             extra_link_args=["-Wl,-rpath,$ORIGIN"],
         )

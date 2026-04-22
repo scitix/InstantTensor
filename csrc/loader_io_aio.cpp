@@ -3,13 +3,21 @@
 namespace instanttensor {
 
 void Loader::open_file_aio(FileInfo &f) {
-    f.fd = ::open(f.filename.c_str(), O_RDONLY | O_DIRECT);
+    int open_flags = O_RDONLY;
+    if (_env_direct_io()) {
+        open_flags |= O_DIRECT;
+    }
+    f.fd = ::open(f.filename.c_str(), open_flags);
     if (f.fd < 0) {
         throw std::runtime_error("Failed to open file: " + f.filename);
     }
     struct stat st;
     if (fstat(f.fd, &st) < 0) { throw std::runtime_error("Failed to fstat file: " + f.filename); }
     f.size = st.st_size;
+
+    if (!_env_direct_io()) {
+        posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
 
     this->need_aio = true;
     this->need_host_buffer = true;
@@ -61,7 +69,7 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         iocb->data = (void*)chunk_id;
         submit_cnt ++;
     }
-    this->chunks[chunk_id].extra_data.aio_unfinished_cnt = submit_cnt;
+    this->chunks[chunk_id].extra_data.unfinished_cnt = submit_cnt;
 
     // NOTE: This will block at the last page of the file if the file is not page aligned.
     //       So we put the last page into another thread
@@ -73,11 +81,13 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     };
 
     int aio_req_id = 0;
-    if(unaligned_last_page) {
-        aio_req_id = this->aio_fallback_thread->post(std::move(aio_func));
-    }
-    else {
-        aio_func();
+    if(submit_cnt > 0) {
+        if(unaligned_last_page) {
+            aio_req_id = this->last_page_reader_thread->post(std::move(aio_func));
+        }
+        else {
+            aio_func();
+        }
     }
     
 
@@ -88,11 +98,11 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     size_t padded_rank_size = p.padded_rank_size;
     cudaEvent_t event = p.event;
     auto cuda_func = [=]() {
-        if(unaligned_last_page) {
-            this->aio_fallback_thread->pop(aio_req_id);
+        if(aio_req_id) {
+            this->last_page_reader_thread->pop(aio_req_id);
         }
         // disk to host
-        size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.aio_unfinished_cnt;
+        size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.unfinished_cnt;
         while(unfinished_cnt > 0) {
             int got = io_getevents(this->aio_ctx, unfinished_cnt, unfinished_cnt, this->aio_events.data(), NULL);
             // got may < min_nr and >= 0 if interrupted
@@ -107,7 +117,7 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
                 }
                 // NOTE: event_chunk_id can be different from chunk_id
                 chunk_id_t event_chunk_id = (chunk_id_t)this->aio_events[i].data;
-                this->chunks[event_chunk_id].extra_data.aio_unfinished_cnt --;
+                this->chunks[event_chunk_id].extra_data.unfinished_cnt --;
             }
         }
 
