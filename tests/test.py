@@ -13,8 +13,6 @@ import ctypes
 import instanttensor
 from instanttensor import safe_open as instant_safe_open
 
-from safetensors import safe_open as safetensors_safe_open
-
 # import pdb
 # pdb.set_trace()
 
@@ -26,8 +24,8 @@ def parse_args():
     parser.add_argument(
         'backend',
         type=str,
-        choices=['instanttensor', 'safetensors'],
-        help='Backend type (choices: instanttensor, safetensors)'
+        choices=['instanttensor', 'safetensors', 'runai_model_streamer', 'fastsafetensors'],
+        help='Backend type (choices: instanttensor, safetensors, runai_model_streamer, fastsafetensors)'
     )
     # all remaining positional arguments go into files list
     parser.add_argument(
@@ -147,6 +145,7 @@ t_keys = 0
 t_first = 0
 
 def safetensors_iterator(files):
+    from safetensors import safe_open as safetensors_safe_open
     global t_open, t_close, t_keys, t_first
     for file in files:
         t_open_record = time.perf_counter()
@@ -182,9 +181,94 @@ def instanttensor_iterator(files, device, process_group):
         t_close_record = time.perf_counter()
     t_close += time.perf_counter() - t_close_record
 
+def _init_loader(
+    pg: torch.distributed.ProcessGroup,
+    device: torch.device,
+    f_list: list[str],
+    *,
+    nogds: bool = False,
+):
+    from fastsafetensors import SafeTensorsFileLoader
+    loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+    rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+    loader.add_filenames(rank_file_map)
+    return loader
+
+def fastsafetensors_weights_iterator(
+    hf_weights_files: list[str],
+):
+    """Iterate over the weights in the model safetensor files
+    using fastsafetensor library."""
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+    else:
+        from fastsafetensors import SingleGroup
+        pg = SingleGroup()
+
+    device = torch.device(f"cuda:{pg.rank()}")
+    weight_files_sub_lists = [
+        hf_weights_files[i : i + pg.size()]
+        for i in range(0, len(hf_weights_files), pg.size())
+    ]
+
+    nogds = False
+
+    for f_list in weight_files_sub_lists:
+        loader = _init_loader(pg, device, f_list, nogds=nogds)
+        try:
+            try:
+                fb = loader.copy_files_to_device()
+            except RuntimeError as e:
+                if "gds" not in str(e):
+                    raise
+
+                loader.close()
+                nogds = True
+                print(
+                    "GDS not enabled, setting `nogds=True`.\n"
+                    "For more information, see: https://github.com/foundation-model-stack/fastsafetensors?tab=readme-ov-file#basic-api-usages"
+                )
+                loader = _init_loader(pg, device, f_list, nogds=nogds)
+                fb = loader.copy_files_to_device()
+
+            try:
+                keys = list(fb.key_to_rank_lidx.keys())
+                for k in keys:
+                    t = fb.get_tensor(k)
+                    yield k, t
+            finally:
+                fb.close()
+        finally:
+            loader.close()
+
+def runai_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    is_distributed: bool = True,
+):
+    """Iterate over the weights in the model safetensor files."""
+    from runai_model_streamer import SafetensorsStreamer
+    with SafetensorsStreamer() as streamer:
+        device = f"cuda:{torch.cuda.current_device()}"
+
+        streamer.stream_files(
+            hf_weights_files,
+            device=device,
+            is_distributed=is_distributed,
+        )
+        total_tensors = sum(
+            len(tensors_meta)
+            for tensors_meta in streamer.files_to_tensors_metadata.values()
+        )
+
+        tensor_iter = streamer.get_tensors()
+
+        yield from tensor_iter
+
 tensor_iterator_map = {
     "safetensors": safetensors_iterator,
     "instanttensor": instanttensor_iterator,
+    "runai_model_streamer": runai_safetensors_weights_iterator,
+    "fastsafetensors": fastsafetensors_weights_iterator,
 }
 
 def distributed_load():
