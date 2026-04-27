@@ -10,8 +10,8 @@ namespace instanttensor {
 // Parameters computed in post_read_chunk preamble, passed to IO-specific methods
 struct ChunkIOParams {
     chunk_id_t chunk_id;
-    Chunk &chunk;
-    FileInfo &file;
+    const Chunk &chunk;
+    const FileInfo &file;
     size_t padded_world_chunk_size;
     size_t padded_rank_size;
     size_t padded_thread_size;
@@ -68,13 +68,18 @@ public:
     // size_t prev_file_index = (size_t)-1;
 
     // aio
+    bool aio_context_initialized = false;
     io_context_t aio_ctx = {};
     vector<struct iocb> aio_iocbs;
     vector<struct iocb*> aio_iocb_ptrs;
     vector<struct io_event> aio_events;
 
     // io_uring (loader_io_uring.cpp)
+    bool uring_context_initialized = false;
+    bool uring_register_file = true;
+    bool uring_register_buffer = true;
     struct io_uring uring_ring = {};
+    struct io_uring uring_ring_last_page = {};
 
     int device_idx = -1;
     ncclComm_t group_communicator = nullptr;
@@ -124,20 +129,24 @@ public:
     // cuFile IO path (loader_io_cufile.cpp)
     void open_file_cufile(FileInfo &f);  // open fd with O_DIRECT, cuFileHandleRegister
     void close_file_cufile(FileInfo &f); // cuFileHandleDeregister, close fd
+    void register_device_buffer_cufile();
+    void deregister_device_buffer_cufile();
     ChunkRequest post_read_chunk_cufile(const ChunkIOParams &p);
 
     // AIO path (loader_io_aio.cpp)
     void open_file_aio(FileInfo &f);     // open fd with O_DIRECT, fstat
-    void open_file_aio_context();        // io_setup, allocate iocb arrays
     void close_file_aio(FileInfo &f);    // close fd
-    void close_file_aio_context();       // io_destroy
+    void initialize_aio_context();        // io_setup, allocate iocb arrays
+    void destroy_aio_context();       // io_destroy
     ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
 
     // io_uring path (loader_io_uring.cpp)
     void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
-    void open_uring_context();           // io_uring_queue_init
     void close_file_uring(FileInfo &f);  // close fd
-    void close_uring_context();          // io_uring_queue_exit
+    void initialize_uring_context();           // io_uring_queue_init
+    void destroy_uring_context();          // io_uring_queue_exit
+    void register_host_buffer_uring();
+    void deregister_host_buffer_uring();
     ChunkRequest post_read_chunk_uring(const ChunkIOParams &p);
 };
 

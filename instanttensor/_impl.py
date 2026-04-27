@@ -375,20 +375,13 @@ class safe_open:
                 if io_depth is None:
                     io_depth = 16 # cuFileRead + ncclAllGather # why this has effect?
             else: 
-                if env_direct_io(): # io_uring or libaio with O_DIRECT
-                    if chunk_size is None:
-                        chunk_size = 8*1024*1024
-                    if concurrency is None:
-                        concurrency = 1 # max(1 // self.world_size, 1)
-                    if io_depth is None:
-                        io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
-                else: # buffered io_uring or libaio
-                    if chunk_size is None:
-                        chunk_size = 8*1024*1024
-                    if concurrency is None:
-                        concurrency = 16
-                    if io_depth is None:
-                        io_depth = max(32 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+                # io_uring or libaio
+                if chunk_size is None:
+                    chunk_size = 8*1024*1024
+                if concurrency is None:
+                    concurrency = 1 # max(1 // self.world_size, 1)
+                if io_depth is None:
+                    io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
         
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
@@ -564,54 +557,6 @@ class safe_open:
             if tensor.data_ptr() % tensor.element_size() != 0:
                 raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
             yield name, tensor
-
-    def get_tensor(self, name: str) -> torch.Tensor:
-        """Safetensors-compatible API: get a specific tensor by name from the safetensors file(s).
-        
-        This method retrieves a single tensor by its name. Random access is not supported;
-        tensors must be retrieved sequentially in the order returned by keys().
-        
-        Note:
-            It is recommended to use ``tensors()`` directly instead of this method.
-        
-        Args:
-            name: The name/key of the tensor to retrieve. Must match the next
-                tensor name in the sequence returned by keys().
-        
-        Returns:
-            The tensor as a ``torch.Tensor`` on the specified device. The tensor
-            points to an internal buffer and should be copied (using ``.clone()`` 
-            or ``.copy_()``) if used outside the current iteration.
-        
-        Raises:
-            ValueError: If the requested tensor name does not match the expected
-                name (i.e., tensors are not retrieved in the order returned by
-                ``keys()``).
-        
-        Example:
-            Compatible usage with safetensors API:
-            
-            >>> from instanttensor import safe_open
-            >>> 
-            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
-            ...     # Must get tensors in the exact order returned by keys()
-            ...     for key in f.keys():
-            ...         tensor = f.get_tensor(key)
-            ...         # Important: copy the tensor if storing for later use
-            ...         stored_tensor = tensor.clone()
-            ...         print(f"{key}: {stored_tensor.shape}")
-        
-        Warning:
-            Tensors must be retrieved in the exact order returned by ``keys()``.
-            Calling ``get_tensor()`` with a name that doesn't match the next expected
-            tensor will raise a ``ValueError``.
-        """
-        if self.tmp_generator is None:
-            self.tmp_generator = self.tensors()
-        expect_name, tensor = next(self.tmp_generator)
-        if name != expect_name:
-            raise ValueError(f"get_tensor() should be called in the order of tensor names returned by keys()")
-        return tensor
 
     def keys(self) -> list[str]:
         """Safetensors-compatible API: get the names of all tensors in the safetensors file(s).

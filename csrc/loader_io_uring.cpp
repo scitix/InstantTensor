@@ -17,6 +17,8 @@ namespace instanttensor {
 // parallel — unlike libaio, where io_submit serialises the iocbs through
 // generic_file_read_iter one at a time.
 
+#define IO_URING_REGISTER_BUFFER_SIZE (1<<30) // 1GiB buffer size limit
+
 // ─── file open / close ───────────────────────────────────────────────────────
 
 void Loader::open_file_uring(FileInfo &f) {
@@ -47,11 +49,33 @@ void Loader::open_file_uring(FileInfo &f) {
     this->need_cuda_thread = true;
 }
 
-void Loader::open_uring_context() {
+void Loader::initialize_uring_context() {
     int ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring, 0);
     if (ret < 0) {
         throw std::runtime_error(
             "io_uring_queue_init failed: " + std::string(strerror(-ret)));
+    }
+    // Since the SQ and CQ of uring both operate in SPSC mode, we use an extra ring to submit IO for the last page.
+    // ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring_last_page, 0);
+    // if (ret < 0) {
+    //     throw std::runtime_error(
+    //         "io_uring_queue_init failed: " + std::string(strerror(-ret)));
+    // }
+
+    // vector<unsigned int>num_workers = {32, 0};
+    // io_uring_register_iowq_max_workers(&this->uring_ring, num_workers.data());
+    // fprintf(stderr, "io_uring_register_iowq_max_workers: %d, %d\n", num_workers[0], num_workers[1]);
+
+    if(this->uring_register_file) {
+        vector<int> fds;
+        for(const auto &f : this->file_info) {
+            fds.push_back(f.fd);
+        }
+        ret = io_uring_register_files(&this->uring_ring, fds.data(), fds.size());
+        if (ret < 0) {
+            throw std::runtime_error(
+                "io_uring_register failed: " + std::string(strerror(-ret)));
+        }
     }
 }
 
@@ -59,8 +83,39 @@ void Loader::close_file_uring(FileInfo &f) {
     ::close(f.fd);
 }
 
-void Loader::close_uring_context() {
+void Loader::destroy_uring_context() {
+    if(this->uring_register_file) {
+        io_uring_unregister_files(&this->uring_ring);
+    }
+
+    // io_uring_queue_exit(&this->uring_ring_last_page);
     io_uring_queue_exit(&this->uring_ring);
+}
+
+void Loader::register_host_buffer_uring() {
+    if(this->uring_register_buffer) {
+        void *ptr = this->host_buffer_entry.ptr;
+        size_t size = this->host_buffer_entry.size;
+        vector<struct iovec> iovs;
+        while(size > 0) {
+            size_t iov_size = std::min(size, (size_t)IO_URING_REGISTER_BUFFER_SIZE);
+            iovs.push_back({ptr, iov_size});
+            ptr = (char*)ptr + iov_size;
+            size -= iov_size;
+        }
+
+        int ret = io_uring_register_buffers(&this->uring_ring, iovs.data(), iovs.size());
+        if (ret < 0) {
+            throw std::runtime_error(
+                "io_uring_register_buffers failed: " + std::string(strerror(-ret)));
+        }
+    }
+}
+
+void Loader::deregister_host_buffer_uring() {
+    if(this->uring_register_buffer) {
+        io_uring_unregister_buffers(&this->uring_ring);
+    }
 }
 
 // ─── chunk read ──────────────────────────────────────────────────────────────
@@ -68,7 +123,6 @@ void Loader::close_uring_context() {
 // Helper struct capturing the per-segment read parameters, built on the main
 // thread and moved into the uring_func lambda.
 struct UringReadOp {
-    int    fd;
     void  *buf;
     size_t size;
     size_t file_offset;
@@ -93,22 +147,59 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
         if (thread_size == 0) continue;
 
         ops.push_back(UringReadOp{
-            p.file.fd,
             (char*)this->host_buffer + p.window_offset + thread_offset,
             thread_size,
             p.chunk.file_offset + p.rank_offset + thread_offset,
         });
     }
 
+    struct io_uring *selected_ring = &this->uring_ring; // unaligned_last_page ? &this->uring_ring_last_page : &this->uring_ring;
+
     for (const auto &op : ops) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
+        struct io_uring_sqe *sqe = io_uring_get_sqe(selected_ring);
         if (!sqe) {
             throw std::runtime_error(
                 "io_uring SQ full");
         }
         // Buffered read: no alignment constraints, use exact byte range.
-        io_uring_prep_read(sqe, op.fd, op.buf,
-                        (unsigned)op.size, op.file_offset);
+        int file_handle = this->uring_register_file ? p.chunk.file_index : p.file.fd;
+
+        int buffer_index = -1;
+        if(this->uring_register_buffer) {
+            size_t left_buffer_index = ((char*)op.buf - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            size_t right_buffer_index = ((char*)op.buf + op.size - 1 - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            if(left_buffer_index == right_buffer_index) {
+                buffer_index = (int)left_buffer_index;
+            }
+        }
+        if(buffer_index != -1) {
+            io_uring_prep_read_fixed(sqe, file_handle, op.buf,
+                (unsigned)op.size, op.file_offset, buffer_index);
+        }
+        else {
+            io_uring_prep_read(sqe, file_handle, op.buf,
+                (unsigned)op.size, op.file_offset);
+        }
+        
+        if(this->uring_register_file) {
+            sqe->flags |= IOSQE_FIXED_FILE;
+        }
+
+        // Normal operation for io_uring is to try and issue an sqe as
+        // non-blocking first (do IO in the current thread without sleeping or waiting), 
+        // and if that fails, execute it in an async manner (do IO in another thread). 
+        // However, the non-blocking path will perform "inline memory copy" 
+        // if the page cache is available under buffered IO (w/o O_DIRECT).
+        // Such inline copy is time consuming and does not benefit from multithreading.
+        // Thus we mark it as async, indicating that we prefer to do IO in another thread instead of inline.
+        // This significantly improves the performance if the page cache is available.
+        // Such optimization also applies to the last page of a chunk if 
+        // the file size is not aligned to pages and the last-page IO has to be blocking.
+        if(!_env_direct_io() || unaligned_last_page) {
+            sqe->flags |= IOSQE_ASYNC;
+            // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
+        }
+        sqe->flags |= IOSQE_ASYNC;
         io_uring_sqe_set_data(sqe, (void*)p.chunk_id); // type of user_data is __u64
     }
     this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
@@ -116,20 +207,28 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
 
     int uring_req_id = 0;
     auto uring_func = [=]() {
-        int submitted = io_uring_submit(&this->uring_ring);
-        if (submitted < 0) {
-            throw std::runtime_error(
-                "io_uring_submit failed: " + std::string(strerror(-submitted)));
+        size_t submitted = 0;
+        while(submitted < submit_cnt) {
+            int ret = io_uring_submit(selected_ring);
+            if(ret < 0) {
+                throw std::runtime_error(
+                    "io_uring_submit failed: " + std::string(strerror(-ret)));
+            }
+            submitted += ret;
+            if(ret == 0) {
+                fprintf(stderr, "io_uring_submit returned 0, chunk_id: %zu, submitted: %zu, submit_cnt: %zu\n", chunk_id, submitted, submit_cnt);
+            }
         }
     };
 
     if(submit_cnt > 0) {
-        if(unaligned_last_page) {
-            uring_req_id = this->last_page_reader_thread->post(std::move(uring_func));
-        }
-        else {
-            uring_func();
-        }
+        // if(unaligned_last_page) {
+        //     uring_req_id = this->last_page_reader_thread->post(std::move(uring_func));
+        // }
+        // else {
+        //     uring_func();
+        // }
+        uring_func();
     }
 
     // int uring_req_id = this->uring_thread->post(std::move(uring_func));
@@ -152,7 +251,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
         size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.unfinished_cnt;
         while(unfinished_cnt > 0) {
             struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(&this->uring_ring, &cqe);
+            int ret = io_uring_wait_cqe(selected_ring, &cqe);
             if (ret != 0) {
                 throw std::runtime_error(
                     "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
@@ -160,12 +259,12 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             if (cqe->res < 0) {
                 std::string msg =
                     "io_uring read error: " + std::string(strerror(-cqe->res));
-                io_uring_cqe_seen(&this->uring_ring, cqe);
+                io_uring_cqe_seen(selected_ring, cqe);
                 throw std::runtime_error(msg);
             }
             chunk_id_t cqe_chunk_id = (chunk_id_t)io_uring_cqe_get_data(cqe);
             this->chunks[cqe_chunk_id].extra_data.unfinished_cnt --;
-            io_uring_cqe_seen(&this->uring_ring, cqe);
+            io_uring_cqe_seen(selected_ring, cqe);
         }
 
         CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_mid, rank_size,
