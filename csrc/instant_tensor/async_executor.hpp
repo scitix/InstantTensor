@@ -144,21 +144,27 @@ private:
     std::thread worker;
 
     void run() {
-        WorkItem w;
-        while (true) {
-            while (!input_queue.try_pop(w)) {
-                std::this_thread::yield();
-            }
-            if (!w.task) {
-                break;
-            }
+        try {
+            WorkItem w;
+            while (true) {
+                while (!input_queue.try_pop(w)) {
+                    std::this_thread::yield();
+                }
+                if (!w.task) {
+                    break;
+                }
 
-            std::any res = w.task();
+                std::any res = w.task();
 
-            WorkPair pr{w.id, std::move(res)};
-            while (!output_queue.try_push(pr)) {
-                std::this_thread::yield();
+                WorkPair pr{w.id, std::move(res)};
+                while (!output_queue.try_push(pr)) {
+                    std::this_thread::yield();
+                }
             }
+        }
+        catch (const std::exception &e) {
+            fprintf(stderr, "AsyncExecutor thread exception: %s\n", e.what());
+            throw;
         }
     }
 

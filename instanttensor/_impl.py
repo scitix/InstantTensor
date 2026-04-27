@@ -375,20 +375,13 @@ class safe_open:
                 if io_depth is None:
                     io_depth = 16 # cuFileRead + ncclAllGather # why this has effect?
             else: 
-                if env_direct_io(): # io_uring or libaio with O_DIRECT
-                    if chunk_size is None:
-                        chunk_size = 8*1024*1024
-                    if concurrency is None:
-                        concurrency = 1 # max(1 // self.world_size, 1)
-                    if io_depth is None:
-                        io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
-                else: # buffered io_uring or libaio
-                    if chunk_size is None:
-                        chunk_size = 8*1024*1024
-                    if concurrency is None:
-                        concurrency = 16
-                    if io_depth is None:
-                        io_depth = max(32 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+                # io_uring or libaio
+                if chunk_size is None:
+                    chunk_size = 8*1024*1024
+                if concurrency is None:
+                    concurrency = 1 # max(1 // self.world_size, 1)
+                if io_depth is None:
+                    io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
         
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5

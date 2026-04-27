@@ -30,6 +30,14 @@ void Loader::close_file_cufile(FileInfo &f) {
     ::close(f.fd);
 }
 
+void Loader::register_device_buffer_cufile() {
+    CUFILE_CHECK(cuFileBufRegister(this->device_buffer, this->buffer_size, 0));
+}
+
+void Loader::deregister_device_buffer_cufile() {
+    CUFILE_CHECK(cuFileBufDeregister(this->device_buffer));
+}
+
 ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
     vector<int> req_ids(this->num_threads);

@@ -26,10 +26,10 @@ void Loader::open_file() {
         }
     }
     if(this->need_aio) {
-        this->open_file_aio_context();
+        this->initialize_aio_context();
     }
     if(this->need_uring) {
-        this->open_uring_context();
+        this->initialize_uring_context();
     }
 }
 
@@ -47,10 +47,10 @@ void Loader::close_file() {
         }
     }
     if(this->need_aio) {
-        this->close_file_aio_context();
+        this->destroy_aio_context();
     }
     if(this->need_uring) {
-        this->close_uring_context();
+        this->destroy_uring_context();
     }
 }
 
@@ -80,8 +80,9 @@ void Loader::init_buffer() {
     CUDA_CHECK(cudaMalloc(&this->device_buffer, this->buffer_size));
 
     if (this->need_cufile) {
-        CUFILE_CHECK(cuFileBufRegister(this->device_buffer, this->buffer_size, 0));
+        this->register_device_buffer_cufile();
     }
+
     if (this->need_host_buffer) {
         size_t inflight_host_buffer_size = this->io_depth * this->rank_chunk_size;
         size_t host_buffer_size = inflight_host_buffer_size;
@@ -98,19 +99,28 @@ void Loader::init_buffer() {
 
             this->host_buffer_entry.size = host_buffer_size;
             this->host_buffer_entry.deleter = [=](void *ptr) {
+                if (this->need_uring) {
+                    this->deregister_host_buffer_uring();
+                }
                 CUDA_CHECK(cudaHostUnregister(ptr));
                 free(ptr);
             };
         }
         this->host_buffer = (char*)this->host_buffer_entry.ptr;
     }
+
+    if (this->need_uring) {
+        this->register_host_buffer_uring();
+    }
 }
 
 void Loader::destroy_buffer() {
     if (this->need_cufile) {
-        CUFILE_CHECK(cuFileBufDeregister(this->device_buffer));
+        this->deregister_device_buffer_cufile();
     }
+
     CUDA_CHECK(cudaFree(this->device_buffer));
+
     if (this->need_host_buffer) {
         if (_env_cache_buffer()) {
             host_buffer_cache->put(std::move(this->host_buffer_entry));
@@ -135,7 +145,8 @@ void Loader::init_threads() {
             this->cuda_thread = std::make_unique<AsyncExecutor>();
         }
     }
-    if(this->need_aio || this->need_uring) {
+    // if(this->need_aio || this->need_uring) {
+    if(this->need_aio) {
         if(!this->last_page_reader_thread) {
             this->last_page_reader_thread = std::make_unique<AsyncExecutor>();
         }
@@ -581,8 +592,14 @@ void Loader::run() {
 }
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
-    Loader loader(std::move(input_queue), std::move(output_queue));
-    loader.run();
+    try {
+        Loader loader(std::move(input_queue), std::move(output_queue));
+        loader.run();
+    }
+    catch (const std::exception &e) {
+        fprintf(stderr, "Loader thread exception: %s\n", e.what());
+        throw;
+    }
 }
 
 } // namespace instanttensor

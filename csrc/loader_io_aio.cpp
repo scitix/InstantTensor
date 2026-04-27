@@ -24,7 +24,7 @@ void Loader::open_file_aio(FileInfo &f) {
     this->need_cuda_thread = true;
 }
 
-void Loader::open_file_aio_context() {
+void Loader::initialize_aio_context() {
     int ret = io_setup(this->io_depth * this->num_threads, &this->aio_ctx);
     if(ret < 0){
         print_and_throw(std::runtime_error("Failed to setup aio: " + std::string(strerror(-ret))));
@@ -41,7 +41,7 @@ void Loader::close_file_aio(FileInfo &f) {
     ::close(f.fd);
 }
 
-void Loader::close_file_aio_context() {
+void Loader::destroy_aio_context() {
     int ret = io_destroy(this->aio_ctx);
     if(ret < 0){
         print_and_throw(std::runtime_error("Failed to destroy aio: " + std::string(strerror(-ret))));
@@ -74,9 +74,13 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     // NOTE: This will block at the last page of the file if the file is not page aligned.
     //       So we put the last page into another thread
     auto aio_func = [=]() {
-        int ret = io_submit(this->aio_ctx, submit_cnt, this->aio_iocb_ptrs.data() + window_idx * this->num_threads);
-        if(ret < 0){
-            print_and_throw(std::runtime_error("Failed to submit aio: " + std::string(strerror(-ret))));
+        size_t submitted = 0;
+        while(submitted < submit_cnt) {
+            int ret = io_submit(this->aio_ctx, submit_cnt - submitted, this->aio_iocb_ptrs.data() + window_idx * this->num_threads + submitted);
+            if(ret < 0){
+                print_and_throw(std::runtime_error("Failed to submit aio: " + std::string(strerror(-ret))));
+            }
+            submitted += ret;
         }
     };
 
