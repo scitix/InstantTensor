@@ -25,12 +25,13 @@ from instanttensor import safe_open
 tensors = {}
 with safe_open("model.safetensors", framework="pt", device=0) as f:
     for name, tensor in f.tensors():
-        tensors[name] = tensor.clone()
+        tensors[name] = tensor
 ```
 
-> **NOTE:** `tensor` points to the internal buffer of InstantTensor and should be copied immediately (e.g. by clone() or copy_()) to avoid data being overwritten during buffer reuse.
+Yielded tensors own their memory by default (`copy=True`). For zero-copy
+streaming into preallocated storage, see [Zero-copy mode](#zero-copy-mode).
 
-See [Usage](#usage) for more details (multi-file and distributed usage).
+See [Usage](#usage) for multi-file and distributed usage.
 
 ### Used by
 
@@ -95,7 +96,7 @@ files = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
 tensors = {}
 with safe_open(files, framework="pt", device=0) as f:
     for name, tensor in f.tensors():
-        tensors[name] = tensor.clone()
+        tensors[name] = tensor
 ```
 
 ### Distributed loading
@@ -114,10 +115,30 @@ files = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
 tensors = {}
 with safe_open(files, framework="pt", device=torch.cuda.current_device(), process_group=process_group) as f:
     for name, tensor in f.tensors():
-        tensors[name] = tensor.clone()
+        tensors[name] = tensor
 ```
 
 > **NOTE:** You can also load weights using a subgroup created via `dist.new_group`, which allows multiple subgroups to load weights independently. For example, if you have TP=8 and PP=2 (i.e., two TP groups), you can create two subgroups and load weights independently on each TP group. In cross-node (multi-machine) scenarios, loading using per-node subgroups can sometimes be faster than loading on the world group. However, for most cases, the world group is a good default choice.
+
+### Zero-copy mode
+
+Pass `copy=False` to skip the per-tensor clone and yield views into the
+internal ring buffer:
+
+```python
+with safe_open(files, framework="pt", device=0, copy=False) as f:
+    for name, tensor in f.tensors():
+        model_param[name].copy_(tensor)
+```
+
+Two rules:
+
+1. Consume each tensor before the next is yielded — `list(f.tensors())` and
+   similar patterns silently corrupt data when `buffer_size < total_tensor_size`.
+2. Do not keep references past the `with` block — the buffer is freed on exit.
+
+A `UserWarning` fires when `copy=False` and `buffer_size < total_tensor_size`.
+Both attributes are public on the `safe_open` object.
 
 See `tests/test.py` for a full benchmark harness (TP/PP grouping, checksums, etc.).
 
