@@ -148,7 +148,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
 
         ops.push_back(UringReadOp{
             (char*)this->host_buffer + p.window_offset + thread_offset,
-            thread_size,
+            thread_size_aligned,
             p.chunk.file_offset + p.rank_offset + thread_offset,
         });
     }
@@ -171,6 +171,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             if(left_buffer_index == right_buffer_index) {
                 buffer_index = (int)left_buffer_index;
             }
+            // fprintf(stderr, "chunk_id: %zu, buffer_index: %d, size: %zu, buffer_offset: %zu, file_offset: %zu\n", chunk_id, buffer_index, op.size, (char*)op.buf - (char*)this->host_buffer_entry.ptr, op.file_offset);
         }
         if(buffer_index != -1) {
             io_uring_prep_read_fixed(sqe, file_handle, op.buf,
@@ -199,7 +200,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             sqe->flags |= IOSQE_ASYNC;
             // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
         }
-        sqe->flags |= IOSQE_ASYNC;
+        // sqe->flags |= IOSQE_ASYNC;
         io_uring_sqe_set_data(sqe, (void*)p.chunk_id); // type of user_data is __u64
     }
     this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
@@ -256,13 +257,13 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
                 throw std::runtime_error(
                     "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
             }
+            chunk_id_t cqe_chunk_id = (chunk_id_t)io_uring_cqe_get_data(cqe);
             if (cqe->res < 0) {
                 std::string msg =
-                    "io_uring read error: " + std::string(strerror(-cqe->res));
+                    "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(-cqe->res));
                 io_uring_cqe_seen(selected_ring, cqe);
                 throw std::runtime_error(msg);
             }
-            chunk_id_t cqe_chunk_id = (chunk_id_t)io_uring_cqe_get_data(cqe);
             this->chunks[cqe_chunk_id].extra_data.unfinished_cnt --;
             io_uring_cqe_seen(selected_ring, cqe);
         }

@@ -77,7 +77,7 @@ public:
     // io_uring (loader_io_uring.cpp)
     bool uring_context_initialized = false;
     bool uring_register_file = true;
-    bool uring_register_buffer = true;
+    bool uring_register_buffer = true; // **important for buffered IO performance**
     struct io_uring uring_ring = {};
     struct io_uring uring_ring_last_page = {};
 
