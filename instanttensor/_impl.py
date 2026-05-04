@@ -1,6 +1,7 @@
-import os 
+import os
 import time
 import json
+import warnings
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C
@@ -246,30 +247,48 @@ class safe_open:
             loading immediately. If ``False``, only reads file metadata initially;
             tensors will be loaded when the context manager is entered. Useful
             for testing and debugging.
-    
+        copy: If ``True`` (default), yielded tensors are clones that own their
+            memory and outlive the context. If ``False``, they are zero-copy
+            views into an internal ring buffer reused during iteration and
+            freed on ``__exit__`` — consume each tensor before the next yield
+            and do not store references past the ``with`` block.
+
     Returns:
         A context manager that yields a file-like object with tensor access
         methods.
-    
+
+    Attributes:
+        buffer_size (``int``): Size in bytes of the internal GPU ring buffer.
+        total_tensor_size (``int``): Total bytes of all tensors to load. When
+            ``copy=False`` and ``buffer_size < total_tensor_size``, earlier
+            tensors may be overwritten by later ones during iteration.
+
     Example:
         Basic single-file usage:
-        
+
         >>> from instanttensor import safe_open
         >>> tensors = {}
         >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
         ...     for name, tensor in f.tensors():
-        ...         tensors[name] = tensor.clone()
-        
+        ...         tensors[name] = tensor
+
         Multi-file loading (recommended for better performance):
-        
+
         >>> files = ["model-00001-of-00002.safetensors",
         ...          "model-00002-of-00002.safetensors"]
         >>> with safe_open(files, framework="pt", device=0) as f:
         ...     for name, tensor in f.tensors():
-        ...         tensors[name] = tensor.clone()
-        
+        ...         tensors[name] = tensor
+
+        Zero-copy mode (consume each tensor inline):
+
+        >>> with safe_open("model.safetensors", framework="pt", device=0,
+        ...                copy=False) as f:
+        ...     for name, tensor in f.tensors():
+        ...         model_param[name].copy_(tensor)
+
         Distributed loading:
-        
+
         >>> import torch
         >>> import torch.distributed as dist
         >>> dist.init_process_group(backend="nccl")
@@ -278,12 +297,12 @@ class safe_open:
         ...                device=torch.cuda.current_device(),
         ...                process_group=process_group) as f:
         ...     for name, tensor in f.tensors():
-        ...         tensors[name] = tensor.clone()
+        ...         tensors[name] = tensor
     """
-    def __init__(self, filename: Union[str, list[str]], framework: str, 
+    def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
-            buffer_size=None, chunk_size=None, concurrency=None, io_depth=None, 
-            max_free_mem_usage=None, load_now=True):
+            buffer_size=None, chunk_size=None, concurrency=None, io_depth=None,
+            max_free_mem_usage=None, load_now=True, copy: bool = True):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -314,6 +333,8 @@ class safe_open:
         self.tensor_offsets = []
         self.iterated = False
         self.tmp_generator = None
+        self.copy = copy
+        self._invalidated = False
 
         self._determine_io_params(chunk_size, concurrency, io_depth, max_free_mem_usage)
 
@@ -342,6 +363,16 @@ class safe_open:
         self.total_tensor_size = sum(self.tensor_sizes)
 
         self._determine_buffer_size(buffer_size)
+
+        if not self.copy and self.buffer_size < self.total_tensor_size:
+            warnings.warn(
+                f"copy=False with buffer_size ({self.buffer_size} B) < "
+                f"total_tensor_size ({self.total_tensor_size} B): earlier "
+                f"tensors may be overwritten during iteration. This warning "
+                f"can be ignored if tensors are consumed inline; otherwise, "
+                f"use copy=True.",
+                stacklevel=2,
+            )
 
         if load_now:
             self._open()
@@ -494,6 +525,7 @@ class safe_open:
         stream = torch.cuda.current_stream()
         stream.synchronize() # make sure all the data transfer is done
         self.exit_time = time.perf_counter()
+        self._invalidated = True
         instanttensor._C.close(self.loader_handle)
         self.close_time = time.perf_counter()
         total_time = self.close_time - self.init_time
@@ -509,34 +541,17 @@ class safe_open:
 
     def tensors(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Iterate over all tensors in the safetensors file(s).
-        
-        This method returns an iterator that yields (name, tensor) pairs for
-        all tensors from the safetensors file(s) that are loaded on the
-        specified GPU device.
+
+        Yields ``(name, tensor)`` pairs. With ``copy=True`` (default) tensors
+        own their memory; with ``copy=False`` they are zero-copy views into
+        the ring buffer (see ``safe_open``).
 
         Note:
-            This method synchronizes CUDA streams to ensure data transfer
+            Synchronizes the current CUDA stream to ensure data transfer
             completion.
-        
-        Yields:
-            tuple: A (name, tensor) pair where:
-                - name (``str``): The name/key of the tensor
-                - tensor (``torch.Tensor``): The tensor data on the specified device
-        
-        Example:
-            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
-            ...     for name, tensor in f.tensors():
-            ...         print(f"{name}: {tensor.shape}, {tensor.dtype}")
-            ...         # Important: copy if storing for later use
-            ...         stored_tensor = tensor.clone()
-
-        Warning:
-            The tensors returned by ``tensors()`` point to an internal buffer that
-            is reused during iteration. You must copy each tensor (e.g., using
-            ``.clone()`` or ``.copy_()``) if you need to use it after the current
-            iteration completes. Otherwise, the tensor data may be overwritten by
-            subsequent iterations, leading to incorrect results.
         """
+        if self._invalidated:
+            raise RuntimeError("tensors() called after safe_open context exited")
         if self.iterated:
             raise RuntimeError("tensors() can only be called once")
         self.iterated = True
@@ -548,63 +563,17 @@ class safe_open:
             torch_dtype = safetensors_to_torch_dtype.get(safetensors_dtype, None)
             if torch_dtype is None:
                 raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
-            
+
             tensor_size = get_tensor_size(shape, torch_dtype)
             dl_tensor = instanttensor._C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
             tensor_int8 = torch.from_dlpack(dl_tensor)
             tensor = tensor_int8.view(torch_dtype).view(torch.Size(shape))
-            
+
             if tensor.data_ptr() % tensor.element_size() != 0:
                 raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
+            if self.copy:
+                tensor = tensor.clone()
             yield name, tensor
-
-    def get_tensor(self, name: str) -> torch.Tensor:
-        """Safetensors-compatible API: get a specific tensor by name from the safetensors file(s).
-        
-        This method retrieves a single tensor by its name. Random access is not supported;
-        tensors must be retrieved sequentially in the order returned by keys().
-        
-        Note:
-            It is recommended to use ``tensors()`` directly instead of this method.
-        
-        Args:
-            name: The name/key of the tensor to retrieve. Must match the next
-                tensor name in the sequence returned by keys().
-        
-        Returns:
-            The tensor as a ``torch.Tensor`` on the specified device. The tensor
-            points to an internal buffer and should be copied (using ``.clone()`` 
-            or ``.copy_()``) if used outside the current iteration.
-        
-        Raises:
-            ValueError: If the requested tensor name does not match the expected
-                name (i.e., tensors are not retrieved in the order returned by
-                ``keys()``).
-        
-        Example:
-            Compatible usage with safetensors API:
-            
-            >>> from instanttensor import safe_open
-            >>> 
-            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
-            ...     # Must get tensors in the exact order returned by keys()
-            ...     for key in f.keys():
-            ...         tensor = f.get_tensor(key)
-            ...         # Important: copy the tensor if storing for later use
-            ...         stored_tensor = tensor.clone()
-            ...         print(f"{key}: {stored_tensor.shape}")
-        
-        Warning:
-            Tensors must be retrieved in the exact order returned by ``keys()``.
-            Calling ``get_tensor()`` with a name that doesn't match the next expected
-            tensor will raise a ``ValueError``.
-        """
-        if self.tmp_generator is None:
-            self.tmp_generator = self.tensors()
-        expect_name, tensor = next(self.tmp_generator)
-        if name != expect_name:
-            raise ValueError(f"get_tensor() should be called in the order of tensor names returned by keys()")
-        return tensor
 
     def keys(self) -> list[str]:
         """Safetensors-compatible API: get the names of all tensors in the safetensors file(s).
