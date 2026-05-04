@@ -368,8 +368,9 @@ class safe_open:
             warnings.warn(
                 f"copy=False with buffer_size ({self.buffer_size} B) < "
                 f"total_tensor_size ({self.total_tensor_size} B): earlier "
-                f"tensors may be overwritten during iteration. Consume each "
-                f"tensor inline, or use copy=True.",
+                f"tensors may be overwritten during iteration. This warning "
+                f"can be ignored if tensors are consumed inline; otherwise, "
+                f"use copy=True.",
                 stacklevel=2,
             )
 

@@ -48,8 +48,21 @@ def test_copy_true_tensors_have_independent_storage(small_safetensors):
     path, _ = small_safetensors
     with safe_open(path, framework="pt", device=0, copy=True) as f:
         collected = list(f.tensors())
-    ptrs = {name: t.data_ptr() for name, t in collected}
-    assert len(set(ptrs.values())) == len(ptrs), ptrs
+    intervals = sorted(
+        (
+            t.data_ptr(),
+            t.data_ptr() + t.numel() * t.element_size(),
+            name,
+        )
+        for name, t in collected
+    )
+    overlaps = [
+        ((left_start, left_end, left_name), (right_start, right_end, right_name))
+        for (left_start, left_end, left_name), (right_start, right_end, right_name)
+        in zip(intervals, intervals[1:])
+        if left_end > right_start
+    ]
+    assert not overlaps, overlaps
 
 
 def test_copy_true_survives_list_materialization(small_safetensors):

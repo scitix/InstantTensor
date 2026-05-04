@@ -174,7 +174,7 @@ def safetensors_iterator(files):
 def instanttensor_iterator(files, device, process_group):
     global t_open, t_close, t_keys, t_first
     t_open_record = time.perf_counter()
-    with instant_safe_open(files, framework='pt', device=device, process_group=process_group) as f:
+    with instant_safe_open(files, framework='pt', device=device, process_group=process_group, copy=False) as f:
         t_open += time.perf_counter() - t_open_record
         for name, tensor in f.tensors():
             yield name, tensor
