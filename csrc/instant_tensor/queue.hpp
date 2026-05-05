@@ -4,9 +4,11 @@
 // #include <boost/uuid/uuid_generators.hpp>
 // #include <boost/uuid/uuid_io.hpp>
 // #include <string>
+#include <boost/lockfree/queue.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <thread>        // for std::this_thread::yield
 #include <cstddef>       // for std::size_t
+#include <utility>
 // namespace bip = boost::interprocess;
 
 namespace instanttensor {
@@ -120,6 +122,110 @@ public:
     bool empty() {
         return q.empty();
     }
+    // size_t read_available() const {
+    //     return q.read_available();
+    // }
+    // size_t write_available() const {
+    //     return q.write_available();
+    // }
 };
 
-}
+// Cross-thread MPMC queue based on polling and lock-free atomic operations.
+// boost::lockfree::queue requires a trivially assignable/destructible value
+// type, so store pointers internally while preserving support for non-POD T.
+template<typename T, size_t Capacity = 1024>
+class MPMCQueue {
+    boost::lockfree::queue<T*, boost::lockfree::capacity<Capacity>> q;
+public:
+    MPMCQueue() = default;
+
+    ~MPMCQueue() {
+        T* item = nullptr;
+        while (q.pop(item)) {
+            delete item;
+        }
+    }
+
+    MPMCQueue(const MPMCQueue&) = delete;
+    MPMCQueue& operator=(const MPMCQueue&) = delete;
+
+    void push(T const& v) {
+        T* item = new T(v);
+        while (!q.push(item)) {
+            std::this_thread::yield();
+        }
+    }
+
+    void push(T&& v) {
+        T* item = new T(std::forward<T>(v));
+        while (!q.push(item)) {
+            std::this_thread::yield();
+        }
+    }
+
+    void pop(T& result) {
+        T* item = nullptr;
+        while (!q.pop(item)) {
+            std::this_thread::yield();
+        }
+        result = std::move(*item);
+        delete item;
+    }
+
+    void pop() {
+        T* item = nullptr;
+        while (!q.pop(item)) {
+            std::this_thread::yield();
+        }
+        delete item;
+    }
+
+    bool try_push(T const& v) {
+        T* item = new T(v);
+        if (q.push(item)) {
+            return true;
+        }
+        delete item;
+        return false;
+    }
+
+    bool try_push(T&& v) {
+        T* item = new T(std::forward<T>(v));
+        if (q.push(item)) {
+            return true;
+        }
+        delete item;
+        return false;
+    }
+
+    bool try_pop(T& result) {
+        T* item = nullptr;
+        if (!q.pop(item)) {
+            return false;
+        }
+        result = std::move(*item);
+        delete item;
+        return true;
+    }
+
+    bool try_pop() {
+        T* item = nullptr;
+        if (!q.pop(item)) {
+            return false;
+        }
+        delete item;
+        return true;
+    }
+
+    bool empty() {
+        return q.empty();
+    }
+};
+
+template<typename T, size_t Capacity = 1024>
+using SPMCQueue = MPMCQueue<T, Capacity>;
+
+template<typename T, size_t Capacity = 1024>
+using MPSCQueue = MPMCQueue<T, Capacity>;
+
+} // namespace instanttensor

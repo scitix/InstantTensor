@@ -135,8 +135,8 @@ void Loader::init_threads() {
     auto set_device_func = [=]() { CUDA_CHECK(cudaSetDevice(this->device_idx)); };
 
     if(this->need_worker_threads) {
-        while(this->worker_threads.size() < this->num_threads) {
-            this->worker_threads.emplace_back(std::make_unique<AsyncExecutor>());
+        if(!this->worker_threads) {
+            this->worker_threads = std::make_unique<MultiThreadAsyncExecutor>(this->num_threads, set_device_func);
         }
     }
     if(this->need_cuda_thread) {
@@ -160,9 +160,6 @@ void Loader::init_threads() {
         this->wait_thread = std::make_unique<AsyncExecutor>();
     }
 
-    for(auto &thread : this->worker_threads) {
-        thread->post(set_device_func);
-    }
     if(this->cuda_thread) {
         this->cuda_thread->post(set_device_func);
     }
@@ -189,8 +186,8 @@ void Loader::init_threads() {
 }
 
 void Loader::destroy_threads() {
-    for (auto& thread : this->worker_threads) {
-        thread->join();
+    if (this->worker_threads) {
+        this->worker_threads->join();
     }
     if (this->cuda_thread) {
         this->cuda_thread->join();

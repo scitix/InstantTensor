@@ -40,7 +40,7 @@ public:
     vector<TensorMetadate> tensors;
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
-    vector<unique_ptr<AsyncExecutor>> worker_threads;
+    unique_ptr<MultiThreadAsyncExecutor> worker_threads;
     // A special thread to read the last page of a file when the file size is not page aligned, 
     // which results in blocking I/O even with O_DIRECT and libaio/io_uring.
     unique_ptr<AsyncExecutor> last_page_reader_thread; 

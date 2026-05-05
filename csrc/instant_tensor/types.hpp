@@ -2,12 +2,14 @@
 
 #include <atomic>
 #include <instant_tensor/common.hpp>
+#include <instant_tensor/function_executor.hpp>
 
 namespace instanttensor {
 
 using chunk_id_t = ssize_t;
 
-using AsyncExecutor = SPSCAsyncExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
+using AsyncExecutor = SingleWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
+using MultiThreadAsyncExecutor = MultiWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
 
 // NOTE: edit 
 enum Backend {
