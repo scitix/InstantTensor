@@ -45,7 +45,7 @@ public:
         WorkItem w{id, std::move(t)};
 
         while (!input_queue.try_push(w)) {
-            drainOutputQueueToBuffer();
+            // drainOutputQueueToBuffer(); // no longer drain as this causes thread contention
             std::this_thread::yield();
         }
         return id;
