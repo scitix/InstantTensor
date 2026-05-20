@@ -4,7 +4,7 @@ namespace instanttensor {
 
 void Loader::open_file_aio(FileInfo &f) {
     int open_flags = O_RDONLY;
-    if (_env_direct_io()) {
+    if (this->backend == Backend::AIO) {// != AIO_BUFFERED
         open_flags |= O_DIRECT;
     }
     f.fd = ::open(f.filename.c_str(), open_flags);
@@ -15,11 +15,10 @@ void Loader::open_file_aio(FileInfo &f) {
     if (fstat(f.fd, &st) < 0) { throw std::runtime_error("Failed to fstat file: " + f.filename); }
     f.size = st.st_size;
 
-    if (!_env_direct_io()) {
+    if (this->backend == Backend::AIO_BUFFERED) {
         posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     }
 
-    this->need_aio = true;
     this->need_host_buffer = true;
     this->need_cuda_thread = true;
 }

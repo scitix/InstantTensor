@@ -9,6 +9,32 @@ using chunk_id_t = ssize_t;
 
 using AsyncExecutor = SPSCAsyncExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
 
+// NOTE: edit 
+enum Backend {
+    AIO,
+    AIO_BUFFERED,
+    URING,
+    URING_BUFFERED,
+    CUFILE,
+    MMAP,
+};
+
+inline bool is_valid_backend(Backend backend) {
+    return backend >= Backend::AIO && backend <= Backend::MMAP;
+}
+
+inline string backend_to_string(Backend backend) {
+    switch(backend) {
+        case Backend::AIO: return "AIO";
+        case Backend::AIO_BUFFERED: return "AIO_BUFFERED";
+        case Backend::URING: return "URING";
+        case Backend::URING_BUFFERED: return "URING_BUFFERED";
+        case Backend::CUFILE: return "CUFILE";
+        case Backend::MMAP: return "MMAP";
+    }
+    return "UNKNOWN";
+}
+
 enum Op {
     OPEN,
     CLOSE,
@@ -25,11 +51,12 @@ struct OpenArgs {
     size_t chunk_size;
     size_t num_threads;
     size_t io_depth;
+    Backend backend;
     vector<pair<size_t, size_t>> tensor_offsets;
     OpenArgs(const vector<string> &filenames, int device_idx, ncclComm_t group_communicator, int rank,
-        int world_size, size_t buffer_size, size_t chunk_size, size_t num_threads, size_t io_depth, const vector<pair<size_t, size_t>>& tensor_offsets)
+        int world_size, size_t buffer_size, size_t chunk_size, size_t num_threads, size_t io_depth, Backend backend, const vector<pair<size_t, size_t>>& tensor_offsets)
         : filenames(filenames), device_idx(device_idx), group_communicator(group_communicator), rank(rank), world_size(world_size),
-        buffer_size(buffer_size), chunk_size(chunk_size), num_threads(num_threads), io_depth(io_depth), tensor_offsets(tensor_offsets)
+        buffer_size(buffer_size), chunk_size(chunk_size), num_threads(num_threads), io_depth(io_depth), backend(backend), tensor_offsets(tensor_offsets)
         {}
 };
 

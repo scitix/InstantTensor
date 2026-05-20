@@ -31,11 +31,7 @@ public:
 
     vector<FileInfo> file_info;
     bool use_internal_memory_register = false;
-    bool use_cufile = false;
     bool need_host_buffer = false;
-    bool need_cufile = false;
-    bool need_aio = false;
-    bool need_uring = false;
     bool need_worker_threads = false;
     bool need_cuda_thread = false;
     void *device_buffer = nullptr;
@@ -88,6 +84,7 @@ public:
     size_t buffer_size = 0;
     size_t num_threads = 0;
     size_t io_depth = 0;
+    Backend backend = Backend::AIO;
 
     alignas(64)
     atomic<bool> stop = false;
@@ -127,6 +124,7 @@ public:
     ChunkRequest post_read_chunk_inmem(const ChunkIOParams &p);
 
     // cuFile IO path (loader_io_cufile.cpp)
+    static bool cufile_available();
     void open_file_cufile(FileInfo &f);  // open fd with O_DIRECT, cuFileHandleRegister
     void close_file_cufile(FileInfo &f); // cuFileHandleDeregister, close fd
     void register_device_buffer_cufile();
@@ -141,6 +139,7 @@ public:
     ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
 
     // io_uring path (loader_io_uring.cpp)
+    static bool uring_available();
     void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
     void close_file_uring(FileInfo &f);  // close fd
     void initialize_uring_context();           // io_uring_queue_init

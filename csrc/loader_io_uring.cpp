@@ -1,5 +1,6 @@
 #include <instant_tensor/loader.hpp>
 #include <liburing.h>
+#include <sys/utsname.h>
 
 namespace instanttensor {
 
@@ -21,11 +22,97 @@ namespace instanttensor {
 
 // ─── file open / close ───────────────────────────────────────────────────────
 
+namespace {
+
+bool kernel_at_least_5_15() {
+    struct utsname uts;
+    if (uname(&uts) != 0) {
+        return false;
+    }
+
+    char *end = nullptr;
+    long major = strtol(uts.release, &end, 10);
+    if (end == uts.release || *end != '.') {
+        return false;
+    }
+
+    const char *minor_start = end + 1;
+    long minor = strtol(minor_start, &end, 10);
+    if (end == minor_start) {
+        return false;
+    }
+
+    return major > 5 || (major == 5 && minor >= 15);
+}
+
+bool probe_supports_fixed_buffer_read(struct io_uring *ring) {
+    struct io_uring_probe *probe = io_uring_get_probe_ring(ring);
+    if (!probe) {
+        return false;
+    }
+
+    bool supported = io_uring_opcode_supported(probe, IORING_OP_READ) &&
+                     io_uring_opcode_supported(probe, IORING_OP_READ_FIXED);
+    io_uring_free_probe(probe);
+    return supported;
+}
+
+bool supports_fixed_file_registration(struct io_uring *ring) {
+    int fd = ::open("/dev/null", O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    int ret = io_uring_register_files(ring, &fd, 1);
+    if (ret == 0) {
+        io_uring_unregister_files(ring);
+    }
+    ::close(fd);
+    return ret == 0;
+}
+
+bool supports_fixed_buffer_registration(struct io_uring *ring) {
+    char buffer[4096];
+    struct iovec iov = {buffer, sizeof(buffer)};
+
+    int ret = io_uring_register_buffers(ring, &iov, 1);
+    if (ret == 0) {
+        io_uring_unregister_buffers(ring);
+    }
+    return ret == 0;
+}
+
+} // namespace
+
+bool Loader::uring_available(){// best-effort check
+    if (!kernel_at_least_5_15()) { // io_uring with kernel < 5.15 is not reliable
+        return false;
+    }
+
+    struct io_uring ring = {};
+    struct io_uring_params params = {};
+    // params.flags = IORING_SETUP_SQPOLL; // SQPOLL is not very necessary for us
+    // params.sq_thread_idle = 1000;
+
+    int ret = io_uring_queue_init_params(2, &ring, &params);
+    if (ret < 0) {
+        return false;
+    }
+
+    // io_uring_probe reports opcodes; SQPOLL/fixed files are setup/register capabilities.
+    bool supported = // (ring.flags & IORING_SETUP_SQPOLL) &&
+                     probe_supports_fixed_buffer_read(&ring) &&
+                     supports_fixed_file_registration(&ring) &&
+                     supports_fixed_buffer_registration(&ring);
+    io_uring_queue_exit(&ring);
+    return supported;
+}
+
 void Loader::open_file_uring(FileInfo &f) {
     // Buffered fd — no O_DIRECT.  Page-cache reads are done by kernel io-wq
     // workers, which is what makes them truly async with io_uring.
     int open_flags = O_RDONLY;
-    if (_env_direct_io()) {
+    if (this->backend == Backend::URING) {
         open_flags |= O_DIRECT;
     }
     f.fd = ::open(f.filename.c_str(), open_flags);
@@ -40,11 +127,10 @@ void Loader::open_file_uring(FileInfo &f) {
 
     // Hint sequential access so the VFS read-ahead fills the page cache ahead
     // of our reads and reduces the time spent in the io-wq workers.
-    if (!_env_direct_io()) {
+    if (this->backend == Backend::URING_BUFFERED) {
         posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     }
 
-    this->need_uring       = true;
     this->need_host_buffer = true;
     this->need_cuda_thread = true;
 }
@@ -196,7 +282,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
         // This significantly improves the performance if the page cache is available.
         // Such optimization also applies to the last page of a chunk if 
         // the file size is not aligned to pages and the last-page IO has to be blocking.
-        if(!_env_direct_io() || unaligned_last_page) {
+        if(this->backend == Backend::URING_BUFFERED || unaligned_last_page) {
             sqe->flags |= IOSQE_ASYNC;
             // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
         }

@@ -2,6 +2,10 @@
 
 namespace instanttensor {
 
+bool Loader::cufile_available(){// best-effort check
+    return cufile_binding::init();
+}
+
 void Loader::open_file_cufile(FileInfo &f) {
     f.fd = ::open(f.filename.c_str(), O_RDONLY | O_DIRECT);
     if (f.fd < 0) {
@@ -11,7 +15,6 @@ void Loader::open_file_cufile(FileInfo &f) {
     if (fstat(f.fd, &st) < 0) { throw std::runtime_error("Failed to fstat file: " + f.filename); }
     f.size = st.st_size;
 
-    this->need_cufile = true;
     this->need_worker_threads = true;
     this->need_cuda_thread = true;
 

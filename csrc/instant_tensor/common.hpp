@@ -100,22 +100,6 @@ inline std::optional<string> get_env(const string& name) {
 
 namespace instanttensor {
 
-inline bool _determine_use_cufile(){
-    bool ret = get_env("INSTANTTENSOR_USE_CUFILE").value_or("0") == "1";
-    if (ret) {
-        if (!cufile_binding::init()) {
-            fprintf(stderr, "cuFile not found, fallback to aio.\n");
-            ret = false;
-        }
-    }
-    return ret;
-}
-
-inline bool _env_use_cufile(){
-    static bool ret = _determine_use_cufile();
-    return ret;
-}
-
 inline bool _env_use_internal_memory_register(){
     static bool ret = get_env("INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER").value_or("0") == "1";
     return ret;
@@ -123,17 +107,6 @@ inline bool _env_use_internal_memory_register(){
 
 inline bool _env_cache_buffer(){
     static bool ret = get_env("INSTANTTENSOR_CACHE_BUFFER").value_or("0") == "1";
-    return ret;
-}
-
-inline bool _env_use_uring(){
-    static bool ret = get_env("INSTANTTENSOR_USE_URING").value_or("0") == "1";
-    return ret;
-}
-
-// Enable O_DIRECT for libaio/io_uring
-inline bool _env_direct_io(){
-    static bool ret = get_env("INSTANTTENSOR_DIRECT_IO").value_or("1") == "1";
     return ret;
 }
 

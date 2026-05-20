@@ -41,6 +41,7 @@ public:
             size_t chunk_size,
             size_t num_threads,
             size_t io_depth,
+            Backend backend,
             const vector<pair<size_t, size_t>>& tensor_offsets)
     {
         this->device_idx = device_idx;
@@ -72,7 +73,7 @@ public:
             NCCL_CHECK(ncclCommCount(nccl_group_communicator, &world_size));
         }
 
-        int req_id = this->call(loader_handle, OPEN, std::make_any<OpenArgs>(filenames, device_idx, nccl_group_communicator, rank, world_size, buffer_size, chunk_size, num_threads, io_depth, tensor_offsets));
+        int req_id = this->call(loader_handle, OPEN, std::make_any<OpenArgs>(filenames, device_idx, nccl_group_communicator, rank, world_size, buffer_size, chunk_size, num_threads, io_depth, backend, tensor_offsets));
         this->get_result(loader_handle, req_id);
         return loader_handle;
     }
@@ -98,15 +99,6 @@ public:
 
 unique_ptr<LoaderManager> manager;
 
-void init() {
-    if(_env_use_cufile()) {
-        cufile_context_initializer->initialize();
-    }
-    if(!manager) {
-        manager = std::make_unique<LoaderManager>();
-    }
-}
-
 int open(const vector<string> &filenames,
         int device_idx,
         size_t process_group,
@@ -114,12 +106,14 @@ int open(const vector<string> &filenames,
         size_t chunk_size,
         size_t num_threads,
         size_t io_depth,
+        int backend,
         const vector<pair<size_t, size_t>>& tensor_offsets)
 {
     if(!manager) {
         manager = std::make_unique<LoaderManager>();
     }
-    return manager->open(filenames, device_idx, process_group, buffer_size, chunk_size, num_threads, io_depth, tensor_offsets);
+    Backend backend_enum = static_cast<Backend>(backend);
+    return manager->open(filenames, device_idx, process_group, buffer_size, chunk_size, num_threads, io_depth, backend_enum, tensor_offsets);
 }
 
 void close(int loader_handle) {
@@ -144,15 +138,22 @@ void cleanup() {
     instanttensor::munmaper.reset();
 }
 
+bool backend_available(int backend) {
+    Backend backend_enum = static_cast<Backend>(backend);
+    if(backend_enum == Backend::CUFILE) {
+        return Loader::cufile_available();
+    } else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
+        return Loader::uring_available();
+    } else {
+        return true;
+    }
+}
+
 } // namespace instanttensor
 
 
 PYBIND11_MODULE(_C, m) {
     m.doc() = "InstantTensor C++ extension module";
-
-    m.def("init", &instanttensor::init,
-          "Initialize the cufile driver. This will be called lazily in open() if cufile is available for the specified file, "
-          "but can be explicitly called to control the timing of initialization.");
 
     m.def("open", &instanttensor::open,
           "Open a safetensors file for loading",
@@ -163,6 +164,7 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("chunk_size"),
           pybind11::arg("num_threads"),
           pybind11::arg("io_depth"),
+          pybind11::arg("backend"),
           pybind11::arg("tensor_offsets"));
 
     m.def("close", &instanttensor::close,
@@ -181,4 +183,8 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("cleanup", &instanttensor::cleanup,
           "Clean up global cuda-related objects before python exit and cudaDeviceReset() is called");
+
+    m.def("backend_available", &instanttensor::backend_available,
+          "Check if the backend is available",
+          pybind11::arg("backend"));
 }

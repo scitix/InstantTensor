@@ -154,13 +154,43 @@ Users can specify three key parameters in `safe_open` for performance tuning:
 
 When set to None (the default), InstantTensor will automatically select a value based on the storage type for high performance. Otherwise, the user-supplied value is used.  -->
 
-<!-- ### Environment variables
+### Backend selection
 
-InstantTensor uses a few environment variables to select I/O strategies:
+InstantTensor selects an I/O backend automatically by default. You can override
+the choice with the `backend` argument to `safe_open`, or with the
+`INSTANTTENSOR_BACKEND` environment variable when `backend=None`.
 
-- **`INSTANTTENSOR_USE_CUFILE`**:
-  - `1`: Enable cuFile (GPUDirect Storage) path for disk files
-  - `0` (default): Use libaio for disk files
+Supported backend values are `AIO`, `AIO_BUFFERED`, `URING`, `URING_BUFFERED`,
+`CUFILE`, and `MMAP`.
+
+These backends are used in different file-system and I/O scenarios:
+
+- **In-memory file systems** (available backends: `MMAP`, `URING_BUFFERED`,
+  `AIO_BUFFERED`): when model files are stored on tmpfs or ramfs, `MMAP`
+  provides the best compatibility and performance for this case. The other
+  backends are usually slower for in-memory files.
+- **Regular file systems**: InstantTensor can use either Direct I/O or Buffered
+  I/O.
+  - **Direct I/O** (available backends: `AIO`, `URING`, `CUFILE`) is best when
+    a model is loaded once for a long-running workload. It avoids page-cache
+    cold-start effects and reduces page-cache pollution. When choosing manually,
+    `URING` may be faster on newer platforms. `AIO` has the broadest platform
+    compatibility. `CUFILE` requires GPUDirect Storage support, and its higher
+    throughput can be offset by cuFile initialization overhead.
+  - **Buffered I/O** (available backends: `AIO_BUFFERED`, `URING_BUFFERED`,
+    `MMAP`) is best when the same model is loaded repeatedly within a short
+    period. Later reads can benefit from the page cache, though the first read
+    is usually slower than Direct I/O. `URING_BUFFERED` is preferred on
+    platforms with io_uring support; `AIO_BUFFERED` provides a more compatible
+    option, while `MMAP` is available but usually not preferred.
+
+If no backend is specified, InstantTensor uses `AIO` for regular disk files to
+prioritize first-read performance while preserving broad compatibility. For
+tmpfs/ramfs files, it uses `MMAP` for better compatibility and performance. If
+the manually requested backend is unavailable, InstantTensor emits a warning and
+falls back to the corresponding default (`AIO` or `MMAP`).
+
+<!--
 - **`INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER`**:
   - `1`: For tmpfs/ramfs files, register the mmapped memory and copy directly to GPU
   - `0` (default): Use an external pinned host buffer + CPU memcpy + async H2D copy -->

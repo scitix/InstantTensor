@@ -300,7 +300,6 @@ def distributed_load():
     collective_print(f"[TEST] Rank {load_group_rank} in group {load_group_id} of size {load_group_size}")
     
     if backend == 'instanttensor':
-        instanttensor._impl.init() # can be commented out
         # NOTE: process_group can be the world group or a sub-group, 
         #       each group loads tensors independently. 
         #       Typically, we use the world group to maximize concurrency and avoid redundant loading.

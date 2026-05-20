@@ -6,29 +6,30 @@ Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQue
     this->input_queue = std::move(input_queue);
     this->output_queue = std::move(output_queue);
     this->use_internal_memory_register = _env_use_internal_memory_register();
-    this->use_cufile = _env_use_cufile();
-    // _env_use_uring() is checked at open_file() time, stored in need_uring
 }
 
 void Loader::open_file() {
+    if(!is_valid_backend(this->backend)) {
+        print_and_throw(std::runtime_error("Internal error: Unsupported backend: " + std::to_string(this->backend)));
+    }
     for(size_t i = 0; i < this->file_info.size(); i++) {
         FileInfo& f = this->file_info[i];
         f.in_memory = instanttensor::file_in_memory(f.filename);
 
-        if (f.in_memory) {
+        if (this->backend == Backend::MMAP) {
             this->open_file_inmem(f);
-        } else if (this->use_cufile) {
+        } else if (this->backend == Backend::CUFILE) {
             this->open_file_cufile(f);
-        } else if (_env_use_uring()) {
+        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
             this->open_file_uring(f);
-        } else {
+        } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
             this->open_file_aio(f);
         }
     }
-    if(this->need_aio) {
+    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         this->initialize_aio_context();
     }
-    if(this->need_uring) {
+    if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
         this->initialize_uring_context();
     }
 }
@@ -36,20 +37,20 @@ void Loader::open_file() {
 void Loader::close_file() {
     for(size_t i = 0; i < this->file_info.size(); i++) {
         FileInfo& f = this->file_info[i];
-        if (f.in_memory) {
+        if (this->backend == Backend::MMAP) {
             this->close_file_inmem(f);
-        } else if (this->use_cufile) {
+        } else if (this->backend == Backend::CUFILE) {
             this->close_file_cufile(f);
-        } else if (this->need_uring) {
+        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
             this->close_file_uring(f);
-        } else {
+        } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
             this->close_file_aio(f);
         }
     }
-    if(this->need_aio) {
+    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         this->destroy_aio_context();
     }
-    if(this->need_uring) {
+    if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
         this->destroy_uring_context();
     }
 }
@@ -79,7 +80,7 @@ void Loader::init_buffer() {
     this->buffer_size += padded_size;
     CUDA_CHECK(cudaMalloc(&this->device_buffer, this->buffer_size));
 
-    if (this->need_cufile) {
+    if (this->backend == Backend::CUFILE) {
         this->register_device_buffer_cufile();
     }
 
@@ -99,7 +100,7 @@ void Loader::init_buffer() {
 
             this->host_buffer_entry.size = host_buffer_size;
             this->host_buffer_entry.deleter = [=](void *ptr) {
-                if (this->need_uring) {
+                if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
                     this->deregister_host_buffer_uring();
                 }
                 CUDA_CHECK(cudaHostUnregister(ptr));
@@ -109,13 +110,13 @@ void Loader::init_buffer() {
         this->host_buffer = (char*)this->host_buffer_entry.ptr;
     }
 
-    if (this->need_uring) {
+    if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
         this->register_host_buffer_uring();
     }
 }
 
 void Loader::destroy_buffer() {
-    if (this->need_cufile) {
+    if (this->backend == Backend::CUFILE) {
         this->deregister_device_buffer_cufile();
     }
 
@@ -145,8 +146,7 @@ void Loader::init_threads() {
             this->cuda_thread = std::make_unique<AsyncExecutor>();
         }
     }
-    // if(this->need_aio || this->need_uring) {
-    if(this->need_aio) {
+    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         if(!this->last_page_reader_thread) {
             this->last_page_reader_thread = std::make_unique<AsyncExecutor>();
         }
@@ -377,6 +377,7 @@ void Loader::open(OpenArgs args) {
     this->thread_chunk_size = args.chunk_size;
     this->num_threads = args.num_threads;
     this->io_depth = args.io_depth;
+    this->backend = args.backend;
 
     if (this->world_size > 1 && this->group_communicator == NULL) {
         print_and_throw(std::runtime_error("Internal error: A communicatior should be provided if world_size > 1"));
@@ -406,8 +407,8 @@ void Loader::open(OpenArgs args) {
     std::chrono::duration<double> d5 = t5 - t4;
     std::chrono::duration<double> d6 = t6 - t5;
     if(_env_debug()) {
-        fprintf(stderr, "Config: rank=%d/%d, num_threads=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p\n",
-            this->rank, this->world_size, this->num_threads, this->buffer_size, this->host_buffer_entry.size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
+        fprintf(stderr, "Config: rank=%d/%d, backend=%s, num_threads=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p\n",
+            this->rank, this->world_size, backend_to_string(this->backend).c_str(), this->num_threads, this->buffer_size, this->host_buffer_entry.size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
         fprintf(stderr, "Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f\n", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
     }
 }
@@ -470,13 +471,13 @@ void Loader::post_read_chunk() {
                          rank_offset, rank_size, window_idx, window_offset, rank_dst, all_dst, event};
 
     ChunkRequest result;
-    if (f.in_memory) {
+    if (this->backend == Backend::MMAP) {
         result = this->post_read_chunk_inmem(params);
-    } else if (this->use_cufile) {
+    } else if (this->backend == Backend::CUFILE) {
         result = this->post_read_chunk_cufile(params);
-    } else if (this->need_uring) {
+    } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
         result = this->post_read_chunk_uring(params);
-    } else {
+    } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         result = this->post_read_chunk_aio(params);
     }
 
