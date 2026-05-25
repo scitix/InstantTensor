@@ -11,3 +11,6 @@
 	path = csrc/third_party/boost
 	url = https://github.com/boostorg/boost.git
 	branch = boost-1.74.0
+[submodule "csrc/third_party/liburing"]
+	path = csrc/third_party/liburing
+	url = https://github.com/axboe/liburing.git

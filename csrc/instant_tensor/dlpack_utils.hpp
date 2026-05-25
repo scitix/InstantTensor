@@ -9,9 +9,9 @@
 #include <dlpack/dlpack.h>
 #include <instant_tensor/dl_binding/cuda_binding.hpp>
 
-namespace py = pybind11;
-
 namespace instanttensor {
+
+namespace py = pybind11;
 
 struct Ctx {
     int64_t* shape = nullptr;

@@ -26,6 +26,8 @@
 #include <instant_tensor/dl_binding/cufile_binding.hpp>
 #include <instant_tensor/dl_binding/nccl_binding.hpp>
 
+namespace instanttensor {
+
 using namespace instanttensor::cuda_binding;
 using namespace instanttensor::cufile_binding;
 using namespace instanttensor::nccl_binding;
@@ -97,8 +99,6 @@ inline std::optional<string> get_env(const string& name) {
         return std::nullopt;
     }
 }
-
-namespace instanttensor {
 
 inline bool _env_use_internal_memory_register(){
     static bool ret = get_env("INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER").value_or("0") == "1";
