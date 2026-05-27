@@ -156,39 +156,63 @@ When set to None (the default), InstantTensor will automatically select a value 
 
 ### Backend selection
 
-InstantTensor selects an I/O backend automatically by default. You can override
-the choice with the `backend` argument to `safe_open`, or with the
-`INSTANTTENSOR_BACKEND` environment variable when `backend=None`.
+InstantTensor selects an I/O backend automatically by default. You can provide
+one or more backend candidates with the `backend` argument to `safe_open`, or
+with the `INSTANTTENSOR_BACKEND` environment variable when `backend=None`.
+InstantTensor tries the candidates in order and uses the first backend that is
+supported by the file system and available on the current system.
 
-Supported backend values are `AIO`, `AIO_BUFFERED`, `URING`, `URING_BUFFERED`,
-`CUFILE`, and `MMAP`.
+Supported backend values are `Backend.AIO`, `Backend.AIO_BUFFERED`,
+`Backend.URING`, `Backend.URING_BUFFERED`, `Backend.CUFILE`, and
+`Backend.MMAP`. The `backend` argument accepts a single `Backend` or a list of
+`Backend`/`BackendPolicy` values:
 
-These backends are used in different file-system and I/O scenarios:
+```python
+from instanttensor import Backend, BackendPolicy, safe_open
+
+safe_open("model.safetensors", framework="pt", device=0, backend=Backend.URING)
+safe_open("model.safetensors", framework="pt", device=0, backend=[Backend.URING, Backend.AIO])
+safe_open("model.safetensors", framework="pt", device=0, backend=BackendPolicy.BUFFERED)
+```
+
+`BackendPolicy.BUFFERED` expands to `[Backend.URING_BUFFERED,
+Backend.AIO_BUFFERED, Backend.MMAP]`. This is a good choice when you want Buffered I/O.
+
+`INSTANTTENSOR_BACKEND` accepts comma-separated backend or policy names:
+
+```bash
+INSTANTTENSOR_BACKEND=URING,AIO
+INSTANTTENSOR_BACKEND=BUFFERED
+```
+
+Backends are used in different file-system and I/O scenarios:
 
 - **In-memory file systems** (available backends: `MMAP`, `URING_BUFFERED`,
-  `AIO_BUFFERED`): when model files are stored on tmpfs or ramfs, `MMAP`
-  provides the best compatibility and performance for this case. The other
-  backends are usually slower for in-memory files.
+  `AIO_BUFFERED`): when model files are
+  stored on tmpfs or ramfs, `MMAP` provides the best compatibility and
+  performance for this case. The other backends are usually slower for
+  in-memory files.
 - **Regular file systems**: InstantTensor can use either Direct I/O or Buffered
   I/O.
   - **Direct I/O** (available backends: `AIO`, `URING`, `CUFILE`) is best when
-    a model is loaded once for a long-running workload. It avoids page-cache
-    cold-start effects and reduces page-cache pollution. When choosing manually,
-    `URING` may be faster on newer platforms. `AIO` has the broadest platform
-    compatibility. `CUFILE` requires GPUDirect Storage support, and its higher
-    throughput can be offset by cuFile initialization overhead.
+    a model is loaded once for a long-running
+    workload. It avoids page-cache cold-start effects and reduces page-cache
+    pollution. When choosing manually, `URING` may be faster on newer platforms.
+    `AIO` has the broadest platform compatibility. `CUFILE` requires GPUDirect
+    Storage support, and its higher throughput can be offset by cuFile
+    initialization overhead.
   - **Buffered I/O** (available backends: `AIO_BUFFERED`, `URING_BUFFERED`,
-    `MMAP`) is best when the same model is loaded repeatedly within a short
-    period. Later reads can benefit from the page cache, though the first read
-    is usually slower than Direct I/O. `URING_BUFFERED` is preferred on
-    platforms with io_uring support; `AIO_BUFFERED` provides a more compatible
-    option, while `MMAP` is available but usually not preferred.
+    `MMAP`) is best when the same model is
+    loaded repeatedly within a short period. Later reads can benefit from the
+    page cache, though the first read is usually slower than Direct I/O.
+    `URING_BUFFERED` is preferred on platforms with io_uring support;
+    `AIO_BUFFERED` provides a more compatible option, while `MMAP` is available
+    but usually not preferred.
 
-If no backend is specified, InstantTensor uses `AIO` for regular disk files to
-prioritize first-read performance while preserving broad compatibility. For
-tmpfs/ramfs files, it uses `MMAP` for better compatibility and performance. If
-the manually requested backend is unavailable, InstantTensor emits a warning and
-falls back to the corresponding default (`AIO` or `MMAP`).
+If no backend is specified, InstantTensor tries `[URING, AIO]` for regular disk
+files. For tmpfs/ramfs files, it uses `MMAP`. If none of the requested
+candidates can be used, InstantTensor raises an error listing why each candidate
+was rejected.
 
 <!--
 - **`INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER`**:
