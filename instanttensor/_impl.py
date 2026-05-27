@@ -62,36 +62,52 @@ class Backend(Enum):
     CUFILE = 4
     MMAP = 5
 
+
+class BackendPolicy(Enum):
+    BUFFERED = "BUFFERED"
+
+
 default_backend = [Backend.URING, Backend.AIO]
+default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]
 default_in_memory_backend = [Backend.MMAP]
 available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
 
 
-BackendCandidates = Optional[Union[Backend, list[Backend]]]
+BackendCandidate = Union[Backend, BackendPolicy]
+BackendCandidates = Optional[Union[BackendCandidate, list[BackendCandidate]]]
 
 
-def parse_backend(name: str) -> Backend:
+def parse_backend(name: str) -> BackendCandidate:
     str_to_backend = {backend.name: backend for backend in Backend}
+    str_to_backend.update({policy.name: policy for policy in BackendPolicy})
     name = name.strip()
     if name not in str_to_backend:
         raise ValueError(f"backend={name} is invalid. Available backends: {str_to_backend.keys()}")
     return str_to_backend[name]
 
 
+def expand_backend_candidate(backend: BackendCandidate) -> list[Backend]:
+    if isinstance(backend, Backend):
+        return [backend]
+    if backend == BackendPolicy.BUFFERED:
+        return list(default_buffered_io_backend)
+    raise TypeError("backend must be a `Backend`, `BackendPolicy`, or list of them")
+
+
 def parse_backend_candidates(backends: BackendCandidates) -> Optional[list[Backend]]:
     if backends is None:
         return None
-    if isinstance(backends, Backend):
-        return [backends]
-    if not isinstance(backends, list):
-        raise TypeError("backend must be a `Backend` or `list[Backend]`")
-    if len(backends) == 0:
+
+    backend_list = backends if isinstance(backends, list) else [backends]
+    if len(backend_list) == 0:
         raise ValueError("backend cannot be an empty list; use None to select the default backend candidates")
 
-    for backend in backends:
-        if not isinstance(backend, Backend):
-            raise TypeError("backend must be a `Backend` or `list[Backend]`")
-    return backends
+    candidates = []
+    for backend in backend_list:
+        if not isinstance(backend, (Backend, BackendPolicy)):
+            raise TypeError("backend must be a `Backend`, `BackendPolicy`, or list of them")
+        candidates.extend(expand_backend_candidate(backend))
+    return candidates
 
 
 def backend_names(backends: list[Backend]) -> list[str]:
@@ -343,13 +359,18 @@ class safe_open:
             freed on ``__exit__`` — consume each tensor before the next yield
             and do not store references past the ``with`` block.
         backend: I/O backend candidate(s) to use. This can be a single
-            ``Backend`` value or a ``list[Backend]``. If ``None`` (default),
-            uses ``INSTANTTENSOR_BACKEND`` when set; the environment variable
-            accepts comma-separated backend names such as ``URING,AIO``.
-            Otherwise tries ``[Backend.URING, Backend.AIO]`` for disk files and
-            ``[Backend.MMAP]`` for tmpfs/ramfs files. InstantTensor uses the
-            first candidate that is supported by the filesystem and available
-            on the current system.
+            ``Backend``/``BackendPolicy`` value or a list of them. Supported
+            backends are ``Backend.AIO``, ``Backend.AIO_BUFFERED``,
+            ``Backend.URING``, ``Backend.URING_BUFFERED``, ``Backend.CUFILE``,
+            and ``Backend.MMAP``. Supported policies are
+            ``BackendPolicy.BUFFERED``, which expands to
+            ``[Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]``.
+            If ``None`` (default), uses ``INSTANTTENSOR_BACKEND`` when set; the
+            environment variable accepts comma-separated backend/policy names
+            such as ``URING,AIO`` or ``BUFFERED``. Otherwise tries
+            ``[Backend.URING, Backend.AIO]`` for disk files and ``[Backend.MMAP]``
+            for tmpfs/ramfs files. InstantTensor uses the first candidate that
+            is supported by the filesystem and available on the current system.
 
     Returns:
         A context manager that yields a file-like object with tensor access
