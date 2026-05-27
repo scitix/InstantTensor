@@ -20,15 +20,11 @@ public:
         CUFILE_CHECK(cuFileDriverOpen());// This costs a long time (~2s)
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> dt = t1 - t0;
-        if(_env_debug()) {
-            fprintf(stderr, "cuFile Driver Opened in %.2f seconds\n", dt.count());
-        }
+        debug_log("cuFile Driver Opened in %.2f seconds", dt.count());
     }
     ~CufileContext() {
         CUFILE_CHECK(cuFileDriverClose());
-        if(_env_debug()) {
-            fprintf(stderr, "cuFile Driver Closed\n");
-        }
+        debug_log("cuFile Driver Closed");
     }
 };
 

@@ -61,9 +61,7 @@ void Loader::init_buffer() {
     this->world_chunk_alignment = this->rank_alignment * this->world_size;
     if(this->thread_chunk_size % this->thread_alignment != 0) {
         size_t new_chunk_size = ROUND_UP(this->thread_chunk_size, this->thread_alignment);
-        if(_env_debug()) {
-            fprintf(stderr, "Enlarge thread_chunk_size from %zu to %zu to align to %zu\n", this->thread_chunk_size, new_chunk_size, this->thread_alignment);
-        }
+        debug_log("Enlarge thread_chunk_size from %zu to %zu to align to %zu", this->thread_chunk_size, new_chunk_size, this->thread_alignment);
         this->thread_chunk_size = new_chunk_size;
     }
     this->rank_chunk_size = this->thread_chunk_size * this->num_threads;
@@ -407,9 +405,9 @@ void Loader::open(OpenArgs args) {
     std::chrono::duration<double> d5 = t5 - t4;
     std::chrono::duration<double> d6 = t6 - t5;
     if(_env_debug()) {
-        fprintf(stderr, "Config: rank=%d/%d, backend=%s, num_threads=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p\n",
+        debug_log("Config: rank=%d/%d, backend=%s, num_threads=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p",
             this->rank, this->world_size, backend_to_string(this->backend).c_str(), this->num_threads, this->buffer_size, this->host_buffer_entry.size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
-        fprintf(stderr, "Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f\n", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
+        debug_log("Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
     }
 }
 
@@ -429,8 +427,8 @@ void Loader::close(CloseArgs args) {
     std::chrono::duration<double> d3 = t3 - t2;
     std::chrono::duration<double> d4 = t4 - t3;
     if(_env_debug()) {
-        fprintf(stderr, "Close time: threads=%f, buffer=%f, file=%f, comm=%f\n", d1.count(), d2.count(), d3.count(), d4.count());
-        fprintf(stderr, "Average io_depth = %.2lf\n", 1.0 * this->io_depth_sum / this->io_depth_sample);
+        debug_log("Close time: threads=%f, buffer=%f, file=%f, comm=%f", d1.count(), d2.count(), d3.count(), d4.count());
+        debug_log("Average io_depth = %.2lf", 1.0 * this->io_depth_sum / this->io_depth_sample);
     }
 }
 

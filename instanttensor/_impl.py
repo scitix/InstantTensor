@@ -1,8 +1,8 @@
 import os
+import sys
 import time
 import json
 import warnings
-import logging
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C
@@ -13,14 +13,22 @@ import atexit
 from collections import defaultdict
 
 
-logger = logging.getLogger(__name__)
+def env_debug():
+    return os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
+
+
+def debug_log(message, *args):
+    if env_debug():
+        if args:
+            message = message % args
+        print(f"[InstantTensor][DEBUG] {message}", file=sys.stderr, flush=True)
 
 
 try:
     atexit.register(instanttensor._C.cleanup)
 except AttributeError:
     # _C module is mocked (e.g., during Sphinx documentation build)
-    logger.debug("instanttensor._C is mocked, skipping cleanup registration")
+    debug_log("instanttensor._C is mocked, skipping cleanup registration")
 
 
 # How to choose a backend:
@@ -70,9 +78,6 @@ def parse_backend(name: Optional[str | Backend]) -> Optional[Backend]:
 
 available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
 
-
-def env_debug():
-    return os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
 
 def env_backend():
     return os.environ.get("INSTANTTENSOR_BACKEND")
@@ -564,11 +569,11 @@ class safe_open:
         meta_read_results = [None] * len(self.filename)
 
         if self.distributed_metadata_read: # slower due to all_gather
-            logger.debug("world_size = %d, rank = %d", self.world_size, self.rank)
+            debug_log("world_size = %d, rank = %d", self.world_size, self.rank)
             meta_read_start = len(self.filename) // self.world_size * self.rank + min(self.rank, len(self.filename) % self.world_size)
             meta_read_cnt = len(self.filename) // self.world_size + int(self.rank < len(self.filename) % self.world_size)
             meta_read_end = meta_read_start + meta_read_cnt
-            logger.debug("meta_read = %d-%d", meta_read_start, meta_read_end)
+            debug_log("meta_read = %d-%d", meta_read_start, meta_read_end)
         else:
             meta_read_start = 0 
             meta_read_end = len(self.filename)
@@ -593,7 +598,7 @@ class safe_open:
             dist.all_gather_object(tmp, meta_read_results[meta_read_start:meta_read_end], self.process_group)
             t1 = time.perf_counter()
             meta_read_results = [item for sublist in tmp for item in sublist]
-            logger.debug("Time: all_gather = %.2fs", t1 - t0)
+            debug_log("Time: all_gather = %.2fs", t1 - t0)
 
         return meta_read_results
 
@@ -625,7 +630,7 @@ class safe_open:
         load_time = self.exit_time - self.enter_time
         close_time = self.close_time - self.exit_time
         if env_debug():
-            logger.debug(
+            debug_log(
                 "Time: total=%.2fs, init=%.2fs, sync=%.2fs, meta_read=%.2fs, open=%.2fs, load=%.2fs, close=%.2fs",
                 total_time,
                 init_time,
@@ -635,7 +640,7 @@ class safe_open:
                 load_time,
                 close_time,
             )
-            logger.debug(
+            debug_log(
                 "Throughput: total=%.2fGB/s, load=%.2fGB/s",
                 self.total_tensor_size * 1e-9 / total_time,
                 self.total_tensor_size * 1e-9 / load_time,

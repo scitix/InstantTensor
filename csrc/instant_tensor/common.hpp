@@ -11,6 +11,7 @@
 #include <libaio.h>
 
 #include <iostream>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
@@ -113,6 +114,21 @@ inline bool _env_cache_buffer(){
 inline bool _env_debug() {
     static bool ret = get_env("INSTANTTENSOR_DEBUG").value_or("0") == "1";
     return ret;
+}
+
+template <typename... Args>
+inline void debug_log(const char* fmt, Args... args) {
+    if (!_env_debug()) {
+        return;
+    }
+    fprintf(stderr, "[InstantTensor][DEBUG] ");
+    if constexpr (sizeof...(args) == 0) {
+        fputs(fmt, stderr);
+    } else {
+        fprintf(stderr, fmt, args...);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 } // namespace instanttensor
