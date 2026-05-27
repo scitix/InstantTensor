@@ -52,8 +52,8 @@ except AttributeError:
 #     recommended for this case.
 # Default backend:
 #   InstantTensor uses MMAP by default for in-memory filesystems. In other cases,
-#   it defaults to AIO to prioritize first-read performance while preserving broad
-#   compatibility and high throughput.
+#   it tries URING first and falls back to AIO to balance performance and broad
+#   compatibility.
 class Backend(Enum):
     AIO = 0
     AIO_BUFFERED = 1
@@ -62,25 +62,69 @@ class Backend(Enum):
     CUFILE = 4
     MMAP = 5
 
-default_backend = Backend.AIO
-default_in_memory_backend = Backend.MMAP
+default_backend = [Backend.URING, Backend.AIO]
+default_in_memory_backend = [Backend.MMAP]
+available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
 
-def parse_backend(name: Optional[str | Backend]) -> Optional[Backend]:
-    if name is None:
-        return None
-    if isinstance(name, Backend):
-        return name
+
+BackendCandidates = Optional[Union[Backend, list[Backend]]]
+
+
+def parse_backend(name: str) -> Backend:
     str_to_backend = {backend.name: backend for backend in Backend}
+    name = name.strip()
     if name not in str_to_backend:
         raise ValueError(f"backend={name} is invalid. Available backends: {str_to_backend.keys()}")
     return str_to_backend[name]
 
 
-available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
+def parse_backend_candidates(backends: BackendCandidates) -> Optional[list[Backend]]:
+    if backends is None:
+        return None
+    if isinstance(backends, Backend):
+        return [backends]
+    if not isinstance(backends, list):
+        raise TypeError("backend must be a `Backend` or `list[Backend]`")
+    if len(backends) == 0:
+        raise ValueError("backend cannot be an empty list; use None to select the default backend candidates")
+
+    for backend in backends:
+        if not isinstance(backend, Backend):
+            raise TypeError("backend must be a `Backend` or `list[Backend]`")
+    return backends
+
+
+def backend_names(backends: list[Backend]) -> list[str]:
+    return [backend.name for backend in backends]
+
+
+def select_backend(candidates: list[Backend], supported_backends: Optional[list[Backend]] = None) -> Backend:
+    rejected = []
+    for backend in candidates:
+        if supported_backends is not None and backend not in supported_backends:
+            rejected.append(f"{backend.name} is not supported for this filesystem")
+            continue
+        if not instanttensor._C.backend_available(backend.value):
+            rejected.append(f"{backend.name} is not available on this system")
+            continue
+        debug_log("Using backend %s", backend.name)
+        return backend
+
+    candidates_str = ", ".join(backend_names(candidates))
+    rejected_str = "; ".join(rejected)
+    raise RuntimeError(f"No available backend found from candidates [{candidates_str}]. {rejected_str}")
+
+
 
 
 def env_backend():
-    return os.environ.get("INSTANTTENSOR_BACKEND")
+    ret = os.environ.get("INSTANTTENSOR_BACKEND")
+    if ret is None:
+        return None
+    candidates = [parse_backend(name) for name in ret.split(",") if name.strip()]
+    if not candidates:
+        raise ValueError("INSTANTTENSOR_BACKEND cannot be empty")
+    return candidates
 
 def env_chunk_size():
     ret = os.environ.get("INSTANTTENSOR_CHUNK_SIZE")
@@ -298,13 +342,14 @@ class safe_open:
             views into an internal ring buffer reused during iteration and
             freed on ``__exit__`` — consume each tensor before the next yield
             and do not store references past the ``with`` block.
-        backend: I/O backend to use. Can be one of ``"AIO"``,
-            ``"AIO_BUFFERED"``, ``"URING"``, ``"URING_BUFFERED"``,
-            ``"CUFILE"``, or ``"MMAP"``. If ``None`` (default), uses
-            ``INSTANTTENSOR_BACKEND`` when set; otherwise defaults to ``"AIO"``
-            for disk files and ``"MMAP"`` for tmpfs/ramfs files. If the
-            requested backend is unavailable, InstantTensor emits a warning and
-            falls back to the corresponding default backend.
+        backend: I/O backend candidate(s) to use. This can be a single
+            ``Backend`` value or a ``list[Backend]``. If ``None`` (default),
+            uses ``INSTANTTENSOR_BACKEND`` when set; the environment variable
+            accepts comma-separated backend names such as ``URING,AIO``.
+            Otherwise tries ``[Backend.URING, Backend.AIO]`` for disk files and
+            ``[Backend.MMAP]`` for tmpfs/ramfs files. InstantTensor uses the
+            first candidate that is supported by the filesystem and available
+            on the current system.
 
     Returns:
         A context manager that yields a file-like object with tensor access
@@ -349,7 +394,7 @@ class safe_open:
     def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
-            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: Optional[str] = None):
+            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -439,25 +484,17 @@ class safe_open:
             max_free_mem_usage = env_max_free_mem_usage()
         if backend is None:
             backend = env_backend()
+        backend_candidates = parse_backend_candidates(backend)
 
         in_memory = len(self.filename) > 0 and file_in_memory(self.filename[0])
         for filename in self.filename[1:]:
             if file_in_memory(filename) != in_memory:
                 raise ValueError(f"All files must be in the same filesystem. {self.filename[0]} is in memory, but {filename} is not.")
 
-
-        backend = parse_backend(backend)
-
         if in_memory:
-            if backend is None:
-                backend = Backend.MMAP
-
-            if backend not in available_in_memory_backends:
-                raise ValueError(f"Unsupported backend for in-memory filesystems: {backend.name}. Supported backends: {[backend.name for backend in available_in_memory_backends]}")
-
-            if not instanttensor._C.backend_available(backend.value):
-                warnings.warn(f"Backend {backend.name} is not available on this system. Falling back to {default_in_memory_backend.name}.", RuntimeWarning, stacklevel=3)
-                backend = default_in_memory_backend
+            if backend_candidates is None:
+                backend_candidates = default_in_memory_backend
+            backend = select_backend(backend_candidates, available_in_memory_backends)
 
             if chunk_size is None:
                 chunk_size = 2*1024*1024
@@ -466,12 +503,9 @@ class safe_open:
             if io_depth is None:
                 io_depth = 3 # memcpy + cudaMemcpyAsync + ncclAllGather
         else:
-            if backend is None:
-                backend = Backend.AIO
-
-            if not instanttensor._C.backend_available(backend.value):
-                warnings.warn(f"Backend {backend.name} is not available on this system. Falling back to {default_backend.name}.", RuntimeWarning, stacklevel=3)
-                backend = default_backend
+            if backend_candidates is None:
+                backend_candidates = default_backend
+            backend = select_backend(backend_candidates)
 
             if backend == Backend.CUFILE:
                 if chunk_size is None:
