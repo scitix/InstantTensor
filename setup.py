@@ -19,18 +19,12 @@ package_name = "instanttensor"
 
 include_dirs = [
     f"{root_path}/csrc",
+    f"{root_path}/csrc/third_party/atomic_queue/include",
     f"{root_path}/csrc/third_party/dlpack/include",
     f"{root_path}/csrc/third_party/pybind11/include",
     libaio_src,  # for <libaio.h>
     f"{liburing_src}/include",  # for <liburing.h>
 ]
-
-boost_libs_dir = f"{root_path}/csrc/third_party/boost/libs"
-# boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in os.listdir(boost_libs_dir) if os.path.isdir(f"{boost_libs_dir}/{dir}") and not dir.startswith("old")]
-
-boost_include_dirs = [f"{boost_libs_dir}/{dir}/include" for dir in os.listdir(boost_libs_dir) if os.path.isdir(f"{boost_libs_dir}/{dir}")]
-
-include_dirs += boost_include_dirs
 
 class BuildExt(build_ext):
     def run(self):

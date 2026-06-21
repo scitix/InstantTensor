@@ -7,10 +7,9 @@
 [submodule "csrc/third_party/libaio"]
 	path = csrc/third_party/libaio
 	url = https://pagure.io/libaio.git
-[submodule "csrc/third_party/boost"]
-	path = csrc/third_party/boost
-	url = https://github.com/boostorg/boost.git
-	branch = boost-1.74.0
 [submodule "csrc/third_party/liburing"]
 	path = csrc/third_party/liburing
 	url = https://github.com/axboe/liburing.git
+[submodule "csrc/third_party/atomic_queue"]
+	path = csrc/third_party/atomic_queue
+	url = https://github.com/max0x7ba/atomic_queue.git

@@ -1,226 +1,98 @@
 #pragma once
-// #include <boost/interprocess/ipc/message_queue.hpp> // although we only need inter-thread communication, we use RPCRequest_queue to avoid polling
-// #include <boost/uuid/uuid.hpp>
-// #include <boost/uuid/uuid_generators.hpp>
-// #include <boost/uuid/uuid_io.hpp>
-// #include <string>
-#include <boost/lockfree/queue.hpp>
-#include <boost/lockfree/spsc_queue.hpp>
-#include <thread>        // for std::this_thread::yield
-#include <cstddef>       // for std::size_t
+
+#include <atomic_queue/atomic_queue.h>
+
+#include <cstddef>
+#include <limits>
+#include <thread>
+#include <type_traits>
 #include <utility>
-// namespace bip = boost::interprocess;
 
 namespace instanttensor {
 
-// std::string make_random_string() {
-//     auto uuid = boost::uuids::random_generator()();
-//     return boost::uuids::to_string(uuid);
-// }
+// Fixed-capacity cross-thread queue based on atomic_queue's ring buffer.
+// T is constructed once per slot; queue operations move-assign values in and out.
+template<typename T, size_t Capacity, bool IsSPSC>
+class AtomicQueueAdapter {
+    static_assert(Capacity > 0, "queue capacity must be greater than zero");
+    static_assert((Capacity & (Capacity - 1)) == 0,
+                  "atomic_queue capacity must be a power of two");
+    static_assert(Capacity <= std::numeric_limits<unsigned>::max(),
+                  "atomic_queue capacity exceeds its unsigned index range");
+    static_assert(std::is_nothrow_default_constructible_v<T>,
+                  "AtomicQueue2 requires noexcept default construction");
+    static_assert(std::is_nothrow_move_constructible_v<T>,
+                  "AtomicQueue2 requires noexcept move construction");
+    static_assert(std::is_nothrow_move_assignable_v<T>,
+                  "AtomicQueue2 requires noexcept move assignment");
+    static_assert(std::is_nothrow_destructible_v<T>,
+                  "AtomicQueue2 requires noexcept destruction");
 
-// template<typename T, std::size_t Capacity = 1024>
-// class Queue { // BUG: this only supports POD types
-// public:
-//     Queue()
-//         : _name(("instanttensor_" + make_random_string()))
-//         , _mq(bip::create_only, _name.c_str(), Capacity, sizeof(T))
-//     {
-//         bip::message_queue::remove(_name.c_str());
-//     }
-//     ~Queue() {
-//         bip::message_queue::remove(_name.c_str());
-//     }
-//     void push(const T& message) {
-//         _mq.send(&message, sizeof(T), 0);
-//     }
-//     void pop(T& message) {
-//         std::size_t recvd_size;
-//         unsigned int priority;
-//         _mq.receive(&message, sizeof(T), recvd_size, priority);
-//         // recvd_size is sizeof(T) and priority is 0
-//     }
-//     bool full() {
-//         return _mq.get_num_msg() >= _mq.get_max_msg();
-//     }
-//     bool empty() {
-//         return _mq.get_num_msg() == 0;
-//     }
-// private:
-//     std::string               _name;
-//     bip::message_queue        _mq;
-//     Queue(const Queue&)            = delete;
-//     Queue& operator=(const Queue&) = delete;
-// };
+    using Queue = atomic_queue::AtomicQueue2<
+        T,
+        static_cast<unsigned>(Capacity),
+        true,   // Spread adjacent slots across cache lines.
+        true,   // Use pause instructions while waiting on a claimed slot.
+        false,  // Relaxed ticket ordering; each producer remains FIFO.
+        IsSPSC>;
 
+    Queue q;
 
-// Cross-thread queue based on cv and mutex, may spin and hang
-// This supports non-POD types
-// template<typename T>
-// class Queue {
-//   std::mutex               mu;
-//   std::condition_variable  cv;
-//   std::deque<T>            dq;
-// public:
-//   void push(T const& v) {
-//     std::lock_guard lk(mu);
-//     dq.push_back(v);
-//     cv.notify_one();
-//   }
-//   T pop() {
-//     std::unique_lock lk(mu);
-//     cv.wait(lk, [&]{ return !dq.empty(); });
-//     T v = std::move(dq.front());
-//     dq.pop_front();
-//     return v;
-//   }
-//   bool empty() {
-//     std::lock_guard lk(mu);
-//     return dq.empty();
-//   }
-// };
-
-
-// Cross-thread queue based on polling and lock-free atomic operations
-// Latency: ~250ns. Baselines: promise+future ~4us, mutex-based queue ~8us, boost::asio::thread_pool.post() ~3us
-template<typename T, size_t Capacity = 1024>
-class SPSCQueue {
-    boost::lockfree::spsc_queue<T, boost::lockfree::capacity<Capacity>> q;
 public:
-    SPSCQueue() = default;
-    void push(T const& v) {
-        while (!q.push(v)) {
-            std::this_thread::yield();
-        }
-    }
-    void push(T&& v) {
-        while (!q.push(std::forward<T>(v))) {
-            std::this_thread::yield();
-        }
-    }
-    void pop(T& result) {
-        while (!q.pop(result)) {
-            std::this_thread::yield();
-        }
-    }
-    void pop() {
-        while (!q.pop()) {
-            std::this_thread::yield();
-        }
-    }
-    bool try_push(T const& v) {
-        return q.push(v);
-    }
-    bool try_push(T&& v) {
-        return q.push(std::forward<T>(v));
-    }
-    bool try_pop(T& result) {
-        return q.pop(result);
-    }
-    bool try_pop() {
-        return q.pop();
-    }
-    bool empty() {
-        return q.empty();
-    }
-    // size_t read_available() const {
-    //     return q.read_available();
-    // }
-    // size_t write_available() const {
-    //     return q.write_available();
-    // }
-};
+    AtomicQueueAdapter() = default;
+    AtomicQueueAdapter(const AtomicQueueAdapter&) = delete;
+    AtomicQueueAdapter& operator=(const AtomicQueueAdapter&) = delete;
 
-// Cross-thread MPMC queue based on polling and lock-free atomic operations.
-// boost::lockfree::queue requires a trivially assignable/destructible value
-// type, so store pointers internally while preserving support for non-POD T.
-template<typename T, size_t Capacity = 1024>
-class MPMCQueue {
-    boost::lockfree::queue<T*, boost::lockfree::capacity<Capacity>> q;
-public:
-    MPMCQueue() = default;
-
-    ~MPMCQueue() {
-        T* item = nullptr;
-        while (q.pop(item)) {
-            delete item;
-        }
+    void push(const T& value) {
+        T copy(value);
+        push(std::move(copy));
     }
 
-    MPMCQueue(const MPMCQueue&) = delete;
-    MPMCQueue& operator=(const MPMCQueue&) = delete;
-
-    void push(T const& v) {
-        T* item = new T(v);
-        while (!q.push(item)) {
-            std::this_thread::yield();
-        }
-    }
-
-    void push(T&& v) {
-        T* item = new T(std::forward<T>(v));
-        while (!q.push(item)) {
+    void push(T&& value) {
+        while (!q.try_push(std::move(value))) {
             std::this_thread::yield();
         }
     }
 
     void pop(T& result) {
-        T* item = nullptr;
-        while (!q.pop(item)) {
+        while (!q.try_pop(result)) {
             std::this_thread::yield();
         }
-        result = std::move(*item);
-        delete item;
     }
 
     void pop() {
-        T* item = nullptr;
-        while (!q.pop(item)) {
-            std::this_thread::yield();
-        }
-        delete item;
+        T discarded;
+        pop(discarded);
     }
 
-    bool try_push(T const& v) {
-        T* item = new T(v);
-        if (q.push(item)) {
-            return true;
-        }
-        delete item;
-        return false;
+    bool try_push(const T& value) {
+        T copy(value);
+        return q.try_push(std::move(copy));
     }
 
-    bool try_push(T&& v) {
-        T* item = new T(std::forward<T>(v));
-        if (q.push(item)) {
-            return true;
-        }
-        delete item;
-        return false;
+    bool try_push(T&& value) {
+        return q.try_push(std::move(value));
     }
 
     bool try_pop(T& result) {
-        T* item = nullptr;
-        if (!q.pop(item)) {
-            return false;
-        }
-        result = std::move(*item);
-        delete item;
-        return true;
+        return q.try_pop(result);
     }
 
     bool try_pop() {
-        T* item = nullptr;
-        if (!q.pop(item)) {
-            return false;
-        }
-        delete item;
-        return true;
+        T discarded;
+        return try_pop(discarded);
     }
 
-    bool empty() {
-        return q.empty();
+    bool empty() const {
+        return q.was_empty();
     }
 };
+
+template<typename T, size_t Capacity = 1024>
+using SPSCQueue = AtomicQueueAdapter<T, Capacity, true>;
+
+template<typename T, size_t Capacity = 1024>
+using MPMCQueue = AtomicQueueAdapter<T, Capacity, false>;
 
 template<typename T, size_t Capacity = 1024>
 using SPMCQueue = MPMCQueue<T, Capacity>;
