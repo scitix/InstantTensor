@@ -1,6 +1,14 @@
 #include <instant_tensor/loader.hpp>
 
+
 namespace instanttensor {
+
+
+int Loader::next_executor_request_id() {
+    int request_id = this->executor_request_id;
+    this->executor_request_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
+    return request_id;
+}
 
 Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
     this->input_queue = std::move(input_queue);
@@ -132,21 +140,24 @@ void Loader::destroy_buffer() {
 }
 
 void Loader::init_threads() {
-    auto set_device_func = [=]() { CUDA_CHECK(cudaSetDevice(this->device_idx)); };
+    auto driver_factory = [=]() {
+        CUDA_CHECK(cudaSetDevice(this->device_idx));
+        return std::make_unique<FunctionWorkerDriver>();
+    };
 
     if(this->need_worker_threads) {
         if(!this->worker_threads) {
-            this->worker_threads = std::make_unique<MultiThreadAsyncExecutor>(this->num_threads, set_device_func);
+            this->worker_threads = std::make_unique<ThreadPoolTaskExecutor>(this->num_threads, driver_factory);
         }
     }
     if(this->need_cuda_thread) {
         if(!this->cuda_thread) {
-            this->cuda_thread = std::make_unique<AsyncExecutor>();
+            this->cuda_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
         }
     }
     if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         if(!this->last_page_reader_thread) {
-            this->last_page_reader_thread = std::make_unique<AsyncExecutor>();
+            this->last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
         }
     }
 
@@ -157,18 +168,9 @@ void Loader::init_threads() {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->nccl_stream, cudaStreamNonBlocking));
     }
     if(!this->wait_thread) {
-        this->wait_thread = std::make_unique<AsyncExecutor>();
+        this->wait_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
     }
 
-    if(this->cuda_thread) {
-        this->cuda_thread->post(set_device_func);
-    }
-    if(this->last_page_reader_thread) {
-        this->last_page_reader_thread->post(set_device_func);
-    }
-    if(this->wait_thread) {
-        this->wait_thread->post(set_device_func);
-    }
     this->cuda_events.resize(this->io_depth);
     for(size_t i = 0; i < this->io_depth; i++) {
         CUDA_CHECK(cudaEventCreateWithFlags(&this->cuda_events[i], cudaEventDisableTiming));
@@ -449,7 +451,7 @@ void Loader::post_read_chunk() {
 
     chunk_id_t wait_chunk_id = max(chunk_id - (chunk_id_t)MAX_PREFETCH_CHUNKS, chunk_id - (chunk_id_t)this->io_depth);
     if(wait_chunk_id >= 0) {
-        // wait for the AsyncExecutor to be available to post tasks
+        // wait for the SingleThreadTaskExecutor to be available to post tasks
         // and wait for existing usage of host_buffer
         this->wait_read_chunk(wait_chunk_id);
     }
@@ -481,8 +483,12 @@ void Loader::post_read_chunk() {
 
 void Loader::poll_read_chunk() {
     chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
-    while(next_chunck_id <= this->chunk_reading.load(std::memory_order_relaxed)
-        && this->chunks[next_chunck_id].request.executor->test(this->chunks[next_chunck_id].request.wait_handle)) {
+    while(next_chunck_id <= this->chunk_reading.load(std::memory_order_relaxed)) {
+        ChunkRequest &request = this->chunks[next_chunck_id].request;
+        std::any ignored;
+        if(!request.executor->try_reap(request.wait_handle, ignored)) {
+            break;
+        }
         next_chunck_id++;
     }
     this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
@@ -494,7 +500,8 @@ void Loader::wait_read_chunk(chunk_id_t chunk_id) {
         print_and_throw(std::runtime_error("Internal error: chunk_id out of range."));
     }
     while(next_chunck_id <= chunk_id) {
-        this->chunks[next_chunck_id].request.executor->wait(this->chunks[next_chunck_id].request.wait_handle);
+        ChunkRequest &request = this->chunks[next_chunck_id].request;
+        request.executor->reap(request.wait_handle);
         next_chunck_id++;
     }
     this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
@@ -530,6 +537,17 @@ void Loader::try_step() {
     }
 }
 
+void Loader::wait_step(chunk_id_t chunk_id) {
+    while (this->chunk_read.load(std::memory_order_relaxed) < chunk_id) {
+        if(this->can_step()) {
+            this->step();
+        }
+        else {
+            this->wait_read_chunk(chunk_id);
+        }
+    }
+}
+
 void* Loader::get_tensor_ptr(GetTensorArgs args) {
     auto index = args.tensor_index;
 
@@ -548,14 +566,7 @@ void* Loader::get_tensor_ptr(GetTensorArgs args) {
     TensorMetadate& tensor = this->tensors[this->current_tensor_index];
     chunk_id_t last_chunk_id = tensor.last_chunk_id;
 
-    while (this->chunk_read.load(std::memory_order_relaxed) < last_chunk_id) {
-        if(this->can_step()) {
-            this->step();
-        }
-        else {
-            this->wait_read_chunk(last_chunk_id);
-        }
-    }
+    this->wait_step(last_chunk_id);
 
     return (char*)this->device_buffer + this->tensors[index].device_buffer_offset;
 }

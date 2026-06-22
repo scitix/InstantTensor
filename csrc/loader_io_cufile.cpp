@@ -67,7 +67,8 @@ ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
             }
             return ret;
         };
-        req_ids[i] = this->worker_threads[i]->post(std::move(read_weight));
+        req_ids[i] = this->next_executor_request_id();
+        this->worker_threads->submit(req_ids[i], std::move(read_weight));
         expect_return[i] = thread_size;
         worker_cnt++;
     }
@@ -80,7 +81,7 @@ ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
     auto cuda_func = [=, req_ids=std::move(req_ids), expect_return=std::move(expect_return)]() {
         for(size_t i = 0; i < worker_cnt; i++) {
             ssize_t bytes_read;
-            this->worker_threads[i]->pop(req_ids[i], bytes_read);
+            this->worker_threads->reap(req_ids[i], bytes_read);
             if(bytes_read != expect_return[i]) {// bytes_read < 0 on error
                 fprintf(stderr, "chunk_id=%zd, rank=%d, thread_id=%zu, bytes_read=%zd, expect_read=%zd\n",
                     chunk_id, rank, i, bytes_read, expect_return[i]);
@@ -92,15 +93,17 @@ ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
             CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
         }
     };
-    int cuda_req_id = this->cuda_thread->post(std::move(cuda_func));
+    int cuda_req_id = this->next_executor_request_id();
+    this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
 
     auto wait_func = [=]() mutable {
-        this->cuda_thread->pop(cuda_req_id);
+        this->cuda_thread->reap(cuda_req_id);
         CUDA_CHECK(cudaEventSynchronize(event));
     };
 
-    int completion_req_id = this->wait_thread->post(std::move(wait_func));
-    AsyncExecutor *completion_thread = this->wait_thread.get();
+    int completion_req_id = this->next_executor_request_id();
+    this->wait_thread->submit(completion_req_id, std::move(wait_func));
+    SingleThreadTaskExecutor *completion_thread = this->wait_thread.get();
 
     return ChunkRequest{completion_thread, completion_req_id};
 }

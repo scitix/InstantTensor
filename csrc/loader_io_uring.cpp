@@ -6,7 +6,7 @@ namespace instanttensor {
 
 // ─── Threading model ─────────────────────────────────────────────────────────
 // ALL io_uring calls (get_sqe, submit, wait_cqe, cqe_seen) run exclusively on
-// uring_thread (an SPSCAsyncExecutor).  The main loader thread is the only
+// uring_thread (an SPSCSingleThreadTaskExecutor).  The main loader thread is the only
 // producer; cuda_thread is the only consumer (via uring_thread->pop).
 //
 // This mirrors the existing last_page_reader_thread pattern and avoids any
@@ -292,7 +292,6 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
     const size_t submit_cnt = ops.size();
 
-    int uring_req_id = 0;
     auto uring_func = [=]() {
         size_t submitted = 0;
         while(submitted < submit_cnt) {
@@ -309,16 +308,8 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     };
 
     if(submit_cnt > 0) {
-        // if(unaligned_last_page) {
-        //     uring_req_id = this->last_page_reader_thread->post(std::move(uring_func));
-        // }
-        // else {
-        //     uring_func();
-        // }
         uring_func();
     }
-
-    // int uring_req_id = this->uring_thread->post(std::move(uring_func));
 
     // ── cuda_func: runs on cuda_thread ───────────────────────────────────────
     // Waits for uring_thread to finish (SPSC pop: cuda_thread is the sole
@@ -331,10 +322,6 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     cudaEvent_t event       = p.event;
 
     auto cuda_func = [=]() {
-        if(uring_req_id) {
-            this->last_page_reader_thread->pop(uring_req_id);
-        }
-
         size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.unfinished_cnt;
         while(unfinished_cnt > 0) {
             struct io_uring_cqe *cqe;
@@ -366,15 +353,17 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
         }
     };
 
-    int cuda_req_id = this->cuda_thread->post(std::move(cuda_func));
+    int cuda_req_id = this->next_executor_request_id();
+    this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
 
     // ── wait_func: runs on wait_thread ───────────────────────────────────────
     auto wait_func = [=]() mutable {
-        this->cuda_thread->pop(cuda_req_id);
+        this->cuda_thread->reap(cuda_req_id);
         CUDA_CHECK(cudaEventSynchronize(event));
     };
 
-    int completion_req_id = this->wait_thread->post(std::move(wait_func));
+    int completion_req_id = this->next_executor_request_id();
+    this->wait_thread->submit(completion_req_id, std::move(wait_func));
     return ChunkRequest{this->wait_thread.get(), completion_req_id};
 }
 

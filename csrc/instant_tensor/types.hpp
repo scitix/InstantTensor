@@ -8,8 +8,8 @@ namespace instanttensor {
 
 using chunk_id_t = ssize_t;
 
-using AsyncExecutor = SingleWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
-using MultiThreadAsyncExecutor = MultiWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
+using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
+using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
 
 // NOTE: edit 
 enum Backend {
@@ -103,7 +103,7 @@ struct ChunkExtraData {
 };
 
 struct ChunkRequest {
-    AsyncExecutor* executor;
+    SingleThreadTaskExecutor* executor;
     int wait_handle;
 };
 

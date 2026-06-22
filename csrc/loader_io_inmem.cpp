@@ -37,7 +37,7 @@ void Loader::close_file_inmem(FileInfo &f) {
 
 ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
     int completion_req_id = -1;
-    AsyncExecutor *completion_thread = nullptr;
+    SingleThreadTaskExecutor *completion_thread = nullptr;
 
     if (!this->use_internal_memory_register) {
         vector<int> req_ids(this->num_threads);
@@ -56,7 +56,8 @@ ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
             auto memcpy_func = [=]() {
                 memcpy(thread_mid, thread_src, thread_size);
             };
-            req_ids[i] = this->worker_threads[i]->post(std::move(memcpy_func));
+            req_ids[i] = this->next_executor_request_id();
+            this->worker_threads->submit(req_ids[i], std::move(memcpy_func));
             worker_cnt++;
         }
 
@@ -68,7 +69,7 @@ ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
         cudaEvent_t event = p.event;
         auto cuda_func = [=]() {
             for(size_t i = 0; i < worker_cnt; i++) {
-                this->worker_threads[i]->pop(req_ids[i]);
+                this->worker_threads->reap(req_ids[i]);
             }
             CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_mid, rank_size, cudaMemcpyHostToDevice, this->cuda_stream));// 240GB/s for 8 GPUs
             CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
@@ -79,13 +80,15 @@ ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
                 CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
             }
         };
-        int cuda_req_id = this->cuda_thread->post(std::move(cuda_func));
+        int cuda_req_id = this->next_executor_request_id();
+        this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
 
         auto wait_func = [=]() mutable {
-            this->cuda_thread->pop(cuda_req_id);
+            this->cuda_thread->reap(cuda_req_id);
             CUDA_CHECK(cudaEventSynchronize(event));
         };
-        completion_req_id = this->wait_thread->post(std::move(wait_func));
+        completion_req_id = this->next_executor_request_id();
+        this->wait_thread->submit(completion_req_id, std::move(wait_func));
         completion_thread = this->wait_thread.get();
     }
     else if (this->use_internal_memory_register) {
@@ -106,7 +109,8 @@ ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
         auto wait_func = [=]() {
             CUDA_CHECK(cudaEventSynchronize(event));
         };
-        completion_req_id = this->wait_thread->post(std::move(wait_func));
+        completion_req_id = this->next_executor_request_id();
+        this->wait_thread->submit(completion_req_id, std::move(wait_func));
         completion_thread = this->wait_thread.get();
     }
 

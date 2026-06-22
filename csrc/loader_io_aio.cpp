@@ -83,10 +83,11 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         }
     };
 
-    int aio_req_id = 0;
+    int aio_req_id = EXECUTOR_STOP_REQUEST_ID;
     if(submit_cnt > 0) {
         if(unaligned_last_page) {
-            aio_req_id = this->last_page_reader_thread->post(std::move(aio_func));
+            aio_req_id = this->next_executor_request_id();
+            this->last_page_reader_thread->submit(aio_req_id, std::move(aio_func));
         }
         else {
             aio_func();
@@ -101,8 +102,8 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     size_t padded_rank_size = p.padded_rank_size;
     cudaEvent_t event = p.event;
     auto cuda_func = [=]() {
-        if(aio_req_id) {
-            this->last_page_reader_thread->pop(aio_req_id);
+        if(aio_req_id != EXECUTOR_STOP_REQUEST_ID) {
+            this->last_page_reader_thread->reap(aio_req_id);
         }
         // disk to host
         size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.unfinished_cnt;
@@ -134,15 +135,17 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         }
     };
 
-    int cuda_req_id = this->cuda_thread->post(std::move(cuda_func));
+    int cuda_req_id = this->next_executor_request_id();
+    this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
 
     auto wait_func = [=]() mutable {
-        this->cuda_thread->pop(cuda_req_id);
+        this->cuda_thread->reap(cuda_req_id);
         CUDA_CHECK(cudaEventSynchronize(event));
     };
 
-    int completion_req_id = this->wait_thread->post(std::move(wait_func));
-    AsyncExecutor *completion_thread = this->wait_thread.get();
+    int completion_req_id = this->next_executor_request_id();
+    this->wait_thread->submit(completion_req_id, std::move(wait_func));
+    SingleThreadTaskExecutor *completion_thread = this->wait_thread.get();
 
     return ChunkRequest{completion_thread, completion_req_id};
 }

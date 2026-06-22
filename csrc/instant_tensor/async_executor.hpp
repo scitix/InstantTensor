@@ -114,7 +114,7 @@ public:
     // Submitter side only. This never drains completed results; callers must
     // keep a Reaper running, or bound outstanding tasks below queue capacity.
     // Otherwise task_queue and result_queue can fill each other and deadlock.
-    int submit(int request_id, Payload payload, bool needs_result = true) {
+    void submit(int request_id, Payload payload, bool needs_result = true) {
         if (request_id == STOP_REQUEST_ID) {
             throw std::invalid_argument("request_id is reserved for stop");
         }
@@ -127,7 +127,6 @@ public:
 
         TaskItem task = TaskItem::make_task(request_id, std::move(payload), needs_result);
         task_queue.push(std::move(task));
-        return request_id;
     }
 
     // Reaper side only.

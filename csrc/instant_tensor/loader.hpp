@@ -40,12 +40,12 @@ public:
     vector<TensorMetadate> tensors;
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
-    unique_ptr<MultiThreadAsyncExecutor> worker_threads;
+    unique_ptr<ThreadPoolTaskExecutor> worker_threads;
     // A special thread to read the last page of a file when the file size is not page aligned, 
     // which results in blocking I/O even with O_DIRECT and libaio/io_uring.
-    unique_ptr<AsyncExecutor> last_page_reader_thread; 
-    unique_ptr<AsyncExecutor> cuda_thread;
-    unique_ptr<AsyncExecutor> wait_thread;
+    unique_ptr<SingleThreadTaskExecutor> last_page_reader_thread;
+    unique_ptr<SingleThreadTaskExecutor> cuda_thread;
+    unique_ptr<SingleThreadTaskExecutor> wait_thread;
     std::thread io_depth_sample_thread;
     cudaStream_t cuda_stream = nullptr;
     cudaStream_t nccl_stream = nullptr;
@@ -95,6 +95,10 @@ public:
     atomic<size_t> io_depth_sum = 0;
     atomic<size_t> io_depth_sample = 0;
 
+    int executor_request_id = 0;
+
+    int next_executor_request_id();
+
     // Constructor
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
 
@@ -114,6 +118,7 @@ public:
     void step();
     bool can_step();
     void try_step();
+    void wait_step(chunk_id_t chunk_id);
     void* get_tensor_ptr(GetTensorArgs args);
     std::any dispatch(const RPCRequest &m);
     void run();

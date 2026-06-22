@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -19,20 +20,16 @@ public:
     using TaskItem = typename Base::TaskItem;
     using ResultItem = typename Base::ResultItem;
 
-    // Worker side only. FunctionWorkerDriver has no extra initialization.
     FunctionWorkerDriver() = default;
 
-    // Worker side only.
     bool can_add_task() const override {
         return !pending_task.has_value();
     }
 
-    // Worker side only.
     void add_task(TaskItem&& task) override {
         pending_task.emplace(std::move(task));
     }
 
-    // Worker side only.
     std::vector<ResultItem> process_tasks() override {
         if (!pending_task) {
             return {};
@@ -48,7 +45,6 @@ public:
         return {ResultItem{task.request_id, std::move(result)}};
     }
 
-    // Worker side only.
     bool has_pending_tasks() const override {
         return pending_task.has_value();
     }
@@ -57,8 +53,6 @@ private:
     std::optional<TaskItem> pending_task;
 };
 
-// SingleWorkerFunctionExecutor is the function-task specialization. Payload is
-// a callable normalized to TaskFn, and Result is std::any.
 template<size_t TaskQueueCapacity = 1024, size_t ResultQueueCapacity = 1024>
 class SingleWorkerFunctionExecutor
   : public SingleWorkerDriverExecutor<std::function<std::any()>, std::any,
@@ -67,23 +61,30 @@ public:
     using TaskFn = std::function<std::any()>;
     using Base = SingleWorkerDriverExecutor<TaskFn, std::any,
                                             TaskQueueCapacity, ResultQueueCapacity>;
+    using DriverFactory = typename Base::DriverFactory;
 
-    // Lifecycle side: stores the function driver factory. Call start() before submit().
-    SingleWorkerFunctionExecutor()
-      : Base([]() {
+    static DriverFactory default_driver_factory() {
+        return []() {
             return std::make_unique<FunctionWorkerDriver>();
-        })
-    {}
+        };
+    }
 
-    // Submitter side only.
+    explicit SingleWorkerFunctionExecutor(DriverFactory driver_factory = default_driver_factory(),
+                                          bool start_executor = true)
+      : Base(std::move(driver_factory))
+    {
+        if (start_executor) {
+            Base::start();
+        }
+    }
+
     template<typename F>
-    int submit(int request_id, F&& fn, bool needs_result = true) {
-        return Base::submit(request_id, make_task_fn(std::forward<F>(fn)), needs_result);
+    void submit(int request_id, F&& fn, bool needs_result = true) {
+        Base::submit(request_id, make_task_fn(std::forward<F>(fn)), needs_result);
     }
 
     using Base::reap;
 
-    // Reaper side only.
     template<typename R>
     void reap(int request_id, R& result) {
         std::any result_any;
@@ -92,7 +93,6 @@ public:
     }
 
 private:
-    // Submitter side only. Normalizes arbitrary callables to TaskFn.
     template<typename F>
     static TaskFn make_task_fn(F&& fn) {
         return [fn = std::forward<F>(fn)]() mutable -> std::any {
@@ -108,8 +108,6 @@ private:
     }
 };
 
-// MultiWorkerFunctionExecutor is the function-task specialization. Payload is
-// a callable normalized to TaskFn, and Result is std::any.
 template<size_t TaskQueueCapacity = 1024, size_t ResultQueueCapacity = 1024>
 class MultiWorkerFunctionExecutor
   : public MultiWorkerDriverExecutor<std::function<std::any()>, std::any,
@@ -118,23 +116,37 @@ public:
     using TaskFn = std::function<std::any()>;
     using Base = MultiWorkerDriverExecutor<TaskFn, std::any,
                                            TaskQueueCapacity, ResultQueueCapacity>;
+    using DriverFactory = typename Base::DriverFactory;
 
-    // Lifecycle side: stores the function driver factory. Call start() before submit().
-    MultiWorkerFunctionExecutor()
-      : Base([]() {
+    static DriverFactory default_driver_factory() {
+        return []() {
             return std::make_unique<FunctionWorkerDriver>();
-        })
+        };
+    }
+
+    explicit MultiWorkerFunctionExecutor(size_t num_workers = std::thread::hardware_concurrency(),
+                                         DriverFactory driver_factory = default_driver_factory(),
+                                         bool start_executor = true)
+      : Base(std::move(driver_factory))
+    {
+        if (start_executor) {
+            Base::start(num_workers);
+        }
+    }
+
+    explicit MultiWorkerFunctionExecutor(DriverFactory driver_factory, bool start_executor = true)
+      : MultiWorkerFunctionExecutor(std::thread::hardware_concurrency(),
+                                    std::move(driver_factory),
+                                    start_executor)
     {}
 
-    // Submitter side only.
     template<typename F>
-    int submit(int request_id, F&& fn, bool needs_result = true) {
-        return Base::submit(request_id, make_task_fn(std::forward<F>(fn)), needs_result);
+    void submit(int request_id, F&& fn, bool needs_result = true) {
+        Base::submit(request_id, make_task_fn(std::forward<F>(fn)), needs_result);
     }
 
     using Base::reap;
 
-    // Reaper side only.
     template<typename R>
     void reap(int request_id, R& result) {
         std::any result_any;
@@ -143,7 +155,6 @@ public:
     }
 
 private:
-    // Submitter side only. Normalizes arbitrary callables to TaskFn.
     template<typename F>
     static TaskFn make_task_fn(F&& fn) {
         return [fn = std::forward<F>(fn)]() mutable -> std::any {
