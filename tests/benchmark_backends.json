@@ -1,0 +1,108 @@
+{
+  "entries": [
+    {
+      "backend": "local",
+      "cases": [
+        {
+          "this is a warmup": null,
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"]
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"]
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum", "--tp", "2"]
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"],
+          "pre_evict_page_cache": true,
+          "envs": {
+            "INSTANTTENSOR_BACKEND": "BUFFERED"
+          },
+          "post_evict_page_cache": false
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"],
+          "pre_evict_page_cache": false,
+          "envs": {
+            "INSTANTTENSOR_BACKEND": "BUFFERED"
+          },
+          "post_evict_page_cache": true
+        }
+      ]
+    },
+    {
+      "backend": "local/v0.1.9",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        }
+      ]
+    },
+    {
+      "backend": "local/v0.1.8",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        }
+      ]
+    },
+    {
+      "backend": "local/v0.1.7",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        }
+      ]
+    },
+    {
+      "backend": "local/v0.1.6",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        }
+      ]
+    },
+    {
+      "backend": "local/v0.1.5",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        }
+      ]
+    },
+    {
+      "backend": "local/v0.1.4",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--tp", "2"]
+        }
+      ]
+    },
+    {
+      "backend": "pypi/safetensors/0.7.0",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "pre_evict_page_cache": true,
+          "post_evict_page_cache": false
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"],
+          "pre_evict_page_cache": false,
+          "post_evict_page_cache": true
+        }
+      ]
+    }
+  ]
+}
