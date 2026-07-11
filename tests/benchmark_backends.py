@@ -707,6 +707,21 @@ def selected_entries(entries: list[dict[str, Any]], indexes: list[int] | None) -
     return [(idx, entry) for idx, entry in selected if entry.get("enabled", True)]
 
 
+def require_executable(name: str) -> None:
+    if shutil.which(name) is None:
+        if name == "vmtouch":
+            raise BenchError(
+                "Required executable not found in PATH: vmtouch\n"
+                "On Ubuntu, install it with: sudo apt install vmtouch"
+            )
+        raise BenchError(f"Required executable not found in PATH: {name}")
+
+
+def check_prerequisites() -> None:
+    for executable in ("conda", "git", "bash", "vmtouch"):
+        require_executable(executable)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark tests/test.py across backend package versions."
@@ -789,6 +804,7 @@ def main() -> int:
     if not entries:
         bench_print(f"No enabled benchmark entries configured in {config_path}.")
         return 0
+    check_prerequisites()
 
     base_tmp = args.work_dir.expanduser().resolve() if args.work_dir else stable_work_dir()
     base_tmp.mkdir(parents=True, exist_ok=True)
