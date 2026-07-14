@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build_dist:
-    name: Build wheels and sdist
+  build_sdist:
+    name: Build sdist
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -32,12 +32,52 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build --sdist
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-sdist
+          path: ./dist/*.tar.gz
+
+  build_wheels:
+    name: Build ${{ matrix.arch }} wheels
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Custom checkout submodules
+        run: bash ./checkout_submodules.sh
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.4.0
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-wheels-${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+
+  build_dist:
+    name: Collect distributions
+    needs: [build_sdist, build_wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: build-*
+          path: ./dist
+          merge-multiple: true
 
       - uses: actions/upload-artifact@v7
         with:
           name: dist
-          path: |
-            ./wheelhouse/*.whl
-            ./dist/*.tar.gz
+          path: ./dist/*
