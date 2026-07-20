@@ -13,7 +13,7 @@ concurrency:
 jobs:
   build_sdist:
     name: Build sdist
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
         with:
@@ -69,7 +69,7 @@ jobs:
   build_dist:
     name: Collect distributions
     needs: [build_sdist, build_wheels]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v7
         with:
