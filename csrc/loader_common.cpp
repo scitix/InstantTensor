@@ -1,7 +1,12 @@
 #include <instant_tensor/loader.hpp>
+#include <instant_tensor/host_registration.hpp>
 
 
 namespace instanttensor {
+
+namespace {
+constexpr size_t HOST_REGISTER_SEGMENT_SIZE = 256ULL * 1024 * 1024;
+}
 
 
 int Loader::next_executor_request_id() {
@@ -101,15 +106,49 @@ void Loader::init_buffer() {
                 throw std::runtime_error("Failed to allocate host buffer: " + std::string(strerror(errno)));
             }
 
-            // NOTE: cudaHostRegisterReadOnly is not used since the host buffer is writable for the CPU
-            CUDA_CHECK(cudaHostRegister(this->host_buffer_entry.ptr, host_buffer_size, this->cuda_host_register_flags));
+            // Some CUDA driver/kernel combinations reject a multi-GiB
+            // cudaHostRegister call even though the same storage can be pinned
+            // in smaller adjacent ranges. Keep the one-call fast path and only
+            // segment after that call fails.
+            HostRegistration registration;
+            try {
+                registration = register_host_buffer(
+                    this->host_buffer_entry.ptr,
+                    host_buffer_size,
+                    this->cuda_host_register_flags,
+                    HOST_REGISTER_SEGMENT_SIZE,
+                    [](void* ptr, size_t size, unsigned int flags) {
+                        return static_cast<int>(cudaHostRegister(ptr, size, flags));
+                    },
+                    [](void* ptr) {
+                        return static_cast<int>(cudaHostUnregister(ptr));
+                    },
+                    []() { cudaGetLastError(); }
+                );
+            } catch (...) {
+                free(this->host_buffer_entry.ptr);
+                this->host_buffer_entry.ptr = nullptr;
+                throw;
+            }
+            if (registration.whole_buffer_error != 0) {
+                fprintf(
+                    stderr,
+                    "[InstantTensor] cudaHostRegister rejected a %.2f GiB buffer "
+                    "(code %d); registered it as %zu segments instead.\n",
+                    host_buffer_size / static_cast<double>(1ULL << 30),
+                    registration.whole_buffer_error,
+                    registration.ranges.size()
+                );
+            }
 
             this->host_buffer_entry.size = host_buffer_size;
-            this->host_buffer_entry.deleter = [=](void *ptr) {
+            this->host_buffer_entry.deleter = [=](void* ptr) {
                 if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
                     this->deregister_host_buffer_uring();
                 }
-                CUDA_CHECK(cudaHostUnregister(ptr));
+                for (auto it = registration.ranges.rbegin(); it != registration.ranges.rend(); ++it) {
+                    CUDA_CHECK(cudaHostUnregister(it->ptr));
+                }
                 free(ptr);
             };
         }
