@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,6 +18,13 @@ struct HostRegistrationRange {
 struct HostRegistration {
     std::vector<HostRegistrationRange> ranges;
     int whole_buffer_error = 0;
+};
+
+struct HostBufferAllocation {
+    void* ptr = nullptr;
+    HostRegistration registration;
+    bool runtime_allocated = false;
+    std::string registration_failure;
 };
 
 template <typename RegisterFn, typename UnregisterFn, typename ClearErrorFn>
@@ -64,6 +72,72 @@ HostRegistration register_host_buffer(
         );
     }
     return registration;
+}
+
+template <
+    typename AlignedAllocFn,
+    typename FreeFn,
+    typename RegisterFn,
+    typename UnregisterFn,
+    typename ClearErrorFn,
+    typename RuntimeAllocFn>
+HostBufferAllocation allocate_registered_host_buffer(
+    size_t size,
+    size_t alignment,
+    unsigned int register_flags,
+    unsigned int runtime_alloc_flags,
+    size_t segment_size,
+    AlignedAllocFn&& aligned_alloc_fn,
+    FreeFn&& free_fn,
+    RegisterFn&& register_fn,
+    UnregisterFn&& unregister_fn,
+    ClearErrorFn&& clear_error_fn,
+    RuntimeAllocFn&& runtime_alloc_fn
+) {
+    if (size == 0 || alignment == 0) {
+        throw std::invalid_argument("Host allocation requires non-empty aligned storage");
+    }
+
+    HostBufferAllocation allocation;
+    allocation.ptr = aligned_alloc_fn(alignment, size);
+    if (allocation.ptr == nullptr) {
+        throw std::runtime_error("Failed to allocate aligned host storage");
+    }
+
+    try {
+        allocation.registration = register_host_buffer(
+            allocation.ptr,
+            size,
+            register_flags,
+            segment_size,
+            std::forward<RegisterFn>(register_fn),
+            std::forward<UnregisterFn>(unregister_fn),
+            std::forward<ClearErrorFn>(clear_error_fn)
+        );
+        return allocation;
+    } catch (const std::exception& error) {
+        allocation.registration_failure = error.what();
+    }
+
+    free_fn(allocation.ptr);
+    allocation.ptr = nullptr;
+    clear_error_fn();
+
+    const int result = runtime_alloc_fn(
+        &allocation.ptr,
+        size,
+        runtime_alloc_flags
+    );
+    if (result != 0 || allocation.ptr == nullptr) {
+        throw std::runtime_error(
+            allocation.registration_failure
+            + "; runtime pinned allocation failed (code "
+            + std::to_string(result) + ")"
+        );
+    }
+
+    allocation.runtime_allocated = true;
+    return allocation;
 }
 
 } // namespace instanttensor

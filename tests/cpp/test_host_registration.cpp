@@ -1,11 +1,13 @@
 #include <cassert>
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <instant_tensor/host_registration.hpp>
 
 using instanttensor::register_host_buffer;
+using instanttensor::allocate_registered_host_buffer;
 
 int main() {
     std::vector<char> storage(1024);
@@ -85,5 +87,69 @@ int main() {
         assert(unregistered.size() == 2);
         assert(unregistered[0] == static_cast<char*>(base) + 256);
         assert(unregistered[1] == base);
+    }
+
+    {
+        std::vector<char> runtime_storage(1024);
+        int ordinary_free_calls = 0;
+        int runtime_alloc_calls = 0;
+        auto allocation = allocate_registered_host_buffer(
+            storage.size(),
+            256,
+            0,
+            0,
+            256,
+            [&](size_t, size_t) { return base; },
+            [&](void* ptr) {
+                assert(ptr == base);
+                ++ordinary_free_calls;
+            },
+            [](void*, size_t, unsigned int) { return 1; },
+            [](void*) { return 0; },
+            []() {},
+            [&](void** ptr, size_t size, unsigned int flags) {
+                ++runtime_alloc_calls;
+                assert(size == runtime_storage.size());
+                assert(flags == 0);
+                *ptr = runtime_storage.data();
+                return 0;
+            }
+        );
+        assert(allocation.ptr == runtime_storage.data());
+        assert(allocation.runtime_allocated);
+        assert(allocation.registration.ranges.empty());
+        assert(!allocation.registration_failure.empty());
+        assert(ordinary_free_calls == 1);
+        assert(runtime_alloc_calls == 1);
+    }
+
+    {
+        int ordinary_free_calls = 0;
+        bool threw = false;
+        try {
+            allocate_registered_host_buffer(
+                storage.size(),
+                256,
+                0,
+                0,
+                256,
+                [&](size_t, size_t) { return base; },
+                [&](void* ptr) {
+                    assert(ptr == base);
+                    ++ordinary_free_calls;
+                },
+                [](void*, size_t, unsigned int) { return 1; },
+                [](void*) { return 0; },
+                []() {},
+                [](void**, size_t, unsigned int) { return 2; }
+            );
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            assert(std::string(error.what()).find(
+                "runtime pinned allocation failed (code 2)"
+            ) != std::string::npos);
+        }
+        assert(threw);
+        assert(ordinary_free_calls == 1);
     }
 }

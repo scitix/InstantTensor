@@ -100,44 +100,52 @@ void Loader::init_buffer() {
         size_t host_buffer_size = inflight_host_buffer_size;
         this->host_buffer_entry = host_buffer_cache->get(host_buffer_size);
         if (this->host_buffer_entry.ptr == NULL) {
-            // aligned_alloc + cudaHostRegister is faster than cudaHostAlloc
-            this->host_buffer_entry.ptr = aligned_alloc(this->thread_alignment, host_buffer_size);
-            if (this->host_buffer_entry.ptr == NULL) {
-                throw std::runtime_error("Failed to allocate host buffer: " + std::string(strerror(errno)));
-            }
-
             // Some CUDA driver/kernel combinations reject a multi-GiB
             // cudaHostRegister call even though the same storage can be pinned
-            // in smaller adjacent ranges. Keep the one-call fast path and only
-            // segment after that call fails.
-            HostRegistration registration;
-            try {
-                registration = register_host_buffer(
-                    this->host_buffer_entry.ptr,
-                    host_buffer_size,
-                    this->cuda_host_register_flags,
-                    HOST_REGISTER_SEGMENT_SIZE,
-                    [](void* ptr, size_t size, unsigned int flags) {
-                        return static_cast<int>(cudaHostRegister(ptr, size, flags));
-                    },
-                    [](void* ptr) {
-                        return static_cast<int>(cudaHostUnregister(ptr));
-                    },
-                    []() { cudaGetLastError(); }
+            // in smaller adjacent ranges. A few driver/kernel combinations
+            // reject registration itself; cudaHostAlloc remains the portable
+            // pinned-memory fallback for those hosts.
+            const unsigned int runtime_alloc_flags =
+                this->cuda_host_register_flags
+                & (cudaHostAllocPortable | cudaHostAllocMapped);
+            HostBufferAllocation allocation = allocate_registered_host_buffer(
+                host_buffer_size,
+                this->thread_alignment,
+                this->cuda_host_register_flags,
+                runtime_alloc_flags,
+                HOST_REGISTER_SEGMENT_SIZE,
+                [](size_t alignment, size_t size) {
+                    return aligned_alloc(alignment, size);
+                },
+                [](void* ptr) { free(ptr); },
+                [](void* ptr, size_t size, unsigned int flags) {
+                    return static_cast<int>(cudaHostRegister(ptr, size, flags));
+                },
+                [](void* ptr) {
+                    return static_cast<int>(cudaHostUnregister(ptr));
+                },
+                []() { cudaGetLastError(); },
+                [](void** ptr, size_t size, unsigned int flags) {
+                    return static_cast<int>(cudaHostAlloc(ptr, size, flags));
+                }
+            );
+            this->host_buffer_entry.ptr = allocation.ptr;
+            if (allocation.runtime_allocated) {
+                fprintf(
+                    stderr,
+                    "[InstantTensor] cudaHostRegister paths failed for a %.2f "
+                    "GiB buffer; using runtime-allocated pinned memory. %s\n",
+                    host_buffer_size / static_cast<double>(1ULL << 30),
+                    allocation.registration_failure.c_str()
                 );
-            } catch (...) {
-                free(this->host_buffer_entry.ptr);
-                this->host_buffer_entry.ptr = nullptr;
-                throw;
-            }
-            if (registration.whole_buffer_error != 0) {
+            } else if (allocation.registration.whole_buffer_error != 0) {
                 fprintf(
                     stderr,
                     "[InstantTensor] cudaHostRegister rejected a %.2f GiB buffer "
                     "(code %d); registered it as %zu segments instead.\n",
                     host_buffer_size / static_cast<double>(1ULL << 30),
-                    registration.whole_buffer_error,
-                    registration.ranges.size()
+                    allocation.registration.whole_buffer_error,
+                    allocation.registration.ranges.size()
                 );
             }
 
@@ -146,10 +154,18 @@ void Loader::init_buffer() {
                 if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
                     this->deregister_host_buffer_uring();
                 }
-                for (auto it = registration.ranges.rbegin(); it != registration.ranges.rend(); ++it) {
-                    CUDA_CHECK(cudaHostUnregister(it->ptr));
+                if (allocation.runtime_allocated) {
+                    CUDA_CHECK(cudaFreeHost(ptr));
+                } else {
+                    for (
+                        auto it = allocation.registration.ranges.rbegin();
+                        it != allocation.registration.ranges.rend();
+                        ++it
+                    ) {
+                        CUDA_CHECK(cudaHostUnregister(it->ptr));
+                    }
+                    free(ptr);
                 }
-                free(ptr);
             };
         }
         this->host_buffer = (char*)this->host_buffer_entry.ptr;
