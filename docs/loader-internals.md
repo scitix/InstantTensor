@@ -1,12 +1,12 @@
-# InstantTensor Chunk Layout and Loading Pipeline
+# InstantTensor Loader Internals (v0.1.9)
 
-> **Language:** English (current) | [中文](./chunk-layout.zh-CN.md)
+> **Language:** English (current) | [中文](./loader-internals.zh-CN.md)
 >
 > **Maintenance:** Keep this document and the Chinese version synchronized.
 
-> **Version scope:** This document describes the **Chunk Layout and Loading
-> Pipeline** as of **InstantTensor 0.1.9**. Update both language versions if a
-> later release changes `compute_layout()`, device-ring reuse, or an I/O backend.
+> **Version scope:** This document describes the **InstantTensor loader
+> internals** as of **version 0.1.9**. Update both language versions if a later
+> release changes `compute_layout()`, device-ring reuse, or an I/O backend.
 
 InstantTensor divides contiguous safetensors byte ranges into chunks, stages
 them in host memory, moves them into a device ring buffer, and exposes them as

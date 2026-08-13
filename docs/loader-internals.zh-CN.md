@@ -1,12 +1,12 @@
-# InstantTensor Chunk Layout and Loading Pipeline
+# InstantTensor 加载器内部实现（v0.1.9）
 
-> **语言：** [English](./chunk-layout.md) | 中文（当前）
+> **语言：** [English](./loader-internals.md) | 中文（当前）
 >
 > **维护说明：** 本文与英文版必须同步更新。
 
-> **版本范围：** 本文描述的是截至 **InstantTensor 0.1.9** 的
-> **Chunk Layout and Loading Pipeline**。后续版本若修改 `compute_layout()`、
-> ring buffer 复用规则或 I/O backend，需要同步更新本文。
+> **版本范围：** 本文描述的是截至 **InstantTensor 0.1.9** 的加载器内部实现。
+> 后续版本若修改 `compute_layout()`、ring buffer 复用规则或 I/O backend，
+> 需要同步更新本文。
 
 本文基于当前仓库源码，说明 InstantTensor 如何把 safetensors 文件中的连续字节区间切成 chunk，经过 host staging buffer 搬到 device ring buffer，并最终暴露为 PyTorch tensor。I/O 路径重点描述 `io_uring`。
 
