@@ -162,7 +162,9 @@ def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
 
-# reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
+# runai reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
+# safetensors reference: https://github.com/safetensors/safetensors/blob/main/bindings/python/py_src/safetensors/torch.py
+
 def get_safetensors_dtype_map() -> dict:
     safetensors_to_torch_dtype = {
         "F64": torch.float64,
@@ -189,8 +191,10 @@ def get_safetensors_dtype_map() -> dict:
     # get_torch_dtype() will raise a clear ValueError: "Unsupported dtype 'F4'".
     # This is correct forward-compatible behavior - fail fast with a clear error message.
     _EXPERIMENTAL_ALIASES = {
-        "F8_E4M3": ["float8_e4m3fn", "float8_e4m3fnuz"],
-        "F8_E5M2": ["float8_e5m2", "float8_e5m2fnuz"],
+        "F8_E4M3": ["float8_e4m3fn"],
+        "F8_E4M3FNUZ": ["float8_e4m3fnuz"],
+        "F8_E5M2": ["float8_e5m2"],
+        "F8_E5M2FNUZ": ["float8_e5m2fnuz"],
         "F8_E8M0": ["float8_e8m0fnu", "float8_e8m0fnuz"],
         "F4":      ["float4_e2m1fn_x2"],  # Not yet in PyTorch (as of 2.5.1)
         # FP6 is not supported by PyTorch yet
