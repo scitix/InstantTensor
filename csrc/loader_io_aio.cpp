@@ -57,7 +57,8 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
     for(size_t i = 0; i < this->num_threads; i++) {
         size_t thread_offset = p.padded_thread_size * i;
         // thread_size <= thread_size_aligned <= padded_thread_size
-        size_t thread_size = std::min((size_t)std::max((ssize_t)(p.chunk.size - p.rank_offset - thread_offset), (ssize_t)0), p.padded_thread_size);
+        size_t thread_size = io_segment_logical_size(
+            p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
         size_t thread_size_aligned = ROUND_UP(thread_size, this->thread_alignment);
         if(thread_size != thread_size_aligned) unaligned_last_page = true;
         if(thread_size == 0) continue;
@@ -65,7 +66,8 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         size_t file_offset = p.chunk.file_offset + p.rank_offset + thread_offset;
         // NOTE: aio needs the read size aligned to PAGE_SIZE
         io_prep_pread(iocb, p.file.fd, (char*)this->host_buffer + p.window_offset + thread_offset, thread_size_aligned, file_offset);
-        iocb->data = (void*)chunk_id;
+        uint64_t segment_id = encode_io_segment_id(chunk_id, this->num_threads, i);
+        iocb->data = reinterpret_cast<void*>(static_cast<uintptr_t>(segment_id));
         submit_cnt ++;
     }
     this->chunks[chunk_id].extra_data.unfinished_cnt = submit_cnt;
@@ -114,13 +116,27 @@ ChunkRequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
                 print_and_throw(std::runtime_error("Failed to get aio events: " + std::string(strerror(-got))));
             }
             for(int i = 0; i < got; i++) {
-                // We do not check the expected return value of this->aio_events[i].res here.
-                // We believe checking only for errors (this->aio_events[i].res < 0) is enough.
                 if(this->aio_events[i].res < 0) {
                     print_and_throw(std::runtime_error("Failed to get aio events: " + std::string(strerror(-this->aio_events[i].res))));
                 }
-                // NOTE: event_chunk_id can be different from chunk_id
-                chunk_id_t event_chunk_id = (chunk_id_t)this->aio_events[i].data;
+                uint64_t segment_id = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(this->aio_events[i].data));
+                IOSegmentIndex segment = decode_io_segment_id(segment_id, this->num_threads);
+                chunk_id_t event_chunk_id = segment.chunk_id;
+                const Chunk &event_chunk = this->chunks[event_chunk_id];
+                size_t padded_world_size = ROUND_UP(event_chunk.size, this->world_chunk_alignment);
+                size_t padded_rank_size = padded_world_size / this->world_size;
+                size_t logical_size = io_segment_logical_size(
+                    event_chunk.size, padded_rank_size * this->rank,
+                    (padded_rank_size / this->num_threads) * segment.thread_id,
+                    padded_rank_size / this->num_threads);
+                if(static_cast<size_t>(this->aio_events[i].res) < logical_size) {
+                    print_and_throw(std::runtime_error(
+                        "Unexpected AIO short read: chunk_id=" + std::to_string(event_chunk_id)
+                        + ", thread_id=" + std::to_string(segment.thread_id)
+                        + ", bytes_read=" + std::to_string(this->aio_events[i].res)
+                        + ", logical_size=" + std::to_string(logical_size)));
+                }
                 this->chunks[event_chunk_id].extra_data.unfinished_cnt --;
             }
         }

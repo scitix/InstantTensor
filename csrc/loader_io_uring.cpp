@@ -4,19 +4,8 @@
 
 namespace instanttensor {
 
-// ─── Threading model ─────────────────────────────────────────────────────────
-// ALL io_uring calls (get_sqe, submit, wait_cqe, cqe_seen) run exclusively on
-// uring_thread (an SPSCSingleThreadTaskExecutor).  The main loader thread is the only
-// producer; cuda_thread is the only consumer (via uring_thread->pop).
-//
-// This mirrors the existing last_page_reader_thread pattern and avoids any
-// concurrent access to the liburing userspace state, which is not thread-safe.
-//
-// Within each chunk, the uring_func submits num_threads SQEs simultaneously
-// and then waits for all their CQEs.  The kernel's io-wq dispatches each SQE
-// to a separate worker thread, so all num_threads page-cache fills happen in
-// parallel — unlike libaio, where io_submit serialises the iocbs through
-// generic_file_read_iter one at a time.
+// The loader thread prepares and submits SQEs. cuda_thread consumes CQEs before
+// launching H2D and NCCL work. Each side has a single caller for its ring API.
 
 #define IO_URING_REGISTER_BUFFER_SIZE (1<<30) // 1GiB buffer size limit
 
@@ -109,8 +98,8 @@ bool Loader::uring_available(){// best-effort check
 }
 
 void Loader::open_file_uring(FileInfo &f) {
-    // Buffered fd — no O_DIRECT.  Page-cache reads are done by kernel io-wq
-    // workers, which is what makes them truly async with io_uring.
+    // URING uses O_DIRECT; URING_BUFFERED uses the page cache and io-wq
+    // workers for asynchronous buffered reads.
     int open_flags = O_RDONLY;
     if (this->backend == Backend::URING) {
         open_flags |= O_DIRECT;
@@ -212,11 +201,10 @@ struct UringReadOp {
     void  *buf;
     size_t size;
     size_t file_offset;
+    size_t thread_id;
 };
 
 ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
-    // Build the per-thread read descriptors on the main thread (no io_uring
-    // calls here — those happen exclusively on uring_thread below).
     chunk_id_t chunk_id = p.chunk_id;
     std::vector<UringReadOp> ops;
     ops.reserve(this->num_threads);
@@ -225,9 +213,8 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
 
     for (size_t i = 0; i < this->num_threads; i++) {
         size_t thread_offset = p.padded_thread_size * i;
-        size_t thread_size   = std::min(
-            (size_t)std::max((ssize_t)(p.chunk.size - p.rank_offset - thread_offset), (ssize_t)0),
-            p.padded_thread_size);
+        size_t thread_size = io_segment_logical_size(
+            p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
         size_t thread_size_aligned = ROUND_UP(thread_size, this->thread_alignment);
         if(thread_size != thread_size_aligned) unaligned_last_page = true;
         if (thread_size == 0) continue;
@@ -236,6 +223,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             (char*)this->host_buffer + p.window_offset + thread_offset,
             thread_size_aligned,
             p.chunk.file_offset + p.rank_offset + thread_offset,
+            i,
         });
     }
 
@@ -247,7 +235,8 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             throw std::runtime_error(
                 "io_uring SQ full");
         }
-        // Buffered read: no alignment constraints, use exact byte range.
+        // Buffered I/O intentionally reuses the page-rounded direct-I/O size.
+        // H2D copies only the logically valid rank bytes.
         int file_handle = this->uring_register_file ? p.chunk.file_index : p.file.fd;
 
         int buffer_index = -1;
@@ -287,7 +276,8 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
         }
         // sqe->flags |= IOSQE_ASYNC;
-        io_uring_sqe_set_data(sqe, (void*)p.chunk_id); // type of user_data is __u64
+        uint64_t segment_id = encode_io_segment_id(chunk_id, this->num_threads, op.thread_id);
+        io_uring_sqe_set_data64(sqe, segment_id);
     }
     this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
     const size_t submit_cnt = ops.size();
@@ -312,8 +302,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     }
 
     // ── cuda_func: runs on cuda_thread ───────────────────────────────────────
-    // Waits for uring_thread to finish (SPSC pop: cuda_thread is the sole
-    // consumer of uring_thread's output queue), then DMA host→GPU.
+    // Consumes CQEs, then launches DMA host->GPU.
     void  *rank_mid         = (char*)this->host_buffer + p.window_offset;
     void  *rank_dst         = p.rank_dst;
     void  *all_dst          = p.all_dst;
@@ -330,10 +319,28 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
                 throw std::runtime_error(
                     "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
             }
-            chunk_id_t cqe_chunk_id = (chunk_id_t)io_uring_cqe_get_data(cqe);
+            uint64_t segment_id = io_uring_cqe_get_data64(cqe);
+            IOSegmentIndex segment = decode_io_segment_id(segment_id, this->num_threads);
+            chunk_id_t cqe_chunk_id = segment.chunk_id;
             if (cqe->res < 0) {
                 std::string msg =
                     "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(-cqe->res));
+                io_uring_cqe_seen(selected_ring, cqe);
+                throw std::runtime_error(msg);
+            }
+            const Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
+            size_t padded_world_size = ROUND_UP(cqe_chunk.size, this->world_chunk_alignment);
+            size_t padded_rank_size = padded_world_size / this->world_size;
+            size_t logical_size = io_segment_logical_size(
+                cqe_chunk.size, padded_rank_size * this->rank,
+                (padded_rank_size / this->num_threads) * segment.thread_id,
+                padded_rank_size / this->num_threads);
+            if(static_cast<size_t>(cqe->res) < logical_size) {
+                std::string msg =
+                    "Unexpected io_uring short read: chunk_id=" + std::to_string(cqe_chunk_id)
+                    + ", thread_id=" + std::to_string(segment.thread_id)
+                    + ", bytes_read=" + std::to_string(cqe->res)
+                    + ", logical_size=" + std::to_string(logical_size);
                 io_uring_cqe_seen(selected_ring, cqe);
                 throw std::runtime_error(msg);
             }

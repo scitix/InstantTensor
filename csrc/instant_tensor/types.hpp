@@ -1,12 +1,39 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/function_executor.hpp>
 
 namespace instanttensor {
 
 using chunk_id_t = ssize_t;
+
+struct IOSegmentIndex {
+    chunk_id_t chunk_id;
+    size_t thread_id;
+};
+
+inline uint64_t encode_io_segment_id(
+    chunk_id_t chunk_id, size_t num_threads, size_t thread_id) {
+    return static_cast<uint64_t>(chunk_id) * num_threads + thread_id;
+}
+
+inline IOSegmentIndex decode_io_segment_id(
+    uint64_t segment_id, size_t num_threads) {
+    return {
+        static_cast<chunk_id_t>(segment_id / num_threads),
+        segment_id % num_threads,
+    };
+}
+
+inline size_t io_segment_logical_size(
+    size_t chunk_size, size_t rank_offset,
+    size_t thread_offset, size_t padded_thread_size) {
+    return chunk_size > rank_offset + thread_offset
+        ? std::min(chunk_size - rank_offset - thread_offset, padded_thread_size)
+        : 0;
+}
 
 using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
 using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;

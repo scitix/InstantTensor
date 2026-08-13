@@ -48,7 +48,8 @@ ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
     size_t worker_cnt = 0;
     for(size_t i = 0; i < this->num_threads; i++) {
         size_t thread_offset = p.padded_thread_size * i;
-        size_t thread_size = std::min((size_t)std::max((ssize_t)(p.chunk.size - p.rank_offset - thread_offset), (ssize_t)0), p.padded_thread_size);
+        size_t thread_size = io_segment_logical_size(
+            p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
 
         if(thread_size == 0) continue;
 
