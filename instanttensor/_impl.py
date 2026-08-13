@@ -472,6 +472,15 @@ class safe_open:
             ordered_tensor_metadatas = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
             if not all(ordered_tensor_metadatas[i][1]["data_offsets"][1] == ordered_tensor_metadatas[i+1][1]["data_offsets"][0] for i in range(len(ordered_tensor_metadatas) - 1)):
                 raise ValueError("Safetensors data offsets must be contiguous")
+            torch_dtypes = [safetensors_to_torch_dtype.get(v["dtype"]) for _, v in ordered_tensor_metadatas]
+            if all(dtype is not None for dtype in torch_dtypes):
+                element_sizes = [torch.empty((), dtype=dtype).element_size() for dtype in torch_dtypes]
+                if any(element_sizes[i] < element_sizes[i + 1] for i in range(len(element_sizes) - 1)):
+                    raise ValueError(
+                        "Safetensors tensors must be ordered by non-increasing element size; "
+                        "other tensor layouts will be supported in a future release. "
+                        "Please open a github issue if you need support for this layout"
+                    )
             
             self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
             self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
