@@ -13,7 +13,23 @@ namespace instanttensor {
 
 namespace {
 
-bool kernel_at_least_5_15() {
+bool is_rhel_family() {
+    FILE *fp = fopen("/proc/version", "r");
+    if (!fp) {
+        return false;
+    }
+    char line[256];
+    bool is_rhel = false;
+    if (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "Red Hat") != nullptr || strstr(line, ".el") != nullptr) {
+            is_rhel = true;
+        }
+    }
+    fclose(fp);
+    return is_rhel;
+}
+
+bool kernel_at_least_required_version() {
     struct utsname uts;
     if (uname(&uts) != 0) {
         return false;
@@ -31,7 +47,9 @@ bool kernel_at_least_5_15() {
         return false;
     }
 
-    return major > 5 || (major == 5 && minor >= 15);
+    // RHEL 9 backports io_uring stability fixes from 5.15 into kernel 5.14.x
+    int required_minor = is_rhel_family() ? 14 : 15;
+    return major > 5 || (major == 5 && minor >= required_minor);
 }
 
 bool probe_supports_fixed_buffer_read(struct io_uring *ring) {
@@ -74,7 +92,7 @@ bool supports_fixed_buffer_registration(struct io_uring *ring) {
 } // namespace
 
 bool Loader::uring_available(){// best-effort check
-    if (!kernel_at_least_5_15()) { // io_uring with kernel < 5.15 is not reliable
+    if (!kernel_at_least_required_version()) {
         return false;
     }
 
