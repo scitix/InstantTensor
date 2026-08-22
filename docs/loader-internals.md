@@ -29,6 +29,61 @@ Key source locations:
 - [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L217)
 - [`safe_open.tensors`](../instanttensor/_impl.py#L708)
 
+## Lifecycle at a Glance
+
+```mermaid
+flowchart TD
+    A["Python: read and validate metadata"] --> B["C++ OPEN: files, buffers, streams, executors"]
+    B --> C["compute_layout: chunks, tensor addresses, prefetch watermarks"]
+    C --> D["Loader thread: background prefetch"]
+    D --> E["get_tensor_ptr(index): wait for last_chunk_id"]
+    E --> F["C++: one-dimensional int8 DLPack view"]
+    F --> G["Python: dtype/shape view and optional clone"]
+    G --> H["Synchronize current stream before requesting the next tensor"]
+    H --> D
+    G --> I["CLOSE: stop, join, free buffers, close files"]
+```
+
+`compute_layout()` is entirely static: it determines where every chunk and
+tensor will live and how far each tensor permits prefetch. The loader thread
+then applies those watermarks while I/O, H2D, and optional NCCL work run in the
+background. `CLOSE` is shown to complete the lifecycle; this document covers
+its safety requirements, not every production cleanup branch.
+
+## Scope and Completeness
+
+This document is sufficient to reproduce the behavior-equivalent core of the
+0.1.9 io_uring loader:
+
+- metadata normalization needed by layout;
+- disk, host, and device chunk mapping;
+- `compute_layout()`, including ring wrap and overwrite watermarks;
+- io_uring submission/completion, H2D, and optional NCCL all-gather;
+- prefetch advancement, tensor completion, and DLPack/PyTorch views.
+
+It is not a production-complete specification of the entire package. In
+particular, it does not exhaustively reproduce:
+
+- backend probing, selection, fallback, and filesystem policy;
+- frontend buffer recommendation and free-memory heuristics;
+- host-buffer cache or pooling policy;
+- every close, cancellation, partial-initialization, and error-cleanup path;
+- backend-specific behavior for AIO, cuFile, mmap, and other non-io_uring paths.
+
+Those areas may be implemented differently without changing the core behavior
+described here. A production replacement still needs to define them.
+
+## External Assumptions and Caller Contract
+
+| Category | Requirement | Enforcement in 0.1.9 |
+| --- | --- | --- |
+| File shape | The file list is nonempty; each safetensors file contains at least one tensor; normal supported inputs have nonempty payloads | Partly implicit; all-zero-sized inputs are not a supported compatibility target |
+| Offsets | Tensor ranges are ordered by file offset and adjacent ranges are contiguous | Python sorts and validates continuity |
+| Dtype/alignment | Dtypes must be supported; file order does not need to preserve target-dtype alignment | Python clones an unaligned `int8` view before dtype reinterpretation |
+| Access order | Tensor indices advance in offset order; iteration is single-pass | Python iteration and C++ `current_tensor_index` rely on monotonic access |
+| Distributed input | Every rank uses the same sorted files, metadata, layout parameters, and compatible process group | Caller responsibility |
+| `copy=False` | An aligned tensor is a ring view and must not outlive overwrite or close; an unaligned tensor becomes an independent fallback copy; work on another CUDA stream requires caller-managed synchronization | Frontend warning plus caller responsibility |
+
 ## 1. Overall Model
 
 There is no single `Chunk` object that owns disk, host, and device storage.
@@ -101,7 +156,20 @@ host buffer    = D * R                     # one rank of data per process
 The device allocation includes conservative padding for file-page prefixes,
 first-tensor alignment, and world-chunk tail alignment.
 
-### 2.1 Effective Buffer Size and Initialization Order
+### 2.1 Terminology Traps
+
+| Name | Meaning in the implementation | Common misreading |
+| --- | --- | --- |
+| `chunk_size` | After page rounding, the maximum size `T` of one thread I/O segment | The size of one C++ `Chunk` |
+| `concurrency` | `num_threads = N`; for URING it mainly controls SQEs per full chunk and scales `R`, `W`, and `Aw` | A persistent pool of `N` user-space I/O threads |
+| `io_depth` | Number of reusable host windows/events and a bound on in-flight chunk work | Only the kernel storage queue depth |
+| `buffer_size` | A frontend capacity request that C++ first raises to at least `D * W`, then pads before layout | The exact number of bytes originally requested by the user |
+
+The names come from several layers of the implementation. Use `T`, `N`,
+`W`, and `D` when reasoning about layout to avoid treating similarly named
+objects as identical.
+
+### 2.2 Effective Buffer Size and Initialization Order
 
 Before layout, C++ computes:
 
@@ -228,11 +296,10 @@ possible element size, for `torch.complex128`. Thus aligning the first tensor
 to `F = 16` satisfies the strongest element-alignment requirement.
 
 Only the first tensor of each file, and the first tensor after a device-ring
-wrap, needs explicit device padding. InstantTensor currently requires tensors
-to be laid out in non-increasing element-size order and validates this during
-metadata loading. Let `a_i` be the device address and `e_i` the element size
-of tensor `i` in one contiguous region. Supported element sizes are powers of
-two up to 16, so:
+wrap, receives explicit device padding. For a file laid out in non-increasing
+element-size order, this is sufficient to keep every tensor aligned. Let
+`a_i` be the device address and `e_i` the element size of tensor `i` in one
+contiguous region. Supported element sizes are powers of two up to 16, so:
 
 ```text
 a_0 % 16 == 0
@@ -241,9 +308,18 @@ e_(i+1) divides e_i
 a_(i+1) = a_i + tensor_size_i
 ```
 
-By induction, `a_i % e_i == 0` for every tensor. Explicit alignment is needed
-again at a file boundary because file-page padding breaks payload continuity,
-and after a ring wrap because placement restarts in a different device region.
+By induction, `a_i % e_i == 0` for every tensor in that common layout.
+Explicit alignment is needed again at a file boundary because file-page
+padding breaks payload continuity, and after a ring wrap because placement
+restarts in a different device region.
+
+Safetensors does not require non-increasing element sizes. For another order,
+a later tensor can be unaligned for its dtype. C++ can still expose its bytes
+as an `int8` DLPack view, whose alignment requirement is one byte. Python
+checks the target dtype alignment and, only when needed, clones that byte view
+into independently allocated storage before dtype reinterpretation. Therefore
+arbitrary element-size orders are supported while aligned `copy=False`
+tensors remain zero-copy.
 
 ### 4.3 Tensor Addresses and Cross-Chunk Continuity
 
@@ -285,6 +361,62 @@ while:
 ```text
 chunk_reading < current_tensor.prefetch_chunk_id
 ```
+
+#### Worked Ring-Wrap Example
+
+Use one rank and one I/O segment per chunk:
+
+```text
+A = W = Aw = 4096
+N = P = D = 1
+F = 16
+frontend_buffer_size <= 4096
+device_buffer_size =
+    max(frontend_buffer_size, D * W) + 3 * (F + A + Aw)
+  = 4096 + 3 * (16 + 4096 + 4096)
+  = 28720
+```
+
+One file starts its payload at file offset 4096 and contains nine contiguous
+4096-byte tensors `T0..T8`. Every tensor occupies one chunk. Initial file
+setup places `T0` at device offset 16. Chunks then advance by 4096 bytes:
+
+| Tensor | `last_chunk_id` | Device offset | Final `prefetch_chunk_id` |
+| --- | ---: | ---: | ---: |
+| T0 | 0 | 16 | 6 |
+| T1 | 1 | 4112 | 7 |
+| T2 | 2 | 8208 | 8 |
+| T3 | 3 | 12304 | 8 |
+| T4 | 4 | 16400 | 8 |
+| T5 | 5 | 20496 | 8 |
+| T6 | 6 | 24592 | 8 |
+| T7 | 7 | 16 | 8 |
+| T8 | 8 | 4112 | 8 |
+
+Before `T7`, placing another tensor linearly would require:
+
+```text
+24592 + round_up(4096 + 4096, 4096) = 32784 > 28720
+```
+
+Therefore chunk 6 is finished and `reset_device_region(7)` wraps the next
+region to device offset 16. The relevant state transitions are:
+
+| Event | `chunk_device_offset` after event | `in_buffer_tensor_id` | `left_most_tensor_id` | Local chunk ID | Watermarks assigned |
+| --- | ---: | ---: | ---: | --- | --- |
+| After initial `reset_file` | 16 | 0 | 0 | - | none |
+| After placing T6 | 24592 | 0 | 0 | chunks 0-5 finished; chunk 6 open | none |
+| Finish chunk 6, then wrap before T7 | 16 | 0 | 7 | `previous_chunk_id=5`, `latest_chunk_id=6` | none yet |
+| Finish chunk 7 while placing T8 | 4112 | 1 | 7 | `previous_chunk_id=6` | `T0.prefetch_chunk_id=6` |
+| Final `finish_chunk` for chunk 8 | 8208 | 2 | 7 | `previous_chunk_id=7` | `T1.prefetch_chunk_id=7` |
+| First final reset | 16 | 7 | 9 | `latest_chunk_id=8` | T2 through T6 get 8 |
+| Second final reset | 16 | 9 | 9 | `latest_chunk_id=8` | T7 and T8 get 8 |
+
+`T7` reuses exactly the device interval occupied by `T0`, so a caller using
+`T0` may submit only through chunk 6. Advancing to `T1` permits chunk 7;
+advancing to `T2` permits chunk 8. Assignment happens during later static
+layout transitions, but all watermarks are complete before runtime prefetch
+starts.
 
 ### 4.5 Behavior-Equivalent Layout Pseudocode
 
@@ -665,12 +797,20 @@ C++ wraps the address and byte size as a one-dimensional `int8` DLPack tensor:
 
 ```python
 tensor_int8 = torch.from_dlpack(dl_tensor)
+required_alignment = torch.empty((), dtype=torch_dtype).element_size()
+if copy or tensor_int8.data_ptr() % required_alignment != 0:
+    tensor_int8 = tensor_int8.clone()
 tensor = tensor_int8.view(torch_dtype).view(shape)
 ```
 
 DLPack creates a view over already contiguous bytes. No concatenation occurs.
-`copy=True` clones into independent storage; `copy=False` returns a ring
-buffer view that later prefetch may overwrite.
+`copy=True` always clones into independent storage. With `copy=False`, an
+aligned tensor remains a ring-buffer view that later prefetch may overwrite;
+an unaligned tensor emits a `RuntimeWarning` and falls back to an independent
+clone. PyTorch's CUDA allocator is expected to make the cloned storage
+512-byte aligned, which is sufficient for every supported element size, but
+this is an implementation detail rather than a correctness contract. The
+final target-dtype alignment check remains authoritative.
 
 ## 8. Prefetch and Compute Overlap
 
@@ -701,17 +841,17 @@ synchronization and lifetime control.
 
 - Tensor data offsets in a file must be contiguous.
 - One tensor cannot exceed the device buffer; the frontend expands the buffer to at least the largest tensor.
-- The first tensor after a file start or ring wrap is 16-byte aligned, covering the maximum PyTorch element size. Contiguous layout plus the validated non-increasing element-size order then proves alignment of every later tensor in that region; Python still checks divisibility by `element_size()` as a runtime guard.
+- The first tensor after a file start or ring wrap is 16-byte aligned, covering the maximum PyTorch element size. Non-increasing element sizes preserve alignment without copies; other orders are accepted, with each unaligned tensor copied before dtype reinterpretation.
 - Chunks and tensors never cross files.
 - Full `W` chunks are adjacent on the device, preserving cross-chunk tensor continuity.
 - Disk chunks may overlap by a page tail. Device reservations do not overlap within one linear region; wraps deliberately reuse safe older regions.
-- A `copy=False` view is valid only until device-ring overwrite or loader close.
+- An aligned `copy=False` view is valid only until device-ring overwrite or loader close. An unaligned tensor is an independent fallback copy.
 
 ## 10. Current Implementation Notes
 
 1. `io_depth` sizes host windows, CUDA events, and ring queues, not only storage depth.
 2. On io_uring, `concurrency` controls SQEs per full chunk and world-chunk size, not a persistent user-space I/O thread pool.
-3. Device alignment currently relies on non-increasing tensor element sizes: after the first tensor is 16-byte aligned, divisibility propagates to every following tensor. The InstantTensor frontend explicitly validates this ordering and rejects other layouts before I/O; support for them is planned for a future release. Returned-address divisibility remains the runtime guard.
+3. Non-increasing tensor element sizes preserve zero-copy alignment after the first tensor is aligned to 16 bytes. Other orders may create unaligned addresses; the frontend clones those tensors as `int8` before dtype reinterpretation and retains the returned-address divisibility check as a final guard.
 
 ## 11. Acceptance Criteria
 
@@ -775,7 +915,7 @@ conservative, but never more aggressive than the first destructive chunk.
 - No chunk beyond the current tensor watermark is submitted while that tensor may be in use.
 - Completion covers read, H2D, and optional all-gather, not merely submission or launch.
 - Multi-rank completion leaves identical valid chunk bytes on every device.
-- With `copy=False`, current-view use finishes before advancement. Version 0.1.9 synchronizes the current Python CUDA stream.
+- With `copy=False`, use of an aligned ring view finishes before advancement. Version 0.1.9 synchronizes the current Python CUDA stream. An unaligned fallback copy has independent storage.
 
 ### 11.3 Minimum Scenario Matrix
 
@@ -792,7 +932,7 @@ conservative, but never more aggressive than the first destructive chunk.
 | CQEs complete out of chunk order | Decode the matching chunk/thread segment; advance only contiguous `chunk_read` |
 | Page-rounded read returns a short result | Accept when `bytes_read >= logical_size`; reject missing logical bytes before H2D |
 | Small device ring wraps repeatedly | Every watermark stops before current bytes are overwritten |
-| Mixed dtype item sizes | Every address is aligned for its item size or explicitly rejected |
+| Mixed dtype item sizes | Aligned tensors stay zero-copy; each unaligned tensor is copied before dtype reinterpretation |
 
 ### 11.4 End-to-End Equivalence
 
