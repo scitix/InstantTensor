@@ -472,15 +472,6 @@ class safe_open:
             ordered_tensor_metadatas = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
             if not all(ordered_tensor_metadatas[i][1]["data_offsets"][1] == ordered_tensor_metadatas[i+1][1]["data_offsets"][0] for i in range(len(ordered_tensor_metadatas) - 1)):
                 raise ValueError("Safetensors data offsets must be contiguous")
-            torch_dtypes = [safetensors_to_torch_dtype.get(v["dtype"]) for _, v in ordered_tensor_metadatas]
-            if all(dtype is not None for dtype in torch_dtypes):
-                element_sizes = [torch.empty((), dtype=dtype).element_size() for dtype in torch_dtypes]
-                if any(element_sizes[i] < element_sizes[i + 1] for i in range(len(element_sizes) - 1)):
-                    raise ValueError(
-                        "Safetensors tensors must be ordered by non-increasing element size; "
-                        "other tensor layouts will be supported in a future release. "
-                        "Please open a github issue if you need support for this layout"
-                    )
             
             self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
             self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
@@ -742,12 +733,27 @@ class safe_open:
             tensor_size = get_tensor_size(shape, torch_dtype)
             dl_tensor = instanttensor._C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
             tensor_int8 = torch.from_dlpack(dl_tensor)
+
+            required_alignment = torch.empty((), dtype=torch_dtype).element_size()
+            is_aligned = tensor_int8.data_ptr() % required_alignment == 0
+            if self.copy or not is_aligned:
+                if not self.copy:
+                    warnings.warn(
+                        f"Tensor {name} address {tensor_int8.data_ptr():#x} is not aligned "
+                        f"to dtype {torch_dtype} size {required_alignment}B; falling back "
+                        "to copy=True for this tensor",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                tensor_int8 = tensor_int8.clone()
+                # PyTorch's CUDA allocator is expected to return 512-byte-aligned
+                # storage. This is an implementation detail; 512 is divisible by
+                # every supported element size, and the check below remains authoritative.
+            
             tensor = tensor_int8.view(torch_dtype).view(torch.Size(shape))
 
             if tensor.data_ptr() % tensor.element_size() != 0:
                 raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
-            if self.copy:
-                tensor = tensor.clone()
             yield name, tensor
 
     def keys(self) -> list[str]:
