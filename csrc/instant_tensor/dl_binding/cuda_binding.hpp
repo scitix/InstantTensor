@@ -18,6 +18,11 @@
 #define cudaHostRegisterIoMemory 0x04
 #define cudaHostRegisterReadOnly 0x08
 
+#define cudaHostAllocDefault 0x00
+#define cudaHostAllocPortable 0x01
+#define cudaHostAllocMapped 0x02
+#define cudaHostAllocWriteCombined 0x04
+
 namespace instanttensor {
 namespace cuda_binding {
 
@@ -54,6 +59,9 @@ inline cudaError_t (*cudaEventSynchronize_fn)(cudaEvent_t event) = nullptr;
 inline cudaError_t (*cudaStreamWaitEvent_fn)(cudaStream_t stream, cudaEvent_t event, unsigned int flags) = nullptr;
 inline cudaError_t (*cudaHostRegister_fn)(void* ptr, size_t size, unsigned int flags) = nullptr;
 inline cudaError_t (*cudaHostUnregister_fn)(void* ptr) = nullptr;
+inline cudaError_t (*cudaHostAlloc_fn)(void** ptr, size_t size, unsigned int flags) = nullptr;
+inline cudaError_t (*cudaFreeHost_fn)(void* ptr) = nullptr;
+inline cudaError_t (*cudaGetLastError_fn)() = nullptr;
 inline const char* (*cudaGetErrorString_fn)(cudaError_t error) = nullptr;
 
 inline bool init() {
@@ -95,6 +103,9 @@ inline bool init() {
     cudaStreamWaitEvent_fn = resolve<decltype(cudaStreamWaitEvent_fn)>(lib_handle, {"cudaStreamWaitEvent", "hipStreamWaitEvent"});
     cudaHostRegister_fn = resolve<decltype(cudaHostRegister_fn)>(lib_handle, {"cudaHostRegister", "hipHostRegister"});
     cudaHostUnregister_fn = resolve<decltype(cudaHostUnregister_fn)>(lib_handle, {"cudaHostUnregister", "hipHostUnregister"});
+    cudaHostAlloc_fn = resolve<decltype(cudaHostAlloc_fn)>(lib_handle, {"cudaHostAlloc", "hipHostMalloc"});
+    cudaFreeHost_fn = resolve<decltype(cudaFreeHost_fn)>(lib_handle, {"cudaFreeHost", "hipHostFree"});
+    cudaGetLastError_fn = resolve<decltype(cudaGetLastError_fn)>(lib_handle, {"cudaGetLastError", "hipGetLastError"});
     cudaGetErrorString_fn = resolve<decltype(cudaGetErrorString_fn)>(lib_handle, {"cudaGetErrorString", "hipGetErrorString"});
 
     return true;
@@ -136,6 +147,15 @@ inline cudaError_t cudaHostRegister(void* ptr, size_t size, unsigned int flags) 
 }
 inline cudaError_t cudaHostUnregister(void* ptr) {
     return cudaHostUnregister_fn(ptr);
+}
+inline cudaError_t cudaHostAlloc(void** ptr, size_t size, unsigned int flags) {
+    return cudaHostAlloc_fn(ptr, size, flags);
+}
+inline cudaError_t cudaFreeHost(void* ptr) {
+    return cudaFreeHost_fn(ptr);
+}
+inline cudaError_t cudaGetLastError() {
+    return cudaGetLastError_fn();
 }
 inline const char* cudaGetErrorString(cudaError_t error) {
     return cudaGetErrorString_fn(error);
