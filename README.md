@@ -156,13 +156,16 @@ See `tests/test.py` for a full benchmark harness (TP/PP grouping, checksums, etc
 
 <!-- ## Performance tuning
 
-Users can specify three key parameters in `safe_open` for performance tuning:
+Users can specify four key parameters in `safe_open` for performance tuning:
 
 - **`buffer_size`**: The size of the GPU buffer used for tensors in bytes.
 
 - **`chunk_size`**: The size of each file I/O operation in bytes.
 
-- **`concurrency`**: The number of concurrent I/O operations. 
+- **`concurrency`**: The number of MMAP/cuFile worker threads. Native async
+  backends ignore it.
+
+- **`io_depth`**: The maximum number of rank-local I/O operations in flight.
 
 When set to None (the default), InstantTensor will automatically select a value based on the storage type for high performance. Otherwise, the user-supplied value is used.  -->
 

@@ -43,21 +43,15 @@ void Loader::deregister_device_buffer_cufile() {
 
 ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
-    vector<int> req_ids(this->num_threads);
-    std::vector<ssize_t> expect_return(this->num_threads);
-    size_t worker_cnt = 0;
-    for(size_t i = 0; i < this->num_threads; i++) {
-        size_t thread_offset = p.padded_thread_size * i;
-        size_t thread_size = io_segment_logical_size(
-            p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
-
-        if(thread_size == 0) continue;
-
+    int read_req_id = EXECUTOR_STOP_REQUEST_ID;
+    ssize_t expected_bytes = p.rank_size;
+    if(p.rank_size > 0) {
         CUfileHandle_t cufile_handle = p.file.cufile_handle;
-        size_t file_offset = p.chunk.file_offset + p.rank_offset + thread_offset;
-        size_t buf_offset = p.chunk.device_buffer_offset + p.rank_offset + thread_offset;
-        auto read_weight = [=]() -> ssize_t {
-            ssize_t ret = cuFileRead(cufile_handle, this->device_buffer, thread_size,
+        size_t file_offset = p.chunk.file_offset + p.rank_offset;
+        size_t buf_offset = p.chunk.device_buffer_offset + p.rank_offset;
+        size_t rank_size = p.rank_size;
+        auto read_chunk = [=]() -> ssize_t {
+            ssize_t ret = cuFileRead(cufile_handle, this->device_buffer, rank_size,
                 file_offset, buf_offset);
             if(ret == -1) {
                 perror("cuFileRead");
@@ -68,10 +62,8 @@ ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
             }
             return ret;
         };
-        req_ids[i] = this->next_executor_request_id();
-        this->worker_threads->submit(req_ids[i], std::move(read_weight));
-        expect_return[i] = thread_size;
-        worker_cnt++;
+        read_req_id = this->next_executor_request_id();
+        this->worker_threads->submit(read_req_id, std::move(read_chunk));
     }
 
     void *rank_dst = p.rank_dst;
@@ -79,14 +71,14 @@ ChunkRequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
     size_t padded_rank_size = p.padded_rank_size;
     cudaEvent_t event = p.event;
     int rank = this->rank;
-    auto cuda_func = [=, req_ids=std::move(req_ids), expect_return=std::move(expect_return)]() {
-        for(size_t i = 0; i < worker_cnt; i++) {
+    auto cuda_func = [=]() {
+        if(read_req_id != EXECUTOR_STOP_REQUEST_ID) {
             ssize_t bytes_read;
-            this->worker_threads->reap(req_ids[i], bytes_read);
-            if(bytes_read != expect_return[i]) {// bytes_read < 0 on error
-                fprintf(stderr, "chunk_id=%zd, rank=%d, thread_id=%zu, bytes_read=%zd, expect_read=%zd\n",
-                    chunk_id, rank, i, bytes_read, expect_return[i]);
-                print_and_throw(std::runtime_error("Internal error: bytes_read(" + std::to_string(bytes_read) + ") != thread_size(" + std::to_string(expect_return[i]) + ")."));
+            this->worker_threads->reap(read_req_id, bytes_read);
+            if(bytes_read != expected_bytes) {// bytes_read < 0 on error
+                fprintf(stderr, "chunk_id=%zd, rank=%d, bytes_read=%zd, expect_read=%zd\n",
+                    chunk_id, rank, bytes_read, expected_bytes);
+                print_and_throw(std::runtime_error("Internal error: bytes_read(" + std::to_string(bytes_read) + ") != rank_size(" + std::to_string(expected_bytes) + ")."));
             }
         }
         if(this->world_size > 1) {

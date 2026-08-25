@@ -125,13 +125,13 @@ void Loader::open_file_uring(FileInfo &f) {
 }
 
 void Loader::initialize_uring_context() {
-    int ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring, 0);
+    int ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring, 0);
     if (ret < 0) {
         throw std::runtime_error(
             "io_uring_queue_init failed: " + std::string(strerror(-ret)));
     }
     // Since the SQ and CQ of uring both operate in SPSC mode, we use an extra ring to submit IO for the last page.
-    // ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring_last_page, 0);
+    // ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring_last_page, 0);
     // if (ret < 0) {
     //     throw std::runtime_error(
     //         "io_uring_queue_init failed: " + std::string(strerror(-ret)));
@@ -195,41 +195,16 @@ void Loader::deregister_host_buffer_uring() {
 
 // ─── chunk read ──────────────────────────────────────────────────────────────
 
-// Helper struct capturing the per-segment read parameters, built on the main
-// thread and moved into the uring_func lambda.
-struct UringReadOp {
-    void  *buf;
-    size_t size;
-    size_t file_offset;
-    size_t thread_id;
-};
-
 ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
-    std::vector<UringReadOp> ops;
-    ops.reserve(this->num_threads);
-
-    bool unaligned_last_page = false;
-
-    for (size_t i = 0; i < this->num_threads; i++) {
-        size_t thread_offset = p.padded_thread_size * i;
-        size_t thread_size = io_segment_logical_size(
-            p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
-        size_t thread_size_aligned = ROUND_UP(thread_size, this->thread_alignment);
-        if(thread_size != thread_size_aligned) unaligned_last_page = true;
-        if (thread_size == 0) continue;
-
-        ops.push_back(UringReadOp{
-            (char*)this->host_buffer + p.window_offset + thread_offset,
-            thread_size_aligned,
-            p.chunk.file_offset + p.rank_offset + thread_offset,
-            i,
-        });
-    }
+    size_t rank_size_aligned = ROUND_UP(p.rank_size, this->rank_alignment);
+    bool unaligned_last_page = p.rank_size != rank_size_aligned;
 
     struct io_uring *selected_ring = &this->uring_ring; // unaligned_last_page ? &this->uring_ring_last_page : &this->uring_ring;
 
-    for (const auto &op : ops) {
+    size_t submit_cnt = 0;
+    if(p.rank_size > 0) {
+        void *buf = (char*)this->host_buffer + p.window_offset;
         struct io_uring_sqe *sqe = io_uring_get_sqe(selected_ring);
         if (!sqe) {
             throw std::runtime_error(
@@ -241,20 +216,19 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
 
         int buffer_index = -1;
         if(this->uring_register_buffer) {
-            size_t left_buffer_index = ((char*)op.buf - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
-            size_t right_buffer_index = ((char*)op.buf + op.size - 1 - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            size_t left_buffer_index = ((char*)buf - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            size_t right_buffer_index = ((char*)buf + rank_size_aligned - 1 - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
             if(left_buffer_index == right_buffer_index) {
                 buffer_index = (int)left_buffer_index;
             }
-            // fprintf(stderr, "chunk_id: %zu, buffer_index: %d, size: %zu, buffer_offset: %zu, file_offset: %zu\n", chunk_id, buffer_index, op.size, (char*)op.buf - (char*)this->host_buffer_entry.ptr, op.file_offset);
         }
         if(buffer_index != -1) {
-            io_uring_prep_read_fixed(sqe, file_handle, op.buf,
-                (unsigned)op.size, op.file_offset, buffer_index);
+            io_uring_prep_read_fixed(sqe, file_handle, buf,
+                (unsigned)rank_size_aligned, p.chunk.file_offset + p.rank_offset, buffer_index);
         }
         else {
-            io_uring_prep_read(sqe, file_handle, op.buf,
-                (unsigned)op.size, op.file_offset);
+            io_uring_prep_read(sqe, file_handle, buf,
+                (unsigned)rank_size_aligned, p.chunk.file_offset + p.rank_offset);
         }
         
         if(this->uring_register_file) {
@@ -276,11 +250,10 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
         }
         // sqe->flags |= IOSQE_ASYNC;
-        uint64_t segment_id = encode_io_segment_id(chunk_id, this->num_threads, op.thread_id);
-        io_uring_sqe_set_data64(sqe, segment_id);
+        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(chunk_id));
+        submit_cnt = 1;
     }
-    this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
-    const size_t submit_cnt = ops.size();
+    this->chunks[chunk_id].extra_data.unfinished_cnt = submit_cnt;
 
     auto uring_func = [=]() {
         size_t submitted = 0;
@@ -319,9 +292,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
                 throw std::runtime_error(
                     "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
             }
-            uint64_t segment_id = io_uring_cqe_get_data64(cqe);
-            IOSegmentIndex segment = decode_io_segment_id(segment_id, this->num_threads);
-            chunk_id_t cqe_chunk_id = segment.chunk_id;
+            chunk_id_t cqe_chunk_id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqe));
             if (cqe->res < 0) {
                 std::string msg =
                     "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(-cqe->res));
@@ -331,14 +302,11 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             const Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
             size_t padded_world_size = ROUND_UP(cqe_chunk.size, this->world_chunk_alignment);
             size_t padded_rank_size = padded_world_size / this->world_size;
-            size_t logical_size = io_segment_logical_size(
-                cqe_chunk.size, padded_rank_size * this->rank,
-                (padded_rank_size / this->num_threads) * segment.thread_id,
-                padded_rank_size / this->num_threads);
+            size_t logical_size = rank_logical_size(
+                cqe_chunk.size, padded_rank_size * this->rank, padded_rank_size);
             if(static_cast<size_t>(cqe->res) < logical_size) {
                 std::string msg =
                     "Unexpected io_uring short read: chunk_id=" + std::to_string(cqe_chunk_id)
-                    + ", thread_id=" + std::to_string(segment.thread_id)
                     + ", bytes_read=" + std::to_string(cqe->res)
                     + ", logical_size=" + std::to_string(logical_size);
                 io_uring_cqe_seen(selected_ring, cqe);

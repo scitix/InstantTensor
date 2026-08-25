@@ -64,25 +64,23 @@ void Loader::close_file() {
 }
 
 void Loader::init_buffer() {
-    this->thread_alignment = PAGE_SIZE;
-    this->rank_alignment = this->thread_alignment * this->num_threads;
+    this->rank_alignment = PAGE_SIZE;
     this->world_chunk_alignment = this->rank_alignment * this->world_size;
-    if(this->thread_chunk_size % this->thread_alignment != 0) {
-        size_t new_chunk_size = ROUND_UP(this->thread_chunk_size, this->thread_alignment);
-        debug_log("Enlarge thread_chunk_size from %zu to %zu to align to %zu", this->thread_chunk_size, new_chunk_size, this->thread_alignment);
-        this->thread_chunk_size = new_chunk_size;
+    if(this->rank_chunk_size % this->rank_alignment != 0) {
+        size_t new_chunk_size = ROUND_UP(this->rank_chunk_size, this->rank_alignment);
+        debug_log("Enlarge rank_chunk_size from %zu to %zu to align to %zu", this->rank_chunk_size, new_chunk_size, this->rank_alignment);
+        this->rank_chunk_size = new_chunk_size;
     }
-    this->rank_chunk_size = this->thread_chunk_size * this->num_threads;
     this->world_chunk_size = this->rank_chunk_size * this->world_size;
 
     size_t inflight_device_buffer_size = this->io_depth * this->world_chunk_size;
     if (this->buffer_size < inflight_device_buffer_size) this->buffer_size = inflight_device_buffer_size;
 
     // At most first_tensor_alignment bytes are padded both before and after the chunk
-    // At most thread_alignment bytes are padded before a chunk if the previous chunk's size < world_chunk_size
+    // At most rank_alignment bytes are padded before a chunk if the previous chunk's size < world_chunk_size
     // At most world_chunk_alignment bytes are padded after a chunk if its size < world_chunk_size
     // For three tensors, these paddings exist at most 3 times
-    size_t padded_size = 3 * (this->first_tensor_alignment + this->thread_alignment + this->world_chunk_alignment); // can be any value that >= 0
+    size_t padded_size = 3 * (this->first_tensor_alignment + this->rank_alignment + this->world_chunk_alignment); // can be any value that >= 0
     this->buffer_size += padded_size;
     CUDA_CHECK(cudaMalloc(&this->device_buffer, this->buffer_size));
 
@@ -96,7 +94,7 @@ void Loader::init_buffer() {
         this->host_buffer_entry = host_buffer_cache->get(host_buffer_size);
         if (this->host_buffer_entry.ptr == NULL) {
             // aligned_alloc + cudaHostRegister is faster than cudaHostAlloc
-            this->host_buffer_entry.ptr = aligned_alloc(this->thread_alignment, host_buffer_size);
+            this->host_buffer_entry.ptr = aligned_alloc(this->rank_alignment, host_buffer_size);
             if (this->host_buffer_entry.ptr == NULL) {
                 throw std::runtime_error("Failed to allocate host buffer: " + std::string(strerror(errno)));
             }
@@ -147,7 +145,7 @@ void Loader::init_threads() {
 
     if(this->need_worker_threads) {
         if(!this->worker_threads) {
-            this->worker_threads = std::make_unique<ThreadPoolTaskExecutor>(this->num_threads, driver_factory);
+            this->worker_threads = std::make_unique<ThreadPoolTaskExecutor>(this->concurrency, driver_factory);
         }
     }
     if(this->need_cuda_thread) {
@@ -217,7 +215,7 @@ void Loader::destroy_threads() {
 void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) {// list[(file_index, tensor_offset)]
     // NOTE: One chunk is a group of contiguous tensors, may have left and right non-tensor paddings.
     //       It may correspond to at most three types of storage: file, host buffer, device buffer.
-    //       The size and offset of the file storage and the host buffer of a chunk is aligned to thread_alignment (== PAGE_SIZE)
+    //       The size and offset of the file storage and the host buffer of a chunk is aligned to rank_alignment (== PAGE_SIZE)
     //       since libaio with O_DIRECT requres page-aligned I/O. (cuFile does not require this)
     //       The size of the device buffer of a chunk is aligned to world_chunk_alignment for ncclAllGather, and the offset is set to let tensors aligned (see below).
     // NOTE: We set the device buffer offset of the first chunk of a file properly
@@ -226,7 +224,7 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
     //       Consecutive tensors in current and consecutive chunks are then also dtype-aligned since the tensors
     //       are listed in the order of decreasing dtype size (e.g., FP32->FP16/BF16->FP8/INT8) in safetensors files.
     size_t chunk_file_index = 0;
-    size_t chunk_file_offset = 0; // The chunk offset from the beginning of the file, aligned to thread_alignment (typically == PAGE_SIZE)
+    size_t chunk_file_offset = 0; // The chunk offset from the beginning of the file, aligned to rank_alignment (typically == PAGE_SIZE)
     size_t chunk_device_buffer_offset = 0;
     size_t current_chunk_size = 0;
 
@@ -253,15 +251,15 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
             // ROUND_UP/DOWN make real effect only at the right most chunk
             this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}, {}});
 
-            if(chunk_file_offset % this->thread_alignment != 0) {
+            if(chunk_file_offset % this->rank_alignment != 0) {
                 throw std::runtime_error("Internal error: Chunk alignment error.");
             }
 
             // may reread the last file page
-            chunk_file_offset += ROUND_DOWN(current_chunk_size, this->thread_alignment);
+            chunk_file_offset += ROUND_DOWN(current_chunk_size, this->rank_alignment);
             chunk_device_buffer_offset += ROUND_UP(current_chunk_size, this->world_chunk_alignment);
-            // equals to "current_chunk_size -= ROUND_DOWN(current_chunk_size, this->thread_alignment);""
-            current_chunk_size %= this->thread_alignment;
+            // equals to "current_chunk_size -= ROUND_DOWN(current_chunk_size, this->rank_alignment);""
+            current_chunk_size %= this->rank_alignment;
 
 
             chunk_id_t prev_chunk_id = (chunk_id_t)this->chunks.size() - 2;
@@ -273,7 +271,7 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
         }
     };
     auto reset_chunk_buffer_offset = [&](size_t new_left_most_tensor_id) {
-        if(current_chunk_size >= this->thread_alignment) {
+        if(current_chunk_size >= this->rank_alignment) {
             print_and_throw(std::runtime_error("Internal error: Unchunked page detected when resetting chunk buffer offset."));
         }
         chunk_id_t latest_chunk_id = (chunk_id_t)this->chunks.size() - 1;
@@ -285,12 +283,12 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
         left_most_tensor_id = new_left_most_tensor_id;
     };
     auto reset_chunk_file = [&](size_t file_index, size_t file_offset) {
-        if(current_chunk_size >= this->thread_alignment) {
+        if(current_chunk_size >= this->rank_alignment) {
             print_and_throw(std::runtime_error("Internal error: Unchunked page detected when resetting chunk file offset."));
         }
         chunk_file_index = file_index;
-        chunk_file_offset = ROUND_DOWN(file_offset, this->thread_alignment);
-        current_chunk_size = file_offset % this->thread_alignment;
+        chunk_file_offset = ROUND_DOWN(file_offset, this->rank_alignment);
+        current_chunk_size = file_offset % this->rank_alignment;
         chunk_device_buffer_offset = ROUND_UP(chunk_device_buffer_offset, this->first_tensor_alignment) + this->first_tensor_alignment - current_chunk_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
     };
 
@@ -371,10 +369,20 @@ void Loader::open(OpenArgs args) {
     this->rank = args.rank;
     this->world_size = args.world_size;
     this->buffer_size = args.buffer_size;
-    this->thread_chunk_size = args.chunk_size;
-    this->num_threads = args.num_threads;
+    this->rank_chunk_size = args.chunk_size;
+    this->concurrency = args.concurrency;
     this->io_depth = args.io_depth;
     this->backend = args.backend;
+
+    if(this->rank_chunk_size == 0) {
+        print_and_throw(std::invalid_argument("chunk_size must be greater than zero"));
+    }
+    if(this->concurrency == 0) {
+        print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
+    }
+    if(this->io_depth == 0 || this->io_depth > MAX_PREFETCH_CHUNKS) {
+        print_and_throw(std::invalid_argument("io_depth must be between 1 and " + std::to_string(MAX_PREFETCH_CHUNKS)));
+    }
 
     if (this->world_size > 1 && this->group_communicator == NULL) {
         print_and_throw(std::runtime_error("Internal error: A communicatior should be provided if world_size > 1"));
@@ -404,8 +412,8 @@ void Loader::open(OpenArgs args) {
     std::chrono::duration<double> d5 = t5 - t4;
     std::chrono::duration<double> d6 = t6 - t5;
     if(_env_debug()) {
-        debug_log("Config: rank=%d/%d, backend=%s, num_threads=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p",
-            this->rank, this->world_size, backend_to_string(this->backend).c_str(), this->num_threads, this->buffer_size, this->host_buffer_entry.size, this->thread_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
+        debug_log("Config: rank=%d/%d, backend=%s, concurrency=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p",
+            this->rank, this->world_size, backend_to_string(this->backend).c_str(), this->concurrency, this->buffer_size, this->host_buffer_entry.size, this->rank_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
         debug_log("Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
     }
 }
@@ -439,9 +447,8 @@ void Loader::post_read_chunk() {
     // only the right most chunks of files and of buffers may not be aligned and need padding
     size_t padded_world_chunk_size = ROUND_UP(chunk.size, this->world_chunk_alignment);
     size_t padded_rank_size = padded_world_chunk_size / this->world_size;
-    size_t padded_thread_size = padded_rank_size / this->num_threads;
     size_t rank_offset = padded_rank_size * this->rank;
-    size_t rank_size = std::min((size_t)std::max((ssize_t)(chunk.size - rank_offset), (ssize_t)0), padded_rank_size);
+    size_t rank_size = rank_logical_size(chunk.size, rank_offset, padded_rank_size);
     size_t window_idx = chunk_id % this->io_depth;
     size_t window_offset = window_idx * this->rank_chunk_size;
     void *rank_dst = (char*)this->device_buffer + chunk.device_buffer_offset + rank_offset;
@@ -464,7 +471,7 @@ void Loader::post_read_chunk() {
     // }
 
     FileInfo &f = this->file_info[chunk.file_index];
-    ChunkIOParams params{chunk_id, chunk, f, padded_world_chunk_size, padded_rank_size, padded_thread_size,
+    ChunkIOParams params{chunk_id, chunk, f, padded_rank_size,
                          rank_offset, rank_size, window_idx, window_offset, rank_dst, all_dst, event};
 
     ChunkRequest result;

@@ -71,6 +71,7 @@ default_backend = [Backend.URING, Backend.AIO]
 default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]
 default_in_memory_backend = [Backend.MMAP]
 available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
+MAX_IO_DEPTH = 1024
 
 
 BackendCandidate = Union[Backend, BackendPolicy]
@@ -342,12 +343,12 @@ class safe_open:
             automatically determined based on storage type. Increasing this
             value can improve throughput, but values that are too large may
             conversely reduce throughput.
-        concurrency: The number of concurrent I/O operations. If ``None`` (default),
-            uses ``INSTANTTENSOR_CONCURRENCY`` when set; otherwise automatically
-            determined based on storage type and system capabilities. Increasing
-            this value can improve throughput, but values that are too large may
-            conversely reduce throughput.
-        io_depth: The number of queued I/O operations per thread. If ``None`` (default),
+        concurrency: The number of worker threads used by the synchronous
+            ``MMAP`` and ``CUFILE`` backends. It does not affect the I/O layout
+            or native asynchronous backends. If ``None`` (default), uses
+            ``INSTANTTENSOR_CONCURRENCY`` when set; otherwise automatically
+            determined for the selected backend.
+        io_depth: The maximum number of rank-local I/O operations in flight. If ``None`` (default),
             uses ``INSTANTTENSOR_IO_DEPTH`` when set; otherwise automatically
             determined based on storage type and system capabilities.
         max_free_mem_usage: Max ratio of idle memory used. If ``None`` (default),
@@ -523,10 +524,20 @@ class safe_open:
 
             if chunk_size is None:
                 chunk_size = 2*1024*1024
-            if concurrency is None:
-                concurrency = max(min(32, os.cpu_count()) // self.world_size, 1)
-            if io_depth is None:
-                io_depth = 3 # memcpy + cudaMemcpyAsync + ncclAllGather
+            default_in_memory_concurrency = max(min(32, os.cpu_count() or 1) // self.world_size, 1)
+            if backend == Backend.MMAP:
+                if concurrency is None:
+                    concurrency = default_in_memory_concurrency
+                if io_depth is None:
+                    # Preserve three pipeline groups per worker.
+                    io_depth = 3 * concurrency
+            else:
+                if concurrency is None:
+                    concurrency = 1
+                if io_depth is None:
+                    # Preserve the previous native-async request depth without
+                    # making it depend on the public concurrency parameter.
+                    io_depth = 3 * default_in_memory_concurrency
         else:
             if backend_candidates is None:
                 backend_candidates = default_backend
@@ -539,15 +550,25 @@ class safe_open:
                     # Since these are all IO-intensive threads, using more threads than CPU cores is acceptable
                     concurrency = max(32 // self.world_size, 1) 
                 if io_depth is None:
-                    io_depth = 16 # cuFileRead + ncclAllGather # why this has effect?
+                    # Preserve the previous 16 chunks of requests per worker.
+                    io_depth = 16 * concurrency
             else: 
-                # AIO/AIO_BUFFERED/URING/URING_BUFFERED
+                # Native-async backends and disk-backed MMAP.
                 if chunk_size is None:
                     chunk_size = 8*1024*1024
                 if concurrency is None:
-                    concurrency = 1 # max(1 // self.world_size, 1)
+                    concurrency = 1
                 if io_depth is None:
                     io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+        if concurrency <= 0:
+            raise ValueError("concurrency must be greater than zero")
+        if io_depth <= 0:
+            raise ValueError("io_depth must be greater than zero")
+        if io_depth > MAX_IO_DEPTH:
+            raise ValueError(f"io_depth must not exceed {MAX_IO_DEPTH}")
         
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
@@ -566,8 +587,8 @@ class safe_open:
             # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
 
 
-        if chunk_size * concurrency * io_depth * self.world_size > avail_bytes:
-            shrinked_io_depth = max(avail_bytes // (chunk_size * concurrency * self.world_size), 3)
+        if chunk_size * io_depth * self.world_size > avail_bytes:
+            shrinked_io_depth = max(avail_bytes // (chunk_size * self.world_size), 1)
             if shrinked_io_depth != io_depth:
                 warnings.warn(
                     f"Shrink io_depth from {io_depth} to {shrinked_io_depth} due to memory limit.",
@@ -576,17 +597,7 @@ class safe_open:
                 )
                 io_depth = shrinked_io_depth
         
-        if chunk_size * concurrency * io_depth * self.world_size > avail_bytes:
-            shrinked_concurrency = max(avail_bytes // (chunk_size * io_depth * self.world_size), 1)
-            if shrinked_concurrency != concurrency:
-                warnings.warn(
-                    f"Shrink concurrency from {concurrency} to {shrinked_concurrency} due to memory limit.",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
-                concurrency = shrinked_concurrency
-
-        if chunk_size * concurrency * io_depth * self.world_size > avail_bytes:
+        if chunk_size * io_depth * self.world_size > avail_bytes:
             raise RuntimeError("Device memory is not enough")
 
         self.chunk_size = chunk_size
@@ -601,7 +612,7 @@ class safe_open:
         if buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
             buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
-            buffer_size_for_io = self.chunk_size * self.concurrency * self.io_depth * self.world_size
+            buffer_size_for_io = self.chunk_size * self.io_depth * self.world_size
             self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
         else:
             self.buffer_size = buffer_size

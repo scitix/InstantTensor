@@ -1,12 +1,12 @@
-# InstantTensor Loader Internals (v0.1.9)
+# InstantTensor Loader Internals
 
 > **Language:** English (current) | [中文](./loader-internals.zh-CN.md)
 >
 > **Maintenance:** Keep this document and the Chinese version synchronized.
 
-> **Version scope:** This document describes the **InstantTensor loader
-> internals** as of **version 0.1.9**. Update both language versions if a later
-> release changes `compute_layout()`, device-ring reuse, or an I/O backend.
+> **Version scope:** This document describes the loader in the **current
+> repository source**. Update both language versions when `compute_layout()`,
+> device-ring reuse, parameter semantics, or an I/O backend changes.
 
 InstantTensor divides contiguous safetensors byte ranges into chunks, stages
 them in host memory, moves them into a device ring buffer, and exposes them as
@@ -16,7 +16,7 @@ Reproducible here means behavior-equivalent, not source-identical. Another
 implementation may use different classes or async primitives, but it must:
 
 - derive equivalent disk and device chunk boundaries from the same file offsets;
-- preserve file, host, and device mappings, including rank/thread partitioning;
+- preserve file, host, and device mappings, including rank partitioning;
 - keep tensors contiguous on the device when they cross chunk boundaries;
 - wait for the correct completion before reusing host windows, CUDA events, or device regions;
 - enforce a watermark equivalent to `prefetch_chunk_id`;
@@ -24,10 +24,10 @@ implementation may use different classes or async primitives, but it must:
 
 Key source locations:
 
-- [`Loader::compute_layout`](../csrc/loader_common.cpp#L217)
-- [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L434)
-- [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L217)
-- [`safe_open.tensors`](../instanttensor/_impl.py#L708)
+- [`Loader::compute_layout`](../csrc/loader_common.cpp#L215)
+- [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L442)
+- [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L198)
+- [`safe_open.tensors`](../instanttensor/_impl.py#L717)
 
 ## Lifecycle at a Glance
 
@@ -53,7 +53,7 @@ its safety requirements, not every production cleanup branch.
 ## Scope and Completeness
 
 This document is sufficient to reproduce the behavior-equivalent core of the
-0.1.9 io_uring loader:
+current io_uring loader:
 
 - metadata normalization needed by layout;
 - disk, host, and device chunk mapping;
@@ -75,7 +75,7 @@ described here. A production replacement still needs to define them.
 
 ## External Assumptions and Caller Contract
 
-| Category | Requirement | Enforcement in 0.1.9 |
+| Category | Requirement | Current enforcement |
 | --- | --- | --- |
 | File shape | The file list is nonempty; each safetensors file contains at least one tensor; normal supported inputs have nonempty payloads | Partly implicit; all-zero-sized inputs are not a supported compatibility target |
 | Offsets | Tensor ranges are ordered by file offset and adjacent ranges are contiguous | Python sorts and validates continuity |
@@ -132,21 +132,20 @@ world chunk.
 These symbols correspond to `Loader::init_buffer()`:
 
 ```text
-A = thread_alignment = system page size, normally 4096
-T = thread_chunk_size = round_up(user chunk_size, A)
-N = num_threads, the Python concurrency value
-R = rank_chunk_size = T * N
+A = rank_alignment = system page size, normally 4096
+R = rank_chunk_size = round_up(user chunk_size, A)
 P = world_size = number of processes in the torch.distributed process group
 rank = process index in [0, P)
 W = world_chunk_size = R * P
-Aw = world_chunk_alignment = A * N * P
+Aw = world_chunk_alignment = A * P
 D = io_depth
+C = concurrency, the MMAP/cuFile worker count
 F = first_tensor_alignment = 16
 ```
 
-Python `chunk_size` becomes the maximum size `T` of one I/O segment.
-The normal upper bound of `Chunk::size` is `W = T * N * P`; a C++ chunk is
-partitioned again by rank and thread.
+Python `chunk_size` becomes the maximum size `R` of one rank-local I/O request.
+The normal upper bound of `Chunk::size` is `W = R * P`; a C++ chunk is
+partitioned only by rank.
 
 ```text
 device buffer >= D * W + layout padding
@@ -160,13 +159,20 @@ first-tensor alignment, and world-chunk tail alignment.
 
 | Name | Meaning in the implementation | Common misreading |
 | --- | --- | --- |
-| `chunk_size` | After page rounding, the maximum size `T` of one thread I/O segment | The size of one C++ `Chunk` |
-| `concurrency` | `num_threads = N`; for URING it mainly controls SQEs per full chunk and scales `R`, `W`, and `Aw` | A persistent pool of `N` user-space I/O threads |
-| `io_depth` | Number of reusable host windows/events and a bound on in-flight chunk work | Only the kernel storage queue depth |
+| `chunk_size` | After page rounding, the maximum rank-local request size `R` | The size of one world-wide C++ `Chunk` |
+| `concurrency` | Worker count for synchronous MMAP memcpy and cuFile reads; ignored by native-async backends and layout | A cross-backend I/O-depth multiplier |
+| `io_depth` | Maximum rank-local requests/pipeline entries in flight, and the number of reusable host windows/events | Only the kernel storage queue depth |
 | `buffer_size` | A frontend capacity request that C++ first raises to at least `D * W`, then pads before layout | The exact number of bytes originally requested by the user |
 
-The names come from several layers of the implementation. Use `T`, `N`,
-`W`, and `D` when reasoning about layout to avoid treating similarly named
+Backend defaults preserve the previous request capacity after removing the
+thread-segment layer. In-memory MMAP uses `D = 3 * C`; cuFile uses
+`D = 16 * C`. Native-async backends resolve `D` independently of `C`, and an
+explicit `concurrency` value cannot change their layout or memory use. Free
+device-memory pressure shrinks only `io_depth`. The accepted range is
+`1 <= io_depth <= 1024`, matching the executor capacity.
+
+The names come from several layers of the implementation. Use `R`, `W`, and
+`D` when reasoning about layout to avoid treating similarly named
 objects as identical.
 
 ### 2.2 Effective Buffer Size and Initialization Order
@@ -179,14 +185,14 @@ effective_device_buffer_size =
 
 allocated_device_buffer_size =
     effective_device_buffer_size
-    + 3 * (first_tensor_alignment + thread_alignment
+    + 3 * (first_tensor_alignment + rank_alignment
            + world_chunk_alignment)
 ```
 
 The implementation updates `buffer_size` to this padded allocation size.
 `compute_layout()` uses that value for capacity checks. A reimplementation may
 keep requested and allocated sizes separate, but must use the allocated size to
-reproduce 0.1.9 wrap boundaries.
+reproduce the current wrap boundaries.
 
 ```text
 Python:
@@ -197,7 +203,7 @@ Python:
 
 C++:
     open files and initialize io_uring
-    derive A, T, R, W, Aw
+    derive A, R, W, Aw
     enlarge and allocate the device buffer
     allocate/register the host buffer and register it with io_uring
     create CUDA/NCCL streams, per-window events, and executors
@@ -231,7 +237,7 @@ The Python frontend:
 The final offset lets adjacent entries determine tensor size. A pair crossing a
 file boundary only finishes the previous chunk and switches files.
 
-Version 0.1.9 also assumes:
+The current implementation also assumes:
 
 - file indices start at zero and are contiguous; offsets are ordered by file and address;
 - every safetensors file has at least one tensor;
@@ -282,8 +288,7 @@ Within one linear region, each finished chunk advances by:
 next_chunk_device_offset += round_up(chunk.size, Aw)
 ```
 
-`Aw = A * N * P` lets a padded chunk divide into `P` rank slices, each
-further divisible into `N` page-aligned thread segments.
+`Aw = A * P` lets a padded chunk divide into `P` page-aligned rank slices.
 
 If the next complete tensor does not fit, layout finishes the current chunk at
 the tensor boundary and wraps to a low device address. This is not
@@ -364,11 +369,11 @@ chunk_reading < current_tensor.prefetch_chunk_id
 
 #### Worked Ring-Wrap Example
 
-Use one rank and one I/O segment per chunk:
+Use one rank and one I/O request per chunk:
 
 ```text
-A = W = Aw = 4096
-N = P = D = 1
+A = R = W = Aw = 4096
+P = D = 1
 F = 16
 frontend_buffer_size <= 4096
 device_buffer_size =
@@ -453,7 +458,7 @@ finish_chunk():
     # Advance only by full file pages; the next chunk rereads the page tail.
     chunk_file_offset += round_down(current_chunk_size, A)
 
-    # Reserve an Aw-aligned device range for rank/thread partitioning.
+    # Reserve an Aw-aligned device range for rank partitioning.
     chunk_device_offset += round_up(current_chunk_size, Aw)
     current_chunk_size %= A
 
@@ -546,7 +551,6 @@ Commonly missed details:
 S  = c.size
 Sw = round_up(S, Aw)
 Sr = Sw / P                         # padded_rank_size
-St = Sr / N                         # padded_thread_size
 r0 = Sr * rank                      # rank_offset
 rs = clamp(S - r0, 0, Sr)           # rank_size, valid bytes
 ```
@@ -559,12 +563,8 @@ The rank owns:
 [c.file_offset + r0, c.file_offset + r0 + rs)
 ```
 
-Thread `i` receives:
-
 ```text
-thread_offset = St * i
-thread_size   = clamp(S - r0 - thread_offset, 0, St)
-read_size     = round_up(thread_size, A)
+read_size = round_up(rs, A)
 ```
 
 File offset, host address, and read size are page aligned for `O_DIRECT`.
@@ -576,7 +576,7 @@ The final read may extend past the logical chunk end, but H2D copies only
 ```text
 window_index  = chunk_id % D
 window_offset = window_index * R
-thread_dst    = host_buffer + window_offset + thread_offset
+rank_mid      = host_buffer + window_offset
 ```
 
 The pinned host buffer is a ring of `D` windows. Each window holds one rank
@@ -617,7 +617,7 @@ Sr = Sw / P
 `POSIX_FADV_SEQUENTIAL`. Both:
 
 - allocate and CUDA-register pinned host memory;
-- create an io_uring sized `io_depth * num_threads`;
+- create an io_uring sized `io_depth`;
 - register files as fixed files;
 - register host memory in iovecs of at most 1 GiB.
 
@@ -626,24 +626,22 @@ A read contained in one registered segment uses
 
 ### 6.2 SQE Submission
 
-`post_read_chunk_uring()` creates one SQE per nonempty thread segment:
+`post_read_chunk_uring()` creates one SQE for the rank slice when it is nonempty:
 
 ```text
-file source -> host window/thread segment
+file rank slice -> host window
 ```
 
 Both direct and buffered io_uring paths submit
 `round_up(logical_size, PAGE_SIZE)`; buffered I/O intentionally reuses the
 direct-I/O range, while H2D copies only logical bytes. `URING_BUFFERED` also
 sets `IOSQE_ASYNC` to avoid a large inline page-cache copy on the loader
-thread. A non-page-aligned final segment sets it as well.
+thread. A non-page-aligned final rank slice sets it as well.
 
-All backends use the same `(chunk_id, thread_id)` segment coordinates and
-logical-size calculation. The kernel-completion backends encode those
-coordinates as `segment_id = chunk_id * num_threads + thread_id`: io_uring
-stores it in SQE `user_data`, and libaio stores it in `iocb->data`. cuFile
-and MMAP have no equivalent kernel `user_data`; their executor request IDs
-remain a separate mechanism. `unfinished_cnt` remains a per-chunk counter.
+All backends use `chunk_id` as the request coordinate and the same rank-size
+calculation. io_uring stores it in SQE `user_data`, while libaio stores it in
+`iocb->data`. cuFile and MMAP use executor request IDs instead. Each chunk's
+`unfinished_cnt` is therefore either zero or one.
 
 ### 6.3 CQE, H2D, and NCCL
 
@@ -665,9 +663,9 @@ wait_thread (single-thread executor):
 ```
 
 Disk I/O for multiple chunks can be in flight. CQEs may arrive out of order.
-The segment ID recovers both `chunk_id` and `thread_id`, selecting the
-correct `unfinished_cnt` and logical segment size. A nonnegative short read
-is accepted only when it still covers the complete logical segment; page-rounded
+The completion metadata recovers `chunk_id`, selecting the correct
+`unfinished_cnt` and logical rank size. A nonnegative short read
+is accepted only when it still covers the complete logical rank slice; page-rounded
 padding may be absent. `poll_read_chunk()` and `wait_read_chunk()` reap final
 completion handles in
 chunk order, making `chunk_read` a contiguous completed prefix.
@@ -739,12 +737,11 @@ get_tensor_ptr(tensor_index):
 `submit_uring_h2d_allgather()` performs:
 
 ```text
-1. Prepare one SQE for every nonempty thread segment using Section 5.
-2. Encode segment_id = chunk_id * num_threads + thread_id and read the
-   disk segment into its host-window segment.
-3. Submit all SQEs and set chunks[chunk_id].unfinished_cnt.
+1. Prepare one SQE when the current rank slice is nonempty.
+2. Store `chunk_id` in completion metadata and read the rank slice into its host window.
+3. Submit the SQE and set `chunks[chunk_id].unfinished_cnt` to zero or one.
 4. On the single-thread CUDA executor:
-   a. decode each CQE segment ID, reject bytes_read < logical_size, and
+   a. decode each CQE chunk ID, reject bytes_read < logical_size, and
       decrement the matching chunk unfinished_cnt;
    b. wait until unfinished_cnt of the current chunk reaches zero;
    c. cudaMemcpyAsync host rank slice -> device rank slice;
@@ -849,8 +846,8 @@ synchronization and lifetime control.
 
 ## 10. Current Implementation Notes
 
-1. `io_depth` sizes host windows, CUDA events, and ring queues, not only storage depth.
-2. On io_uring, `concurrency` controls SQEs per full chunk and world-chunk size, not a persistent user-space I/O thread pool.
+1. `io_depth` is the rank-local request limit and also sizes host windows, CUDA events, and native I/O queues; a window remains occupied through H2D and optional all-gather.
+2. `concurrency` only controls the MMAP/cuFile worker pool. It does not affect chunk geometry, buffers, AIO, or io_uring.
 3. Non-increasing tensor element sizes preserve zero-copy alignment after the first tensor is aligned to 16 bytes. Other orders may create unaligned addresses; the frontend clones those tensors as `int8` before dtype reinterpretation and retains the returned-address divisibility check as a final guard.
 
 ## 11. Acceptance Criteria
@@ -863,7 +860,7 @@ For every chunk:
 0 < chunk.size <= W
 chunk.file_offset % A == 0
 round_up(chunk.size, Aw) % P == 0
-(round_up(chunk.size, Aw) / P) % N == 0
+(round_up(chunk.size, Aw) / P) % A == 0
 ```
 
 For every tensor:
@@ -915,7 +912,7 @@ conservative, but never more aggressive than the first destructive chunk.
 - No chunk beyond the current tensor watermark is submitted while that tensor may be in use.
 - Completion covers read, H2D, and optional all-gather, not merely submission or launch.
 - Multi-rank completion leaves identical valid chunk bytes on every device.
-- With `copy=False`, use of an aligned ring view finishes before advancement. Version 0.1.9 synchronizes the current Python CUDA stream. An unaligned fallback copy has independent storage.
+- With `copy=False`, use of an aligned ring view finishes before advancement. The frontend synchronizes the current Python CUDA stream. An unaligned fallback copy has independent storage.
 
 ### 11.3 Minimum Scenario Matrix
 
@@ -929,7 +926,7 @@ conservative, but never more aggressive than the first destructive chunk.
 | Two or more files | No cross-file chunk; recompute prefix and first-tensor alignment |
 | `world_size > 1` with a short final chunk | Later slices may be empty; padded all-gather remains divisible |
 | `io_depth = 3` with at least four chunks | Chunk 3 waits for chunk 0 before reusing window 0 |
-| CQEs complete out of chunk order | Decode the matching chunk/thread segment; advance only contiguous `chunk_read` |
+| CQEs complete out of chunk order | Decode the matching chunk; advance only contiguous `chunk_read` |
 | Page-rounded read returns a short result | Accept when `bytes_read >= logical_size`; reject missing logical bytes before H2D |
 | Small device ring wraps repeatedly | Every watermark stops before current bytes are overwritten |
 | Mixed dtype item sizes | Aligned tensors stay zero-copy; each unaligned tensor is copied before dtype reinterpretation |
@@ -939,9 +936,9 @@ conservative, but never more aggressive than the first destructive chunk.
 Given identical files, chunk parameters, world size, and buffer size, produce:
 
 1. identical tensor order, shapes, dtypes, and payload;
-2. identical effective rank/thread file ranges, allowing I/O coalescing only when valid bytes are unchanged;
+2. identical effective rank file ranges, allowing I/O coalescing only when valid bytes are unchanged;
 3. equivalent device-ring wrap points and contiguous tensor intervals;
-4. an overwrite watermark no more aggressive than 0.1.9;
+4. an overwrite watermark no more aggressive than the current implementation;
 5. no unresolved dependency when returning a tensor, reusing a host window/event, or closing.
 
 A more conservative watermark is correct but reduces prefetch. Matching overlap

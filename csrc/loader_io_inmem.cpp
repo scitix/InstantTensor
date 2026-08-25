@@ -40,26 +40,16 @@ ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
     SingleThreadTaskExecutor *completion_thread = nullptr;
 
     if (!this->use_internal_memory_register) {
-        vector<int> req_ids(this->num_threads);
-        size_t worker_cnt = 0;
-        for(size_t i = 0; i < this->num_threads; i++) {
-            size_t thread_offset = p.padded_thread_size * i;
-            size_t thread_size = io_segment_logical_size(
-                p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
-            if(p.padded_thread_size > this->thread_chunk_size) {
-                print_and_throw(std::runtime_error("Internal error: padded_thread_size > chunk_size."));
-            }
-
-            if(thread_size == 0) continue;
-
-            void *thread_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset + thread_offset;
-            void *thread_mid = (char*)this->host_buffer + p.window_offset + thread_offset;
+        int memcpy_req_id = EXECUTOR_STOP_REQUEST_ID;
+        if(p.rank_size > 0) {
+            void *rank_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset;
+            void *rank_mid = (char*)this->host_buffer + p.window_offset;
+            size_t rank_size = p.rank_size;
             auto memcpy_func = [=]() {
-                memcpy(thread_mid, thread_src, thread_size);
+                memcpy(rank_mid, rank_src, rank_size);
             };
-            req_ids[i] = this->next_executor_request_id();
-            this->worker_threads->submit(req_ids[i], std::move(memcpy_func));
-            worker_cnt++;
+            memcpy_req_id = this->next_executor_request_id();
+            this->worker_threads->submit(memcpy_req_id, std::move(memcpy_func));
         }
 
         void *rank_mid = (char*)this->host_buffer + p.window_offset;
@@ -69,8 +59,8 @@ ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
         size_t padded_rank_size = p.padded_rank_size;
         cudaEvent_t event = p.event;
         auto cuda_func = [=]() {
-            for(size_t i = 0; i < worker_cnt; i++) {
-                this->worker_threads->reap(req_ids[i]);
+            if(memcpy_req_id != EXECUTOR_STOP_REQUEST_ID) {
+                this->worker_threads->reap(memcpy_req_id);
             }
             CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_mid, rank_size, cudaMemcpyHostToDevice, this->cuda_stream));// 240GB/s for 8 GPUs
             CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
