@@ -552,6 +552,13 @@ class safe_open:
                 if io_depth is None:
                     # Preserve the previous 16 chunks of requests per worker.
                     io_depth = 16 * concurrency
+            elif backend == Backend.MMAP:
+                if chunk_size is None:
+                    chunk_size = 2*1024*1024
+                if concurrency is None:
+                    concurrency = max(min(32, os.cpu_count() or 1) // self.world_size, 1)
+                if io_depth is None:
+                    io_depth = 3 * concurrency
             else: 
                 # Native-async backends and disk-backed MMAP.
                 if chunk_size is None:

@@ -354,7 +354,7 @@ public:
     {}
 
     // Lifecycle side: starts Worker threads.
-    void start(size_t num_workers = std::thread::hardware_concurrency()) {
+    void start(size_t num_workers) {
         Base::start(num_workers);
     }
 };
