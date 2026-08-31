@@ -138,15 +138,29 @@ void cleanup() {
     instanttensor::munmaper.reset();
 }
 
-bool backend_available(int backend) {
+BackendStatus backend_status(int backend) {
     Backend backend_enum = static_cast<Backend>(backend);
-    if(backend_enum == Backend::CUFILE) {
-        return Loader::cufile_available();
-    } else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
-        return Loader::uring_available();
-    } else {
-        return true;
+    if(!is_valid_backend(backend_enum)) {
+        return {false, "The requested backend is not recognized.", ""};
     }
+    if(backend_enum == Backend::CUFILE) {
+        bool available = Loader::cufile_available();
+        return {
+            available,
+            available ? "" : "cuFile is not available on this system.",
+            "",
+        };
+    }
+    else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
+        return Loader::uring_status();
+    }
+    else {
+        return {true, "", ""};
+    }
+}
+
+bool backend_available(int backend) {
+    return backend_status(backend).available;
 }
 
 } // namespace instanttensor
@@ -186,5 +200,13 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("backend_available", &instanttensor::backend_available,
           "Check if the backend is available",
+          pybind11::arg("backend"));
+
+    m.def("backend_status", [](int backend) {
+              auto status = instanttensor::backend_status(backend);
+              return pybind11::make_tuple(
+                  status.available, status.reason, status.warning);
+          },
+          "Return backend availability, rejection reason, and warning",
           pybind11::arg("backend"));
 }
