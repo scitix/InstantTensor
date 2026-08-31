@@ -1,19 +1,19 @@
-# InstantTensor 加载器内部实现（v0.1.9）
+# InstantTensor 加载器内部实现
 
 > **语言：** [English](./loader-internals.md) | 中文（当前）
 >
 > **维护说明：** 本文与英文版必须同步更新。
 
-> **版本范围：** 本文描述的是截至 **InstantTensor 0.1.9** 的加载器内部实现。
-> 后续版本若修改 `compute_layout()`、ring buffer 复用规则或 I/O backend，
-> 需要同步更新本文。
+> **版本范围：** 本文描述的是**当前仓库源码**中的加载器实现。若修改
+> `compute_layout()`、ring buffer 复用规则、参数语义或 I/O backend，需同步更新
+> 中英文文档。
 
 本文基于当前仓库源码，说明 InstantTensor 如何把 safetensors 文件中的连续字节区间切成 chunk，经过 host staging buffer 搬到 device ring buffer，并最终暴露为 PyTorch tensor。I/O 路径重点描述 `io_uring`。
 
 本文的“可复现”是指可以用不同的类、线程库或异步框架实现行为等价的加载器。实现需要保持以下行为，而不要求复制当前 C++ 代码结构：
 
 - 从相同 tensor file offsets 得到等价的 disk/device chunk 边界；
-- 保持 file、host、device 三层映射及分布式 rank/thread 切分一致；
+- 保持 file、host、device 三层映射及分布式 rank 切分一致；
 - 保证跨 chunk tensor 在 device 上连续；
 - 在 host window、CUDA event 和 device ring 复用前等待正确的 completion；
 - 使用与 `prefetch_chunk_id` 等价的 watermark，不能覆盖当前仍在使用的 tensor；
@@ -21,10 +21,62 @@
 
 关键代码：
 
-- [`Loader::compute_layout`](../csrc/loader_common.cpp#L217)
-- [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L434)
-- [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L217)
-- [`safe_open.tensors`](../instanttensor/_impl.py#L708)
+- [`Loader::compute_layout`](../csrc/loader_common.cpp#L215)
+- [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L442)
+- [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L198)
+- [`safe_open.tensors`](../instanttensor/_impl.py#L717)
+
+## 生命周期总览
+
+```mermaid
+flowchart TD
+    A["Python：读取并验证 metadata"] --> B["C++ OPEN：文件、buffer、stream、executor"]
+    B --> C["compute_layout：chunk、tensor 地址、prefetch watermark"]
+    C --> D["Loader thread：后台 prefetch"]
+    D --> E["get_tensor_ptr(index)：等待 last_chunk_id"]
+    E --> F["C++：一维 int8 DLPack view"]
+    F --> G["Python：dtype/shape view，可选 clone"]
+    G --> H["请求下一个 tensor 前同步当前 stream"]
+    H --> D
+    G --> I["CLOSE：停止、join、释放 buffer、关闭文件"]
+```
+
+`compute_layout()` 完全是静态计算：它预先确定每个 chunk 和 tensor 的位置，
+以及每个 tensor 允许 prefetch 到哪里。之后 loader thread 使用这些 watermark，
+让 I/O、H2D 和可选 NCCL 在后台执行。图中保留 `CLOSE` 用于补全生命周期；
+本文描述 close 的安全性要求，但不穷举 production 中的每条清理分支。
+
+## 范围和完整性
+
+本文足以复现当前 io_uring loader 中行为等价的核心路径：
+
+- layout 所需的 metadata 规范化；
+- disk、host、device 三层 chunk 映射；
+- `compute_layout()`，包括 ring wrap 和覆盖 watermark；
+- io_uring 提交/完成、H2D 和可选 NCCL all-gather；
+- prefetch 推进、tensor completion 和 DLPack/PyTorch view。
+
+本文不是整个 package 的 production-complete specification，尤其没有完整覆盖：
+
+- backend 探测、选择、fallback 和 filesystem policy；
+- frontend buffer recommendation 和 free-memory heuristic；
+- host buffer cache 或 pooling policy；
+- close、cancel、部分初始化失败和异常清理的全部路径；
+- AIO、cuFile、mmap 等非 io_uring backend 的专有行为。
+
+这些部分可以采用不同实现而不改变本文描述的核心行为；production 实现仍需
+自行完整定义。
+
+## 外部假设和调用方契约
+
+| 分类 | 要求 | 当前约束方式 |
+| --- | --- | --- |
+| 文件形态 | 文件列表非空；每个 safetensors 文件至少包含一个 tensor；正常受支持输入具有非空 payload | 部分为隐含前提；全零长度输入不属于兼容目标 |
+| Offset | tensor range 按文件 offset 排序，相邻 range 连续 | Python 排序并检查连续性 |
+| Dtype/对齐 | dtype 必须受支持；文件排列不需要天然满足目标 dtype 对齐 | Python 在 dtype reinterpretation 前 clone 未对齐的 `int8` view |
+| 访问顺序 | tensor index 按 offset 单调前进，iteration 只能执行一次 | Python iteration 和 C++ `current_tensor_index` 都依赖单调访问 |
+| 分布式输入 | 所有 rank 使用相同的已排序文件、metadata、layout 参数和兼容的 process group | 调用方负责 |
+| `copy=False` | 已对齐 tensor 是 ring view，不能活过 overwrite 或 close；未对齐 tensor 会成为独立 fallback copy；在其他 CUDA stream 上使用时由调用方同步 | frontend warning 加调用方负责 |
 
 ## 1. 总体模型
 
@@ -72,19 +124,18 @@ all-gather，使每个进程都得到完整的 world chunk。
 以下符号对应 `Loader::init_buffer()`：
 
 ```text
-A = thread_alignment = system page size，通常为 4096
-T = thread_chunk_size = round_up(user chunk_size, A)
-N = num_threads，即 Python concurrency
-R = rank_chunk_size = T * N
+A = rank_alignment = system page size，通常为 4096
+R = rank_chunk_size = round_up(user chunk_size, A)
 P = world_size = torch.distributed process group 中的进程数
 rank = 当前进程编号，范围为 [0, P)
 W = world_chunk_size = R * P
-Aw = world_chunk_alignment = A * N * P
+Aw = world_chunk_alignment = A * P
 D = io_depth
+C = concurrency，即 MMAP/cuFile 的 worker 数
 F = first_tensor_alignment = 16
 ```
 
-这里容易混淆的一点是：Python 参数 `chunk_size` 最终是单个 I/O segment 的上限 `T`，而 C++ `Chunk::size` 的上限通常是 `W = T * N * P`。一个 C++ chunk 会进一步按 rank 和 thread 切分。
+Python 参数 `chunk_size` 最终是单个 rank-local I/O 请求的上限 `R`，而 C++ `Chunk::size` 的上限通常是 `W = R * P`。一个 C++ chunk 只按 rank 切分。
 
 Buffer 分配为：
 
@@ -95,7 +146,25 @@ host buffer    = D * R                     # 每个进程只存本 rank 的数�
 
 device buffer 额外增加了一小段保守 padding，用于容纳文件页前缀、tensor 首地址对齐和 world chunk 尾部对齐。
 
-### 2.1 有效 buffer size 和初始化顺序
+### 2.1 术语陷阱
+
+| 名称 | 实现中的真实含义 | 常见误解 |
+| --- | --- | --- |
+| `chunk_size` | 页对齐后的单个 rank-local 请求上限 `R` | 一个 world-wide C++ `Chunk` 的大小 |
+| `concurrency` | 同步 MMAP memcpy 和 cuFile read 的 worker 数；原生异步 backend 和 layout 忽略它 | 跨 backend 的 I/O depth 乘数 |
+| `io_depth` | rank-local 请求/pipeline entry 的最大在途数，也是 host window/event 数量 | 只表示 kernel storage queue depth |
+| `buffer_size` | frontend 请求容量；C++ 先提升到至少 `D * W`，再增加 padding 后才执行 layout | 用户最初请求的精确字节数 |
+
+移除 thread-segment 层后，backend 默认值仍保持原先的请求容量：内存文件上的
+MMAP 使用 `D = 3 * C`，cuFile 使用 `D = 16 * C`。原生异步 backend 独立于
+`C` 计算 `D`，显式 `concurrency` 也不能改变其 layout 或内存用量。device
+空闲内存不足时只收缩 `io_depth`。合法范围是 `1 <= io_depth <= 1024`，与
+executor 容量一致。
+
+这些名称来自不同实现层次。推导 layout 时优先使用 `R`、`W` 和
+`D`，可以避免把名称相近但层级不同的对象视为同一个概念。
+
+### 2.2 有效 buffer size 和初始化顺序
 
 Python 传入的 buffer size 不是 compute_layout() 最终使用值的完整定义。C++ 在布局前执行：
 
@@ -105,11 +174,11 @@ effective_device_buffer_size =
 
 allocated_device_buffer_size =
     effective_device_buffer_size
-    + 3 * (first_tensor_alignment + thread_alignment
+    + 3 * (first_tensor_alignment + rank_alignment
            + world_chunk_alignment)
 ```
 
-当前实现随后把 buffer_size 本身更新为包含这段 padding 的 allocation size，compute_layout() 的容量判断使用这个更新后的值。因此行为等价实现若把“用户期望容量”和“实际 allocation 容量”分成两个变量，必须明确布局判断使用哪一个；要复现 0.1.9 的边界，应使用实际 allocation 容量。
+当前实现随后把 buffer_size 本身更新为包含这段 padding 的 allocation size，compute_layout() 的容量判断使用这个更新后的值。因此行为等价实现若把“用户期望容量”和“实际 allocation 容量”分成两个变量，必须明确布局判断使用哪一个；要复现当前边界，应使用实际 allocation 容量。
 
 资源建立顺序为：
 
@@ -122,7 +191,7 @@ Python:
 
 C++:
     open files and initialize io_uring
-    derive A, T, R, W, Aw
+    derive A, R, W, Aw
     enlarge and allocate device buffer
     allocate/register host buffer and register it with io_uring
     create CUDA/NCCL streams, per-window events and executors
@@ -156,11 +225,11 @@ Python frontend 首先：
 
 每个文件的终止 offset 让相邻两个 offset 可以直接计算 tensor size。跨文件的相邻 pair 只用于结束前一个 chunk、切换文件，不产生 tensor。
 
-0.1.9 的实现还隐含以下输入前提，复现时不能只看 `tensor_offsets` 的元素类型：
+当前实现还隐含以下输入前提，复现时不能只看 `tensor_offsets` 的元素类型：
 
 - file index 必须从 0 开始连续递增，并且 offsets 按 file、再按文件内地址排列；C++ 通过“最后一个 file index + 1”推导文件数；
 - 每个 safetensors 文件至少包含一个 tensor；Python 需要读取排序结果的最后一个元素来追加文件结束 offset；
-- 本文针对正常模型文件中的非空 payload。frontend 没有显式拒绝零长度 tensor，但全零长度文件在某些对齐情况下无法形成可供 `last_chunk_id` 等待的 chunk，不应作为 0.1.9 的受支持输入依赖。
+- 本文针对正常模型文件中的非空 payload。frontend 没有显式拒绝零长度 tensor，但全零长度文件在某些对齐情况下无法形成可供 `last_chunk_id` 等待的 chunk，不应作为受支持输入依赖。
 
 行为等价实现可以在入口显式拒绝不满足这些前提的 metadata；如果选择兼容零长度 tensor，则需要单独定义其 completion 和空 view 语义，而不能直接照搬当前 `last_chunk_id` 逻辑。
 
@@ -205,7 +274,7 @@ device_address(file_byte) =
 next_chunk_device_offset += round_up(chunk.size, Aw)
 ```
 
-`Aw = page_size * num_threads * world_size` 使一个 padded chunk 能被等分成 `world_size` 个 rank slice，再把每个 rank slice 等分成 `num_threads` 个页对齐 I/O segment。
+`Aw = page_size * world_size` 使一个 padded chunk 能被等分成 `world_size` 个页对齐 rank slice。
 
 当下一个完整 tensor 放不进 device buffer 时，`compute_layout` 在 tensor 边界结束当前 chunk，并把后续 tensor 放回 buffer 低地址处。这是 device ring 的“环回”。它不是简单的 `offset % buffer_size`：算法会额外调整新 chunk 起点，使新区域中的第一个 tensor 地址满足 16-byte 对齐。
 
@@ -213,11 +282,11 @@ next_chunk_device_offset += round_up(chunk.size, Aw)
 对齐，而 `torch.complex128` 的 element size 为 16 bytes，是可能的最大值。
 因此把首个 tensor 对齐到 `F = 16`，即可满足最严格的 element alignment。
 
-只需要显式对齐每个文件的第一个 tensor，以及 device ring wrap 后新连续区域
-的第一个 tensor。InstantTensor 当前要求 tensor 按 element size 非递增排列，
-并在读取 metadata 时显式验证。对同一连续区域中的 tensor `i`，令 device
-地址为 `a_i`，element size 为 `e_i`。支持的 element size 都是最大为 16 的
-2 的幂，因此：
+只对每个文件的第一个 tensor，以及 device ring wrap 后新连续区域的第一个
+tensor 显式增加 device padding。若文件按 element size 非递增排列，这足以
+保证所有 tensor 对齐。对同一连续区域中的 tensor `i`，令 device 地址为
+`a_i`，element size 为 `e_i`。支持的 element size 都是最大为 16 的 2 的
+幂，因此：
 
 ```text
 a_0 % 16 == 0
@@ -226,9 +295,16 @@ e_(i+1) divides e_i
 a_(i+1) = a_i + tensor_size_i
 ```
 
-由归纳法可得每个 tensor 都满足 `a_i % e_i == 0`。文件边界处的 file-page
-padding 会打断 payload 的连续映射，而 ring wrap 会在另一段 device 区域重新
-放置数据，所以这两个边界之后需要重新对齐首个 tensor。
+由归纳法可得这种常见布局中的每个 tensor 都满足 `a_i % e_i == 0`。文件
+边界处的 file-page padding 会打断 payload 连续映射，而 ring wrap 会在另一段
+device 区域重新放置数据，所以这两个边界之后需要重新对齐首个 tensor。
+
+Safetensors 格式不要求 element size 非递增。采用其他顺序时，后续 tensor
+可能不满足自身 dtype 对齐。C++ 仍可把其字节暴露为 alignment 要求仅 1 byte
+的 `int8` DLPack view。Python 检查目标 dtype alignment；只有地址未对齐时，
+才先把 byte view clone 到独立 storage，再执行 dtype reinterpretation。因此
+任意 element-size 顺序都可加载，而已对齐的 `copy=False` tensor 仍保持
+zero-copy。
 
 ### 4.3 Tensor 地址和跨 chunk 连续性
 
@@ -269,6 +345,61 @@ device ring 会复用低地址。`compute_layout` 同时追踪：
 
 运行时 `can_step()` 只允许 `chunk_reading < current_tensor.prefetch_chunk_id` 时继续 prefetch。
 
+#### 包含 Ring Wrap 的数值例子
+
+使用单 rank、每个 chunk 一个 I/O 请求：
+
+```text
+A = R = W = Aw = 4096
+P = D = 1
+F = 16
+frontend_buffer_size <= 4096
+device_buffer_size =
+    max(frontend_buffer_size, D * W) + 3 * (F + A + Aw)
+  = 4096 + 3 * (16 + 4096 + 4096)
+  = 28720
+```
+
+一个文件的 payload 从 file offset 4096 开始，其中包含 9 个连续的 4096-byte
+tensor `T0..T8`。每个 tensor 恰好占一个 chunk。初始化文件布局后，`T0`
+位于 device offset 16，后续 chunk 每次前进 4096 bytes：
+
+| Tensor | `last_chunk_id` | Device offset | 最终 `prefetch_chunk_id` |
+| --- | ---: | ---: | ---: |
+| T0 | 0 | 16 | 6 |
+| T1 | 1 | 4112 | 7 |
+| T2 | 2 | 8208 | 8 |
+| T3 | 3 | 12304 | 8 |
+| T4 | 4 | 16400 | 8 |
+| T5 | 5 | 20496 | 8 |
+| T6 | 6 | 24592 | 8 |
+| T7 | 7 | 16 | 8 |
+| T8 | 8 | 4112 | 8 |
+
+布局 `T7` 前，若继续线性放置，需要：
+
+```text
+24592 + round_up(4096 + 4096, 4096) = 32784 > 28720
+```
+
+因此算法先结束 chunk 6，再调用 `reset_device_region(7)`，让新区域环回到
+device offset 16。相关状态变化如下：
+
+| 事件 | 事件后的 `chunk_device_offset` | `in_buffer_tensor_id` | `left_most_tensor_id` | 局部 chunk ID | 写入的 watermark |
+| --- | ---: | ---: | ---: | --- | --- |
+| 初始 `reset_file` 后 | 16 | 0 | 0 | - | 无 |
+| 放置 T6 后 | 24592 | 0 | 0 | chunk 0-5 已结束；chunk 6 尚未结束 | 无 |
+| 结束 chunk 6，并在 T7 前环回 | 16 | 0 | 7 | `previous_chunk_id=5`，`latest_chunk_id=6` | 暂无 |
+| 放置 T8 时结束 chunk 7 | 4112 | 1 | 7 | `previous_chunk_id=6` | `T0.prefetch_chunk_id=6` |
+| 最终结束 chunk 8 | 8208 | 2 | 7 | `previous_chunk_id=7` | `T1.prefetch_chunk_id=7` |
+| 第一次尾部 reset | 16 | 7 | 9 | `latest_chunk_id=8` | T2 到 T6 设为 8 |
+| 第二次尾部 reset | 16 | 9 | 9 | `latest_chunk_id=8` | T7、T8 设为 8 |
+
+`T7` 恰好复用 `T0` 的 device 区间，因此调用方仍在使用 `T0` 时最多只能
+提交到 chunk 6。推进到 `T1` 后可以提交 chunk 7；推进到 `T2` 后可以提交
+chunk 8。watermark 虽然在后续静态布局转换中才被写入，但 runtime prefetch
+启动前，所有 tensor 的 watermark 都已经计算完成。
+
 ### 4.5 行为等价的布局伪代码
 
 下面的伪代码保留了影响布局和 prefetch 安全性的全部状态。复现时可以换容器或拆分函数，但不能省略这些状态转换。
@@ -306,7 +437,7 @@ finish_chunk():
     # 文件侧仅前进完整页；页内尾部由下一个 chunk 重读
     chunk_file_offset += round_down(current_chunk_size, A)
 
-    # device 侧为 rank/thread 等分保留 Aw 对齐空间
+    # device 侧为 rank 等分保留 Aw 对齐空间
     chunk_device_offset += round_up(current_chunk_size, Aw)
     current_chunk_size %= A
 
@@ -401,7 +532,6 @@ reset_device_region(tensor_id)
 S  = c.size
 Sw = round_up(S, Aw)
 Sr = Sw / P                         # padded_rank_size
-St = Sr / N                         # padded_thread_size
 r0 = Sr * rank                      # rank_offset
 rs = clamp(S - r0, 0, Sr)           # rank_size，真正有效的字节数
 ```
@@ -414,12 +544,8 @@ rs = clamp(S - r0, 0, Sr)           # rank_size，真正有效的字节数
 [c.file_offset + r0, c.file_offset + r0 + rs)
 ```
 
-该区间再按 thread `i` 分成：
-
 ```text
-thread_offset = St * i
-thread_size   = clamp(S - r0 - thread_offset, 0, St)
-read_size     = round_up(thread_size, A)
+read_size = round_up(rs, A)
 ```
 
 file offset、host address 和 `read_size` 都满足页对齐，支持 `URING` 的 `O_DIRECT`。最后一个 read 可能因为页对齐读到逻辑 chunk 末尾之外；后续 H2D 只复制 `rank_size` 个有效字节。
@@ -431,7 +557,7 @@ Host buffer 是按 `io_depth` 循环使用的 pinned staging ring：
 ```text
 window_index  = chunk_id % D
 window_offset = window_index * R
-thread_dst    = host_buffer + window_offset + thread_offset
+rank_mid      = host_buffer + window_offset
 ```
 
 一个 host window 只对应一个 chunk 的 rank slice，不存其他 rank 的数据。提交 chunk `k` 前，loader 会等待 `k - D` 完成，避免覆盖相同 window。
@@ -473,7 +599,7 @@ Sr = Sw / P
 `URING` 使用 `O_DIRECT`；`URING_BUFFERED` 使用普通 fd，并调用 `POSIX_FADV_SEQUENTIAL`。两者都会：
 
 - 分配并 CUDA-register pinned host buffer；
-- 创建容量为 `io_depth * num_threads` 的 io_uring；
+- 创建容量为 `io_depth` 的 io_uring；
 - 注册所有文件为 fixed files；
 - 把 host buffer 按最多 1 GiB 的 iovec 注册为 fixed buffers。
 
@@ -481,24 +607,21 @@ Sr = Sw / P
 
 ### 6.2 提交 SQE
 
-`post_read_chunk_uring()` 为当前 rank 的每个非空 thread segment 创建一个 SQE：
+`post_read_chunk_uring()` 在当前 rank slice 非空时创建一个 SQE：
 
 ```text
-file source -> host window/thread segment
+file rank slice -> host window
 ```
 
 Direct 和 buffered io_uring 路径都提交
 `round_up(logical_size, PAGE_SIZE)`；buffered I/O 有意复用 direct I/O 的读取
 范围，而 H2D 只复制逻辑有效字节。`URING_BUFFERED` 还会设置
 `IOSQE_ASYNC`，避免 page cache 命中时在 loader thread 内联执行大块
-memcpy；非页对齐的尾段也会设置该标志。
+memcpy；非页对齐的末尾 rank slice 也会设置该标志。
 
-所有 backend 统一使用 `(chunk_id, thread_id)` 作为 segment 坐标，并共享
-相同的逻辑长度计算。具有 kernel completion metadata 的 backend 再将其编码为
-`segment_id = chunk_id * num_threads + thread_id`：io_uring 存入 SQE
-`user_data`，libaio 存入 `iocb->data`。cuFile 和 MMAP 没有对应的 kernel
-`user_data`，其 executor request ID 仍是独立机制。`unfinished_cnt` 仍按
-chunk 维护。
+所有 backend 统一使用 `chunk_id` 作为请求坐标，并共享相同的 rank-size
+计算。io_uring 将它存入 SQE `user_data`，libaio 存入 `iocb->data`。cuFile 和
+MMAP 使用 executor request ID。每个 chunk 的 `unfinished_cnt` 因此只能是 0 或 1。
 
 ### 6.3 CQE、H2D 和 NCCL
 
@@ -523,9 +646,9 @@ wait_thread (single-thread executor):
 
 `cuda_thread` 按 chunk 提交顺序串行处理 completion 和 CUDA/NCCL launch，
 但 disk I/O 可以已有多个 chunk 同时在 flight。CQE 可能跨 chunk 乱序返回。
-从 segment ID 可同时恢复 `chunk_id` 和 `thread_id`，从而找到正确的
-`unfinished_cnt` 和逻辑 segment size。非负 short read 只有在仍覆盖完整逻辑
-segment 时才被接受；页对齐 padding 可以没有读满。
+从 completion metadata 恢复 `chunk_id`，从而找到正确的 `unfinished_cnt`
+和逻辑 rank size。非负 short read 只有在仍覆盖完整逻辑 rank slice 时才被接受；
+页对齐 padding 可以没有读满。
 
 `poll_read_chunk()` 和 `wait_read_chunk()` 最终按 chunk id 顺序 reap `wait_thread` 的 completion request，所以公开的 `chunk_read` 始终代表一个连续完成前缀，不会跳过未完成 chunk。
 
@@ -604,12 +727,11 @@ get_tensor_ptr(tensor_index):
 submit_uring_h2d_allgather() 的行为顺序为：
 
 ```text
-1. 根据第 5 节公式，为当前 rank 的每个非空 thread segment 准备 SQE。
-2. 编码 segment_id = chunk_id * num_threads + thread_id，并读取
-   disk segment -> host window segment。
-3. 提交所有 SQE，设置 chunks[chunk_id].unfinished_cnt。
+1. 当前 rank slice 非空时准备一个 SQE。
+2. 把 `chunk_id` 写入 completion metadata，并读取 rank slice -> host window。
+3. 提交 SQE，把 `chunks[chunk_id].unfinished_cnt` 设置为 0 或 1。
 4. 向单线程 CUDA executor 提交任务：
-   a. 解码每个 CQE 的 segment ID，拒绝 bytes_read < logical_size，并递减
+   a. 解码每个 CQE 的 chunk ID，拒绝 bytes_read < logical_size，并递减
       对应 chunk 的 unfinished_cnt；
    b. 直到当前 chunk 的 unfinished_cnt 变为 0；
    c. cudaMemcpyAsync(host rank slice -> device rank slice)；
@@ -661,13 +783,21 @@ C++ binding 将该地址和 tensor byte size 包装成一维 `int8` DLPack tenso
 
 ```python
 tensor_int8 = torch.from_dlpack(dl_tensor)
+required_alignment = torch.empty((), dtype=torch_dtype).element_size()
+if copy or tensor_int8.data_ptr() % required_alignment != 0:
+    tensor_int8 = tensor_int8.clone()
 tensor = tensor_int8.view(torch_dtype).view(shape)
 ```
 
 这里仍然没有数据拼接：DLPack 只是为已经连续的 device 字节建立 view。dtype 和 shape 来自 safetensors metadata。
 
-- `copy=True`：再执行 `tensor.clone()`，返回拥有独立 storage 的 tensor；
-- `copy=False`：直接返回 device ring buffer view，后续 prefetch 可能覆盖它。
+- `copy=True`：始终按字节 clone，返回拥有独立 storage 的 tensor；
+- `copy=False`：已对齐 tensor 直接返回 device ring buffer view；未对齐
+  tensor 发出 `RuntimeWarning`，并退化为拥有独立 storage 的 clone。
+
+PyTorch CUDA allocator 预期会让 clone 后的 storage 按 512 bytes 对齐，这足以
+覆盖所有受支持的 element size，但它只是内部实现细节，不是正确性契约；最终
+仍以目标 dtype alignment 检查为准。
 
 ## 8. Prefetch 和 compute overlap
 
@@ -697,19 +827,19 @@ Python generator 在每次获取下一个 tensor 前同步当前 CUDA stream。�
 
 - 文件内 tensor data offsets 必须连续；frontend 会显式检查。
 - 单个 tensor size 不能大于 device buffer；frontend 会至少把显式 buffer 扩大到最大 tensor size。
-- 每个文件起点以及每次 ring wrap 后的新区域，其首个 tensor 地址按 16 bytes 对齐，覆盖 PyTorch 最大的 element size。连续布局和已验证的 element size 非递增顺序可以推出同一区域内后续 tensor 均满足各自的对齐；Python 仍在返回前用 `element_size()` 做运行时检查。
+- 每个文件起点以及每次 ring wrap 后的新区域，其首个 tensor 地址按 16 bytes 对齐，覆盖 PyTorch 最大的 element size。element size 非递增时后续 tensor 无需 copy 即可保持对齐；其他顺序同样被接受，但每个未对齐 tensor 会在 dtype reinterpretation 前被复制。
 - chunk 不跨文件；tensor 不跨文件。
 - 完整 `W` chunk 在 device 中连续排列，因此跨 chunk tensor 仍连续。
 - disk chunk 可能页级重叠。同一线性 device 布局段中的 chunk reservation 不重叠；ring wrap 后则会有意复用已获准覆盖的旧区间。
-- `copy=False` view 的有效期受 device ring overwrite 和 loader close 约束。
+- 已对齐的 `copy=False` view 有效期受 device ring overwrite 和 loader close 约束；未对齐 tensor 是独立 fallback copy。
 
 ## 10. 当前实现中的维护注意点
 
 以下是阅读源码时应特别注意的“代码现状”，不是设计上的抽象：
 
-1. `io_depth` 同时决定 host windows、CUDA events 和 ring queue sizing；它不只是传统意义上的存储队列深度。
-2. `concurrency` 在 io_uring 路径中决定每个 full chunk 的 SQE 数量和 chunk world size，不对应一个长期绑定的用户态 I/O thread pool。
-3. Device 对齐当前依赖 tensor 按 element size 非递增排布：首 tensor 按 16 bytes 对齐后，整除关系会传播到后续 tensor。InstantTensor frontend 会显式验证这一排列，并在 I/O 前拒绝其他布局；未来版本计划支持这些布局。返回地址的整除检查仍是运行时保护。
+1. `io_depth` 是 rank-local 请求上限，同时决定 host windows、CUDA events 和原生 I/O queue 的大小；window 会一直占用到 H2D 和可选 all-gather 完成。
+2. `concurrency` 只控制 MMAP/cuFile worker pool，不影响 chunk geometry、buffer、AIO 或 io_uring。
+3. Tensor element size 非递增时，首 tensor 按 16 bytes 对齐后可继续保持 zero-copy 对齐。其他顺序可能产生未对齐地址；frontend 会先按 `int8` clone 这些 tensor，再做 dtype reinterpretation，并保留返回地址整除检查作为最终保护。
 
 这些细节不改变上文描述的数据路径，但修改 buffer sizing、io_uring 并发模型或 dtype 支持时需要考虑。
 
@@ -725,7 +855,7 @@ Python generator 在每次获取下一个 tensor 前同步当前 CUDA stream。�
 0 < chunk.size <= W
 chunk.file_offset % A == 0
 round_up(chunk.size, Aw) % P == 0
-(round_up(chunk.size, Aw) / P) % N == 0
+(round_up(chunk.size, Aw) / P) % A == 0
 ```
 
 对每个 tensor：
@@ -777,7 +907,7 @@ P > 1:  [chunk.device_buffer_offset,
 - 当前 tensor 尚可能被用户使用时，不提交超过其 `prefetch_chunk_id` 的 chunk。
 - completion 必须覆盖 read、H2D 和可选 all-gather；只完成 SQE 或只完成 H2D launch 都不够。
 - 多 rank 下，每个 rank 只从 disk 读取自己的 slice，但 completion 后每个 device chunk 的有效字节必须相同。
-- `copy=False` 时，推进到下一个 tensor 前必须确认用户对当前 view 的使用已经结束；0.1.9 通过同步 Python 当前 CUDA stream 实现这一点。
+- `copy=False` 时，推进到下一个 tensor 前必须确认用户对当前已对齐 ring view 的使用已经结束；frontend 通过同步 Python 当前 CUDA stream 实现这一点。未对齐 fallback copy 拥有独立 storage。
 
 ### 11.3 最小场景矩阵
 
@@ -791,21 +921,21 @@ P > 1:  [chunk.device_buffer_offset,
 | device buffer 放不下下一个 tensor | 只在 tensor 边界 ring wrap，首地址重新按 16 bytes 对齐 |
 | 非页对齐 tensor 边界后结束 chunk | 下一 disk chunk 重读页尾，device 中不重复 tensor payload |
 | 两个或更多文件 | chunk 不跨文件，每个文件重新计算页前缀和首 tensor 对齐 |
-| `world_size > 1` 且末 chunk 很短 | 后部 rank/thread segment 可以为空，all-gather padded slice 仍可等分 |
+| `world_size > 1` 且末 chunk 很短 | 后部 rank slice 可以为空，all-gather padded slice 仍可等分 |
 | `io_depth = 3` 且提交至少 4 个 chunk | 第 4 个 chunk 复用 window 0 前等待 chunk 0 completion |
-| CQE 跨 chunk 乱序 | 解码到正确的 chunk/thread segment，`chunk_read` 仍只推进连续前缀 |
+| CQE 跨 chunk 乱序 | 解码到正确的 chunk，`chunk_read` 仍只推进连续前缀 |
 | 页对齐 read 返回 short result | `bytes_read >= logical_size` 时接受；缺少逻辑字节时在 H2D 前拒绝 |
 | 小 device ring 多次环回 | 每一代 tensor 的 watermark 都在其字节被覆盖前停止 prefetch |
-| tensor dtype itemsize 混合 | 每个返回地址都满足对应 itemsize 对齐，否则明确拒绝 |
+| tensor dtype itemsize 混合 | 已对齐 tensor 保持 zero-copy；每个未对齐 tensor 在 dtype reinterpretation 前复制 |
 
 ### 11.4 端到端判定
 
 给定相同 safetensors 文件、chunk 参数、world size 和 buffer size，一个行为等价实现应产生：
 
 1. 相同 tensor 顺序、shape、dtype 和 payload；
-2. 相同的 rank/thread 文件切分范围，允许底层 I/O 合并但不能改变有效字节；
+2. 相同的 rank 文件切分范围，允许底层 I/O 合并但不能改变有效字节；
 3. 等价的 device ring wrap 点和 tensor 连续区间；
-4. 不比 0.1.9 更激进的 overwrite watermark；
+4. 不比当前实现更激进的 overwrite watermark；
 5. tensor 返回、host/event 复用和 close 时均不存在未完成的数据依赖。
 
 其中第 4 点允许更保守地少预取，但若目标是复现相同 overlap 性能，则应生成相同的 `prefetch_chunk_id`。

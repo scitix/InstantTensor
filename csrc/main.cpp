@@ -39,7 +39,7 @@ public:
             size_t process_group,
             size_t buffer_size,
             size_t chunk_size,
-            size_t num_threads,
+            size_t concurrency,
             size_t io_depth,
             Backend backend,
             const vector<pair<size_t, size_t>>& tensor_offsets)
@@ -73,7 +73,7 @@ public:
             NCCL_CHECK(ncclCommCount(nccl_group_communicator, &world_size));
         }
 
-        int req_id = this->call(loader_handle, OPEN, std::make_any<OpenArgs>(filenames, device_idx, nccl_group_communicator, rank, world_size, buffer_size, chunk_size, num_threads, io_depth, backend, tensor_offsets));
+        int req_id = this->call(loader_handle, OPEN, std::make_any<OpenArgs>(filenames, device_idx, nccl_group_communicator, rank, world_size, buffer_size, chunk_size, concurrency, io_depth, backend, tensor_offsets));
         this->get_result(loader_handle, req_id);
         return loader_handle;
     }
@@ -104,7 +104,7 @@ int open(const vector<string> &filenames,
         size_t process_group,
         size_t buffer_size,
         size_t chunk_size,
-        size_t num_threads,
+        size_t concurrency,
         size_t io_depth,
         int backend,
         const vector<pair<size_t, size_t>>& tensor_offsets)
@@ -113,7 +113,7 @@ int open(const vector<string> &filenames,
         manager = std::make_unique<LoaderManager>();
     }
     Backend backend_enum = static_cast<Backend>(backend);
-    return manager->open(filenames, device_idx, process_group, buffer_size, chunk_size, num_threads, io_depth, backend_enum, tensor_offsets);
+    return manager->open(filenames, device_idx, process_group, buffer_size, chunk_size, concurrency, io_depth, backend_enum, tensor_offsets);
 }
 
 void close(int loader_handle) {
@@ -138,15 +138,29 @@ void cleanup() {
     instanttensor::munmaper.reset();
 }
 
-bool backend_available(int backend) {
+BackendStatus backend_status(int backend) {
     Backend backend_enum = static_cast<Backend>(backend);
-    if(backend_enum == Backend::CUFILE) {
-        return Loader::cufile_available();
-    } else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
-        return Loader::uring_available();
-    } else {
-        return true;
+    if(!is_valid_backend(backend_enum)) {
+        return {false, "The requested backend is not recognized.", ""};
     }
+    if(backend_enum == Backend::CUFILE) {
+        bool available = Loader::cufile_available();
+        return {
+            available,
+            available ? "" : "cuFile is not available on this system.",
+            "",
+        };
+    }
+    else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
+        return Loader::uring_status();
+    }
+    else {
+        return {true, "", ""};
+    }
+}
+
+bool backend_available(int backend) {
+    return backend_status(backend).available;
 }
 
 } // namespace instanttensor
@@ -162,7 +176,7 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("process_group"),
           pybind11::arg("buffer_size"),
           pybind11::arg("chunk_size"),
-          pybind11::arg("num_threads"),
+          pybind11::arg("concurrency"),
           pybind11::arg("io_depth"),
           pybind11::arg("backend"),
           pybind11::arg("tensor_offsets"));
@@ -186,5 +200,13 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("backend_available", &instanttensor::backend_available,
           "Check if the backend is available",
+          pybind11::arg("backend"));
+
+    m.def("backend_status", [](int backend) {
+              auto status = instanttensor::backend_status(backend);
+              return pybind11::make_tuple(
+                  status.available, status.reason, status.warning);
+          },
+          "Return backend availability, rejection reason, and warning",
           pybind11::arg("backend"));
 }

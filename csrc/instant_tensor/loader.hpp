@@ -12,9 +12,7 @@ struct ChunkIOParams {
     chunk_id_t chunk_id;
     const Chunk &chunk;
     const FileInfo &file;
-    size_t padded_world_chunk_size;
     size_t padded_rank_size;
-    size_t padded_thread_size;
     size_t rank_offset;
     size_t rank_size;
     size_t window_idx;
@@ -35,7 +33,7 @@ public:
     bool need_worker_threads = false;
     bool need_cuda_thread = false;
     void *device_buffer = nullptr;
-    void* host_buffer = nullptr; // per-thread host buffer for in-memory file
+    void* host_buffer = nullptr; // rank-local staging windows
     HostBufferCacheEntry host_buffer_entry = {nullptr, 0, nullptr};
     vector<TensorMetadate> tensors;
     vector<Chunk> chunks;
@@ -51,12 +49,9 @@ public:
     cudaStream_t nccl_stream = nullptr;
     vector<cudaEvent_t> cuda_events;
     size_t world_chunk_alignment = 0;
-    size_t thread_chunk_size = 0;
     size_t rank_chunk_size = 0;
     size_t world_chunk_size = 0;
-    size_t thread_alignment = 0;
     size_t rank_alignment = 0;
-    size_t world_alignment = 0;
     // must >= sizeof(dtype) for any dtype, torch.complex128.itemsize == 16
     const size_t first_tensor_alignment = 16;
     // NOTE: cudaHostRegisterMapped can be automatically determined.
@@ -82,7 +77,7 @@ public:
     int rank = -1;
     int world_size = 0;
     size_t buffer_size = 0;
-    size_t num_threads = 0;
+    size_t concurrency = 0;
     size_t io_depth = 0;
     Backend backend = Backend::AIO;
 
@@ -144,7 +139,7 @@ public:
     ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
 
     // io_uring path (loader_io_uring.cpp)
-    static bool uring_available();
+    static BackendStatus uring_status();
     void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
     void close_file_uring(FileInfo &f);  // close fd
     void initialize_uring_context();           // io_uring_queue_init

@@ -124,7 +124,7 @@ public:
         };
     }
 
-    explicit MultiWorkerFunctionExecutor(size_t num_workers = std::thread::hardware_concurrency(),
+    explicit MultiWorkerFunctionExecutor(size_t num_workers,
                                          DriverFactory driver_factory = default_driver_factory(),
                                          bool start_executor = true)
       : Base(std::move(driver_factory))
@@ -133,12 +133,6 @@ public:
             Base::start(num_workers);
         }
     }
-
-    explicit MultiWorkerFunctionExecutor(DriverFactory driver_factory, bool start_executor = true)
-      : MultiWorkerFunctionExecutor(std::thread::hardware_concurrency(),
-                                    std::move(driver_factory),
-                                    start_executor)
-    {}
 
     template<typename F>
     void submit(int request_id, F&& fn, bool needs_result = true) {

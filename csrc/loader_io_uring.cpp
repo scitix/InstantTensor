@@ -13,60 +13,63 @@ namespace instanttensor {
 
 namespace {
 
-bool is_rhel_family() {
-    FILE *fp = fopen("/proc/version", "r");
-    if (!fp) {
-        return false;
-    }
-    char line[256];
-    bool is_rhel = false;
-    if (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "Red Hat") != nullptr || strstr(line, ".el") != nullptr) {
-            is_rhel = true;
-        }
-    }
-    fclose(fp);
-    return is_rhel;
-}
+struct KernelVersion {
+    long major;
+    long minor;
+    string release;
+};
 
-bool kernel_at_least_required_version() {
+std::optional<KernelVersion> running_kernel_version() {
     struct utsname uts;
     if (uname(&uts) != 0) {
-        return false;
+        return std::nullopt;
     }
 
     char *end = nullptr;
     long major = strtol(uts.release, &end, 10);
     if (end == uts.release || *end != '.') {
-        return false;
+        return std::nullopt;
     }
 
     const char *minor_start = end + 1;
     long minor = strtol(minor_start, &end, 10);
     if (end == minor_start) {
-        return false;
+        return std::nullopt;
     }
 
-    // RHEL 9 backports io_uring stability fixes from 5.15 into kernel 5.14.x
-    int required_minor = is_rhel_family() ? 14 : 15;
-    return major > 5 || (major == 5 && minor >= required_minor);
+    return KernelVersion{major, minor, uts.release};
 }
 
-bool probe_supports_fixed_buffer_read(struct io_uring *ring) {
+bool kernel_version_at_least(
+    const KernelVersion &version, long required_major, long required_minor) {
+    return version.major > required_major ||
+           (version.major == required_major && version.minor >= required_minor);
+}
+
+bool probe_supports_fixed_buffer_read(struct io_uring *ring, string *reason) {
     struct io_uring_probe *probe = io_uring_get_probe_ring(ring);
     if (!probe) {
+        *reason = "Could not query the supported io_uring opcodes.";
         return false;
     }
 
-    bool supported = io_uring_opcode_supported(probe, IORING_OP_READ) &&
-                     io_uring_opcode_supported(probe, IORING_OP_READ_FIXED);
+    bool supports_read = io_uring_opcode_supported(probe, IORING_OP_READ);
+    bool supports_read_fixed =
+        io_uring_opcode_supported(probe, IORING_OP_READ_FIXED);
     io_uring_free_probe(probe);
-    return supported;
+    if (!supports_read || !supports_read_fixed) {
+        *reason = "The required io_uring READ and READ_FIXED opcodes are unavailable.";
+        return false;
+    }
+    return true;
 }
 
-bool supports_fixed_file_registration(struct io_uring *ring) {
+bool supports_fixed_file_registration(struct io_uring *ring, string *reason) {
     int fd = ::open("/dev/null", O_RDONLY);
     if (fd < 0) {
+        int error = errno;
+        *reason = "Could not open /dev/null while probing io_uring fixed-file "
+                  "registration: " + std::string(strerror(error)) + ".";
         return false;
     }
 
@@ -75,25 +78,49 @@ bool supports_fixed_file_registration(struct io_uring *ring) {
         io_uring_unregister_files(ring);
     }
     ::close(fd);
+    if (ret < 0) {
+        *reason = "io_uring fixed-file registration failed: " +
+                  std::string(strerror(-ret)) + ".";
+    }
     return ret == 0;
 }
 
-bool supports_fixed_buffer_registration(struct io_uring *ring) {
+bool supports_fixed_buffer_registration(struct io_uring *ring, string *reason) {
     char buffer[4096];
     struct iovec iov = {buffer, sizeof(buffer)};
 
     int ret = io_uring_register_buffers(ring, &iov, 1);
     if (ret == 0) {
         io_uring_unregister_buffers(ring);
+    } else {
+        *reason = "io_uring fixed-buffer registration failed: " +
+                  std::string(strerror(-ret)) + ".";
     }
     return ret == 0;
 }
 
 } // namespace
 
-bool Loader::uring_available(){// best-effort check
-    if (!kernel_at_least_required_version()) {
-        return false;
+BackendStatus Loader::uring_status(){// best-effort check
+    auto kernel_version = running_kernel_version();
+    if (!kernel_version) {
+        return {false, "Could not determine the Linux kernel version.", ""};
+    }
+
+    // IORING_OP_READ, IOSQE_ASYNC, and IORING_REGISTER_PROBE require 5.6.
+    if (!kernel_version_at_least(*kernel_version, 5, 6)) {
+        return {
+            false,
+            "io_uring requires Linux kernel 5.6 or newer; the detected kernel "
+            "version is " + kernel_version->release + ".",
+            "",
+        };
+    }
+
+    string warning;
+    if (!kernel_version_at_least(*kernel_version, 5, 15)) {
+        warning = "io_uring on Linux " + kernel_version->release +
+                  " may be unstable; Linux 5.15 or newer is recommended.";
     }
 
     struct io_uring ring = {};
@@ -103,16 +130,21 @@ bool Loader::uring_available(){// best-effort check
 
     int ret = io_uring_queue_init_params(2, &ring, &params);
     if (ret < 0) {
-        return false;
+        return {
+            false,
+            "io_uring queue initialization failed: " +
+                std::string(strerror(-ret)) + ".",
+            warning,
+        };
     }
 
     // io_uring_probe reports opcodes; SQPOLL/fixed files are setup/register capabilities.
-    bool supported = // (ring.flags & IORING_SETUP_SQPOLL) &&
-                     probe_supports_fixed_buffer_read(&ring) &&
-                     supports_fixed_file_registration(&ring) &&
-                     supports_fixed_buffer_registration(&ring);
+    string reason;
+    bool supported = probe_supports_fixed_buffer_read(&ring, &reason) &&
+                     supports_fixed_file_registration(&ring, &reason) &&
+                     supports_fixed_buffer_registration(&ring, &reason);
     io_uring_queue_exit(&ring);
-    return supported;
+    return {supported, reason, warning};
 }
 
 void Loader::open_file_uring(FileInfo &f) {
@@ -143,13 +175,13 @@ void Loader::open_file_uring(FileInfo &f) {
 }
 
 void Loader::initialize_uring_context() {
-    int ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring, 0);
+    int ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring, 0);
     if (ret < 0) {
         throw std::runtime_error(
             "io_uring_queue_init failed: " + std::string(strerror(-ret)));
     }
     // Since the SQ and CQ of uring both operate in SPSC mode, we use an extra ring to submit IO for the last page.
-    // ret = io_uring_queue_init((unsigned)(this->io_depth * this->num_threads), &this->uring_ring_last_page, 0);
+    // ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring_last_page, 0);
     // if (ret < 0) {
     //     throw std::runtime_error(
     //         "io_uring_queue_init failed: " + std::string(strerror(-ret)));
@@ -213,41 +245,16 @@ void Loader::deregister_host_buffer_uring() {
 
 // ─── chunk read ──────────────────────────────────────────────────────────────
 
-// Helper struct capturing the per-segment read parameters, built on the main
-// thread and moved into the uring_func lambda.
-struct UringReadOp {
-    void  *buf;
-    size_t size;
-    size_t file_offset;
-    size_t thread_id;
-};
-
 ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
-    std::vector<UringReadOp> ops;
-    ops.reserve(this->num_threads);
-
-    bool unaligned_last_page = false;
-
-    for (size_t i = 0; i < this->num_threads; i++) {
-        size_t thread_offset = p.padded_thread_size * i;
-        size_t thread_size = io_segment_logical_size(
-            p.chunk.size, p.rank_offset, thread_offset, p.padded_thread_size);
-        size_t thread_size_aligned = ROUND_UP(thread_size, this->thread_alignment);
-        if(thread_size != thread_size_aligned) unaligned_last_page = true;
-        if (thread_size == 0) continue;
-
-        ops.push_back(UringReadOp{
-            (char*)this->host_buffer + p.window_offset + thread_offset,
-            thread_size_aligned,
-            p.chunk.file_offset + p.rank_offset + thread_offset,
-            i,
-        });
-    }
+    size_t rank_size_aligned = ROUND_UP(p.rank_size, this->rank_alignment);
+    bool unaligned_last_page = p.rank_size != rank_size_aligned;
 
     struct io_uring *selected_ring = &this->uring_ring; // unaligned_last_page ? &this->uring_ring_last_page : &this->uring_ring;
 
-    for (const auto &op : ops) {
+    size_t submit_cnt = 0;
+    if(p.rank_size > 0) {
+        void *buf = (char*)this->host_buffer + p.window_offset;
         struct io_uring_sqe *sqe = io_uring_get_sqe(selected_ring);
         if (!sqe) {
             throw std::runtime_error(
@@ -259,20 +266,19 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
 
         int buffer_index = -1;
         if(this->uring_register_buffer) {
-            size_t left_buffer_index = ((char*)op.buf - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
-            size_t right_buffer_index = ((char*)op.buf + op.size - 1 - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            size_t left_buffer_index = ((char*)buf - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            size_t right_buffer_index = ((char*)buf + rank_size_aligned - 1 - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
             if(left_buffer_index == right_buffer_index) {
                 buffer_index = (int)left_buffer_index;
             }
-            // fprintf(stderr, "chunk_id: %zu, buffer_index: %d, size: %zu, buffer_offset: %zu, file_offset: %zu\n", chunk_id, buffer_index, op.size, (char*)op.buf - (char*)this->host_buffer_entry.ptr, op.file_offset);
         }
         if(buffer_index != -1) {
-            io_uring_prep_read_fixed(sqe, file_handle, op.buf,
-                (unsigned)op.size, op.file_offset, buffer_index);
+            io_uring_prep_read_fixed(sqe, file_handle, buf,
+                (unsigned)rank_size_aligned, p.chunk.file_offset + p.rank_offset, buffer_index);
         }
         else {
-            io_uring_prep_read(sqe, file_handle, op.buf,
-                (unsigned)op.size, op.file_offset);
+            io_uring_prep_read(sqe, file_handle, buf,
+                (unsigned)rank_size_aligned, p.chunk.file_offset + p.rank_offset);
         }
         
         if(this->uring_register_file) {
@@ -294,11 +300,10 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
         }
         // sqe->flags |= IOSQE_ASYNC;
-        uint64_t segment_id = encode_io_segment_id(chunk_id, this->num_threads, op.thread_id);
-        io_uring_sqe_set_data64(sqe, segment_id);
+        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(chunk_id));
+        submit_cnt = 1;
     }
-    this->chunks[chunk_id].extra_data.unfinished_cnt = ops.size();
-    const size_t submit_cnt = ops.size();
+    this->chunks[chunk_id].extra_data.unfinished_cnt = submit_cnt;
 
     auto uring_func = [=]() {
         size_t submitted = 0;
@@ -337,9 +342,7 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
                 throw std::runtime_error(
                     "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
             }
-            uint64_t segment_id = io_uring_cqe_get_data64(cqe);
-            IOSegmentIndex segment = decode_io_segment_id(segment_id, this->num_threads);
-            chunk_id_t cqe_chunk_id = segment.chunk_id;
+            chunk_id_t cqe_chunk_id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqe));
             if (cqe->res < 0) {
                 std::string msg =
                     "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(-cqe->res));
@@ -349,14 +352,11 @@ ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             const Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
             size_t padded_world_size = ROUND_UP(cqe_chunk.size, this->world_chunk_alignment);
             size_t padded_rank_size = padded_world_size / this->world_size;
-            size_t logical_size = io_segment_logical_size(
-                cqe_chunk.size, padded_rank_size * this->rank,
-                (padded_rank_size / this->num_threads) * segment.thread_id,
-                padded_rank_size / this->num_threads);
+            size_t logical_size = rank_logical_size(
+                cqe_chunk.size, padded_rank_size * this->rank, padded_rank_size);
             if(static_cast<size_t>(cqe->res) < logical_size) {
                 std::string msg =
                     "Unexpected io_uring short read: chunk_id=" + std::to_string(cqe_chunk_id)
-                    + ", thread_id=" + std::to_string(segment.thread_id)
                     + ", bytes_read=" + std::to_string(cqe->res)
                     + ", logical_size=" + std::to_string(logical_size);
                 io_uring_cqe_seen(selected_ring, cqe);

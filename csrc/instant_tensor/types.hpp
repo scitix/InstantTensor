@@ -9,29 +9,10 @@ namespace instanttensor {
 
 using chunk_id_t = ssize_t;
 
-struct IOSegmentIndex {
-    chunk_id_t chunk_id;
-    size_t thread_id;
-};
-
-inline uint64_t encode_io_segment_id(
-    chunk_id_t chunk_id, size_t num_threads, size_t thread_id) {
-    return static_cast<uint64_t>(chunk_id) * num_threads + thread_id;
-}
-
-inline IOSegmentIndex decode_io_segment_id(
-    uint64_t segment_id, size_t num_threads) {
-    return {
-        static_cast<chunk_id_t>(segment_id / num_threads),
-        segment_id % num_threads,
-    };
-}
-
-inline size_t io_segment_logical_size(
-    size_t chunk_size, size_t rank_offset,
-    size_t thread_offset, size_t padded_thread_size) {
-    return chunk_size > rank_offset + thread_offset
-        ? std::min(chunk_size - rank_offset - thread_offset, padded_thread_size)
+inline size_t rank_logical_size(
+    size_t chunk_size, size_t rank_offset, size_t padded_rank_size) {
+    return chunk_size > rank_offset
+        ? std::min(chunk_size - rank_offset, padded_rank_size)
         : 0;
 }
 
@@ -46,6 +27,12 @@ enum Backend {
     URING_BUFFERED,
     CUFILE,
     MMAP,
+};
+
+struct BackendStatus {
+    bool available;
+    string reason;
+    string warning;
 };
 
 inline bool is_valid_backend(Backend backend) {
@@ -78,14 +65,14 @@ struct OpenArgs {
     int world_size;
     size_t buffer_size;
     size_t chunk_size;
-    size_t num_threads;
+    size_t concurrency;
     size_t io_depth;
     Backend backend;
     vector<pair<size_t, size_t>> tensor_offsets;
     OpenArgs(const vector<string> &filenames, int device_idx, ncclComm_t group_communicator, int rank,
-        int world_size, size_t buffer_size, size_t chunk_size, size_t num_threads, size_t io_depth, Backend backend, const vector<pair<size_t, size_t>>& tensor_offsets)
+        int world_size, size_t buffer_size, size_t chunk_size, size_t concurrency, size_t io_depth, Backend backend, const vector<pair<size_t, size_t>>& tensor_offsets)
         : filenames(filenames), device_idx(device_idx), group_communicator(group_communicator), rank(rank), world_size(world_size),
-        buffer_size(buffer_size), chunk_size(chunk_size), num_threads(num_threads), io_depth(io_depth), backend(backend), tensor_offsets(tensor_offsets)
+        buffer_size(buffer_size), chunk_size(chunk_size), concurrency(concurrency), io_depth(io_depth), backend(backend), tensor_offsets(tensor_offsets)
         {}
 };
 
