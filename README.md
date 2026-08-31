@@ -162,7 +162,7 @@ Users can specify four key parameters in `safe_open` for performance tuning:
 
 - **`chunk_size`**: The size of each file I/O operation in bytes.
 
-- **`concurrency`**: The number of MMAP/cuFile worker threads. Native async
+- **`concurrency`**: The number of `MMAP`/`CUFILE` worker threads. Other
   backends ignore it.
 
 - **`io_depth`**: The maximum number of rank-local I/O operations in flight.
@@ -229,10 +229,39 @@ files. For tmpfs/ramfs files, it uses `MMAP`. If none of the requested
 candidates can be used, InstantTensor raises an error listing why each candidate
 was rejected.
 
-<!--
-- **`INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER`**:
-  - `1`: For tmpfs/ramfs files, register the mmapped memory and copy directly to GPU
-  - `0` (default): Use an external pinned host buffer + CPU memcpy + async H2D copy -->
+### Environment variables
+
+Set these variables before the first `safe_open` call. An explicit `safe_open`
+argument takes precedence over its corresponding environment variable.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `INSTANTTENSOR_BACKEND` | Comma-separated backend or policy candidates, for example `URING,AIO` or `BUFFERED`. | Automatically select by filesystem type. |
+| `INSTANTTENSOR_BUFFER_SIZE` | Requested logical GPU tensor ring-buffer size in bytes. It constrains `io_depth` but may be enlarged to fit the largest tensor. | Automatically determined from tensor sizes and I/O settings. |
+| `INSTANTTENSOR_CHUNK_SIZE` | File I/O chunk size in bytes. | Automatically determined for the selected backend. |
+| `INSTANTTENSOR_CONCURRENCY` | Number of worker threads for `MMAP` and `CUFILE`; other backends ignore it. | Automatically determined for the selected backend. |
+| `INSTANTTENSOR_IO_DEPTH` | Maximum number of rank-local I/O operations in flight. Higher values can increase throughput and staging-memory usage; the maximum is 1024. | Automatically determined for the selected backend. |
+| `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Maximum fraction of currently free GPU memory available to the logical device buffer. | `0.5` |
+| `INSTANTTENSOR_CACHE_BUFFER` | Set to `1` to cache pinned host staging buffers across loader opens. Cached memory remains pinned until process cleanup. | `0` |
+| `INSTANTTENSOR_DEBUG` | Set to `1` to print backend selection, buffer sizes, timing, and throughput diagnostics. | `0` |
+
+The I/O capacity required by a configuration is
+`round_up(chunk_size, page_size) * io_depth * world_size`. When `buffer_size`
+is omitted, InstantTensor chooses the larger of this value and the
+tensor-layout recommendation. When `buffer_size` and `io_depth` are both set,
+they must be compatible. When only `buffer_size` is set, InstantTensor reduces
+the default `io_depth` as needed. The internal device allocation includes a
+small additional alignment guard beyond the logical `buffer_size`. If the
+final logical buffer exceeds the resulting device-memory budget, opening fails
+before the native allocation is attempted.
+
+For example:
+
+```bash
+INSTANTTENSOR_BACKEND=BUFFERED \
+INSTANTTENSOR_IO_DEPTH=32 \
+INSTANTTENSOR_DEBUG=1 python load_model.py
+```
 
 ## API reference
 
