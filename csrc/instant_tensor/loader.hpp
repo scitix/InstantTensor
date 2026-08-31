@@ -139,7 +139,7 @@ public:
     ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
 
     // io_uring path (loader_io_uring.cpp)
-    static bool uring_available();
+    static BackendStatus uring_status();
     void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
     void close_file_uring(FileInfo &f);  // close fd
     void initialize_uring_context();           // io_uring_queue_init

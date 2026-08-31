@@ -67,6 +67,7 @@ InstantTensor is recommended if **any** of the following conditions are met:
 
 - GPU platforms: CUDA, ROCm
 - Framework: PyTorch
+- `URING`/`URING_BUFFERED`: Linux kernel 5.6 or newer; 5.15 or newer is recommended
 
 
 ### Method 1: Install from pip

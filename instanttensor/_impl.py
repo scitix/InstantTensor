@@ -77,6 +77,7 @@ MAX_IO_DEPTH = 1024
 
 BackendCandidate = Union[Backend, BackendPolicy]
 BackendCandidates = Optional[Union[BackendCandidate, list[BackendCandidate]]]
+_emitted_backend_warnings = set()
 
 
 @dataclass(frozen=True)
@@ -126,21 +127,40 @@ def backend_names(backends: list[Backend]) -> list[str]:
     return [backend.name for backend in backends]
 
 
+def _emit_backend_warning(message: str) -> None:
+    if not message or message in _emitted_backend_warnings:
+        return
+
+    warnings.warn(
+        message,
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    _emitted_backend_warnings.add(message)
+
+
 def select_backend(candidates: list[Backend], supported_backends: Optional[list[Backend]] = None) -> Backend:
     rejected = []
     for backend in candidates:
         if supported_backends is not None and backend not in supported_backends:
-            rejected.append(f"{backend.name} is not supported for this filesystem")
+            rejected.append(f"{backend.name} is not supported for this filesystem.")
             continue
-        if not instanttensor._C.backend_available(backend.value):
-            rejected.append(f"{backend.name} is not available on this system")
+        available, reason, warning = instanttensor._C.backend_status(backend.value)
+        if not available:
+            rejected.append(
+                reason or f"{backend.name} is not available on this system."
+            )
             continue
+        _emit_backend_warning(warning)
         debug_log("Using backend %s", backend.name)
         return backend
 
     candidates_str = ", ".join(backend_names(candidates))
-    rejected_str = "; ".join(rejected)
-    raise RuntimeError(f"No available backend found from candidates [{candidates_str}]. {rejected_str}")
+    rejected_str = " ".join(rejected)
+    raise RuntimeError(
+        f"No available backend was found among candidates [{candidates_str}]. "
+        f"{rejected_str}"
+    )
 
 
 

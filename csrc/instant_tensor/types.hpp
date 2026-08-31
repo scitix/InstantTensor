@@ -29,6 +29,12 @@ enum Backend {
     MMAP,
 };
 
+struct BackendStatus {
+    bool available;
+    string reason;
+    string warning;
+};
+
 inline bool is_valid_backend(Backend backend) {
     return backend >= Backend::AIO && backend <= Backend::MMAP;
 }

@@ -13,42 +13,63 @@ namespace instanttensor {
 
 namespace {
 
-bool kernel_at_least_5_15() {
+struct KernelVersion {
+    long major;
+    long minor;
+    string release;
+};
+
+std::optional<KernelVersion> running_kernel_version() {
     struct utsname uts;
     if (uname(&uts) != 0) {
-        return false;
+        return std::nullopt;
     }
 
     char *end = nullptr;
     long major = strtol(uts.release, &end, 10);
     if (end == uts.release || *end != '.') {
-        return false;
+        return std::nullopt;
     }
 
     const char *minor_start = end + 1;
     long minor = strtol(minor_start, &end, 10);
     if (end == minor_start) {
-        return false;
+        return std::nullopt;
     }
 
-    return major > 5 || (major == 5 && minor >= 15);
+    return KernelVersion{major, minor, uts.release};
 }
 
-bool probe_supports_fixed_buffer_read(struct io_uring *ring) {
+bool kernel_version_at_least(
+    const KernelVersion &version, long required_major, long required_minor) {
+    return version.major > required_major ||
+           (version.major == required_major && version.minor >= required_minor);
+}
+
+bool probe_supports_fixed_buffer_read(struct io_uring *ring, string *reason) {
     struct io_uring_probe *probe = io_uring_get_probe_ring(ring);
     if (!probe) {
+        *reason = "Could not query the supported io_uring opcodes.";
         return false;
     }
 
-    bool supported = io_uring_opcode_supported(probe, IORING_OP_READ) &&
-                     io_uring_opcode_supported(probe, IORING_OP_READ_FIXED);
+    bool supports_read = io_uring_opcode_supported(probe, IORING_OP_READ);
+    bool supports_read_fixed =
+        io_uring_opcode_supported(probe, IORING_OP_READ_FIXED);
     io_uring_free_probe(probe);
-    return supported;
+    if (!supports_read || !supports_read_fixed) {
+        *reason = "The required io_uring READ and READ_FIXED opcodes are unavailable.";
+        return false;
+    }
+    return true;
 }
 
-bool supports_fixed_file_registration(struct io_uring *ring) {
+bool supports_fixed_file_registration(struct io_uring *ring, string *reason) {
     int fd = ::open("/dev/null", O_RDONLY);
     if (fd < 0) {
+        int error = errno;
+        *reason = "Could not open /dev/null while probing io_uring fixed-file "
+                  "registration: " + std::string(strerror(error)) + ".";
         return false;
     }
 
@@ -57,25 +78,49 @@ bool supports_fixed_file_registration(struct io_uring *ring) {
         io_uring_unregister_files(ring);
     }
     ::close(fd);
+    if (ret < 0) {
+        *reason = "io_uring fixed-file registration failed: " +
+                  std::string(strerror(-ret)) + ".";
+    }
     return ret == 0;
 }
 
-bool supports_fixed_buffer_registration(struct io_uring *ring) {
+bool supports_fixed_buffer_registration(struct io_uring *ring, string *reason) {
     char buffer[4096];
     struct iovec iov = {buffer, sizeof(buffer)};
 
     int ret = io_uring_register_buffers(ring, &iov, 1);
     if (ret == 0) {
         io_uring_unregister_buffers(ring);
+    } else {
+        *reason = "io_uring fixed-buffer registration failed: " +
+                  std::string(strerror(-ret)) + ".";
     }
     return ret == 0;
 }
 
 } // namespace
 
-bool Loader::uring_available(){// best-effort check
-    if (!kernel_at_least_5_15()) { // io_uring with kernel < 5.15 is not reliable
-        return false;
+BackendStatus Loader::uring_status(){// best-effort check
+    auto kernel_version = running_kernel_version();
+    if (!kernel_version) {
+        return {false, "Could not determine the Linux kernel version.", ""};
+    }
+
+    // IORING_OP_READ, IOSQE_ASYNC, and IORING_REGISTER_PROBE require 5.6.
+    if (!kernel_version_at_least(*kernel_version, 5, 6)) {
+        return {
+            false,
+            "io_uring requires Linux kernel 5.6 or newer; the detected kernel "
+            "version is " + kernel_version->release + ".",
+            "",
+        };
+    }
+
+    string warning;
+    if (!kernel_version_at_least(*kernel_version, 5, 15)) {
+        warning = "io_uring on Linux " + kernel_version->release +
+                  " may be unstable; Linux 5.15 or newer is recommended.";
     }
 
     struct io_uring ring = {};
@@ -85,16 +130,21 @@ bool Loader::uring_available(){// best-effort check
 
     int ret = io_uring_queue_init_params(2, &ring, &params);
     if (ret < 0) {
-        return false;
+        return {
+            false,
+            "io_uring queue initialization failed: " +
+                std::string(strerror(-ret)) + ".",
+            warning,
+        };
     }
 
     // io_uring_probe reports opcodes; SQPOLL/fixed files are setup/register capabilities.
-    bool supported = // (ring.flags & IORING_SETUP_SQPOLL) &&
-                     probe_supports_fixed_buffer_read(&ring) &&
-                     supports_fixed_file_registration(&ring) &&
-                     supports_fixed_buffer_registration(&ring);
+    string reason;
+    bool supported = probe_supports_fixed_buffer_read(&ring, &reason) &&
+                     supports_fixed_file_registration(&ring, &reason) &&
+                     supports_fixed_buffer_registration(&ring, &reason);
     io_uring_queue_exit(&ring);
-    return supported;
+    return {supported, reason, warning};
 }
 
 void Loader::open_file_uring(FileInfo &f) {
