@@ -103,10 +103,7 @@ void Loader::init_buffer() {
             CUDA_CHECK(cudaHostRegister(this->host_buffer_entry.ptr, host_buffer_size, this->cuda_host_register_flags));
 
             this->host_buffer_entry.size = host_buffer_size;
-            this->host_buffer_entry.deleter = [=](void *ptr) {
-                if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-                    this->deregister_host_buffer_uring();
-                }
+            this->host_buffer_entry.deleter = [](void *ptr) {
                 CUDA_CHECK(cudaHostUnregister(ptr));
                 free(ptr);
             };
@@ -127,6 +124,10 @@ void Loader::destroy_buffer() {
     CUDA_CHECK(cudaFree(this->device_buffer));
 
     if (this->need_host_buffer) {
+        // Buffer registration belongs to this loader's ring and must not outlive it.
+        if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+            this->deregister_host_buffer_uring();
+        }
         if (_env_cache_buffer()) {
             host_buffer_cache->put(std::move(this->host_buffer_entry));
         }
