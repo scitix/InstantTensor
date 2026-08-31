@@ -11,6 +11,7 @@ from typing import Union, Generator, Optional
 import threading
 import atexit
 from collections import defaultdict
+from dataclasses import dataclass
 
 
 def env_debug():
@@ -76,6 +77,16 @@ MAX_IO_DEPTH = 1024
 
 BackendCandidate = Union[Backend, BackendPolicy]
 BackendCandidates = Optional[Union[BackendCandidate, list[BackendCandidate]]]
+
+
+@dataclass(frozen=True)
+class _OpenConfig:
+    buffer_size: Optional[int]
+    chunk_size: Optional[int]
+    concurrency: Optional[int]
+    io_depth: Optional[int]
+    max_free_mem_usage: Optional[float]
+    backend: BackendCandidates
 
 
 def parse_backend(name: str) -> BackendCandidate:
@@ -162,6 +173,28 @@ def env_max_free_mem_usage():
 def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
+
+
+def _resolve_open_config(
+    buffer_size: Optional[int],
+    chunk_size: Optional[int],
+    concurrency: Optional[int],
+    io_depth: Optional[int],
+    max_free_mem_usage: Optional[float],
+    backend: BackendCandidates,
+) -> _OpenConfig:
+    return _OpenConfig(
+        buffer_size=buffer_size if buffer_size is not None else env_buffer_size(),
+        chunk_size=chunk_size if chunk_size is not None else env_chunk_size(),
+        concurrency=concurrency if concurrency is not None else env_concurrency(),
+        io_depth=io_depth if io_depth is not None else env_io_depth(),
+        max_free_mem_usage=(
+            max_free_mem_usage
+            if max_free_mem_usage is not None
+            else env_max_free_mem_usage()
+        ),
+        backend=backend if backend is not None else env_backend(),
+    )
 
 # runai reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
 # safetensors reference: https://github.com/safetensors/safetensors/blob/main/bindings/python/py_src/safetensors/torch.py
@@ -272,6 +305,15 @@ def get_tensor_size(shape: list[int], dtype: torch.dtype) -> int:
         ret *= s
     return ret
 
+
+def required_buffer_size_for_io(
+    chunk_size: int, io_depth: int, world_size: int,
+) -> int:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    aligned_chunk_size = (chunk_size + page_size - 1) // page_size * page_size
+    return aligned_chunk_size * io_depth * world_size
+
+
 def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor: float = 0.9) -> int:
     """
     Compute the recommended buffer size for the given tensor sizes.
@@ -337,23 +379,27 @@ class safe_open:
             If ``None`` (default), uses ``INSTANTTENSOR_BUFFER_SIZE`` when set;
             otherwise automatically determined based on tensor sizes and I/O
             settings for optimal performance. Larger values improve throughput
-            but use more GPU memory.
+            but use more GPU memory. When set without ``io_depth``, the default
+            I/O depth is reduced as needed to fit this buffer. If both values
+            are set, the buffer must be large enough for the requested depth.
         chunk_size: The size of each file I/O operation in bytes. If ``None``
             (default), uses ``INSTANTTENSOR_CHUNK_SIZE`` when set; otherwise
             automatically determined based on storage type. Increasing this
             value can improve throughput, but values that are too large may
             conversely reduce throughput.
         concurrency: The number of worker threads used by the synchronous
-            ``MMAP`` and ``CUFILE`` backends. It does not affect the I/O layout
-            or native asynchronous backends. If ``None`` (default), uses
+            ``MMAP`` and ``CUFILE`` backends. Other backends ignore it. It does
+            not affect the I/O layout. If ``None`` (default), uses
             ``INSTANTTENSOR_CONCURRENCY`` when set; otherwise automatically
             determined for the selected backend.
         io_depth: The maximum number of rank-local I/O operations in flight. If ``None`` (default),
             uses ``INSTANTTENSOR_IO_DEPTH`` when set; otherwise automatically
             determined based on storage type and system capabilities.
-        max_free_mem_usage: Max ratio of idle memory used. If ``None`` (default),
-            uses ``INSTANTTENSOR_MAX_FREE_MEM_USAGE`` when set; otherwise
-            defaults to 0.5.
+        max_free_mem_usage: Maximum fraction of currently free device memory
+            available to the logical GPU buffer. If ``None`` (default), uses
+            ``INSTANTTENSOR_MAX_FREE_MEM_USAGE`` when set; otherwise defaults
+            to 0.5. The internal allocation also includes a small alignment
+            guard.
         load_now: Whether to load tensors immediately. If ``True`` (default), starts
             loading immediately. If ``False``, only reads file metadata initially;
             tensors will be loaded when the context manager is entered. Useful
@@ -456,7 +502,11 @@ class safe_open:
         self.copy = copy
         self._invalidated = False
 
-        self._determine_io_params(chunk_size, concurrency, io_depth, max_free_mem_usage, backend)
+        config = _resolve_open_config(
+            buffer_size, chunk_size, concurrency, io_depth,
+            max_free_mem_usage, backend,
+        )
+        self._determine_io_params(config)
 
         self.meta_read_time = time.perf_counter()
 
@@ -484,7 +534,7 @@ class safe_open:
         self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
         self.total_tensor_size = sum(self.tensor_sizes)
 
-        self._determine_buffer_size(buffer_size)
+        self._finalize_buffer_size(config.buffer_size)
 
         if not self.copy and self.buffer_size < self.total_tensor_size:
             warnings.warn(
@@ -499,17 +549,14 @@ class safe_open:
         if load_now:
             self._open()
 
-    def _determine_io_params(self, chunk_size, concurrency, io_depth, max_free_mem_usage, backend):
-        if chunk_size is None:
-            chunk_size = env_chunk_size()
-        if concurrency is None:
-            concurrency = env_concurrency()
-        if io_depth is None:
-            io_depth = env_io_depth()
-        if max_free_mem_usage is None:
-            max_free_mem_usage = env_max_free_mem_usage()
-        if backend is None:
-            backend = env_backend()
+    def _determine_io_params(self, config: _OpenConfig):
+        buffer_size = config.buffer_size
+        chunk_size = config.chunk_size
+        concurrency = config.concurrency
+        io_depth = config.io_depth
+        max_free_mem_usage = config.max_free_mem_usage
+        backend = config.backend
+        io_depth_is_explicit = io_depth is not None
         backend_candidates = parse_backend_candidates(backend)
 
         in_memory = len(self.filename) > 0 and file_in_memory(self.filename[0])
@@ -576,6 +623,39 @@ class safe_open:
             raise ValueError("io_depth must be greater than zero")
         if io_depth > MAX_IO_DEPTH:
             raise ValueError(f"io_depth must not exceed {MAX_IO_DEPTH}")
+
+        if buffer_size is not None:
+            if buffer_size <= 0:
+                raise ValueError("buffer_size must be greater than zero")
+
+            buffer_size_per_io_depth = required_buffer_size_for_io(
+                chunk_size, 1, self.world_size,
+            )
+            max_io_depth_for_buffer = buffer_size // buffer_size_per_io_depth
+            required_buffer_size = buffer_size_per_io_depth * io_depth
+
+            if io_depth_is_explicit and required_buffer_size > buffer_size:
+                raise ValueError(
+                    f"buffer_size ({buffer_size} B) is too small for io_depth={io_depth}; "
+                    f"at least {required_buffer_size} B is required for "
+                    f"chunk_size={chunk_size} and world_size={self.world_size}"
+                )
+
+            if not io_depth_is_explicit:
+                if max_io_depth_for_buffer < 1:
+                    raise ValueError(
+                        f"buffer_size ({buffer_size} B) is too small for one I/O operation; "
+                        f"at least {buffer_size_per_io_depth} B is required for "
+                        f"chunk_size={chunk_size} and world_size={self.world_size}"
+                    )
+                if io_depth > max_io_depth_for_buffer:
+                    warnings.warn(
+                        f"Shrink io_depth from {io_depth} to {max_io_depth_for_buffer} "
+                        f"to fit buffer_size={buffer_size}.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                    io_depth = max_io_depth_for_buffer
         
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
@@ -593,33 +673,37 @@ class safe_open:
             avail_bytes = avail_bytes_tensor.item()
             # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
 
-
-        if chunk_size * io_depth * self.world_size > avail_bytes:
-            shrinked_io_depth = max(avail_bytes // (chunk_size * self.world_size), 1)
-            if shrinked_io_depth != io_depth:
-                warnings.warn(
-                    f"Shrink io_depth from {io_depth} to {shrinked_io_depth} due to memory limit.",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
-                io_depth = shrinked_io_depth
-        
-        if chunk_size * io_depth * self.world_size > avail_bytes:
-            raise RuntimeError("Device memory is not enough")
+        self._device_memory_budget = avail_bytes
+        buffer_size_per_io_depth = required_buffer_size_for_io(
+            chunk_size, 1, self.world_size,
+        )
+        max_io_depth_for_memory = avail_bytes // buffer_size_per_io_depth
+        if max_io_depth_for_memory < 1:
+            raise RuntimeError(
+                f"Device memory budget ({avail_bytes} B) is too small for one "
+                f"I/O operation; at least {buffer_size_per_io_depth} B is required"
+            )
+        if io_depth > max_io_depth_for_memory:
+            warnings.warn(
+                f"Shrink io_depth from {io_depth} to {max_io_depth_for_memory} "
+                f"due to memory limit.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            io_depth = max_io_depth_for_memory
 
         self.chunk_size = chunk_size
         self.concurrency = concurrency
         self.io_depth = io_depth
         self.backend = backend
 
-    def _determine_buffer_size(self, buffer_size):
-        if buffer_size is None:
-            buffer_size = env_buffer_size()
-        
+    def _finalize_buffer_size(self, buffer_size):
         if buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
             buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
-            buffer_size_for_io = self.chunk_size * self.io_depth * self.world_size
+            buffer_size_for_io = required_buffer_size_for_io(
+                self.chunk_size, self.io_depth, self.world_size,
+            )
             self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
         else:
             self.buffer_size = buffer_size
@@ -632,7 +716,12 @@ class safe_open:
                 )
                 self.buffer_size = min_buffer_size
 
-            max_buffer_size = self.total_tensor_size
+            max_buffer_size = max(
+                self.total_tensor_size,
+                required_buffer_size_for_io(
+                    self.chunk_size, self.io_depth, self.world_size,
+                ),
+            )
             if self.buffer_size > max_buffer_size:
                 warnings.warn(
                     f"Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste.",
@@ -640,6 +729,12 @@ class safe_open:
                     stacklevel=3,
                 )
                 self.buffer_size = max_buffer_size
+
+        if self.buffer_size > self._device_memory_budget:
+            raise RuntimeError(
+                f"buffer_size ({self.buffer_size} B) exceeds device memory "
+                f"budget ({self._device_memory_budget} B)"
+            )
 
     def _read_metadata(self):
         meta_read_threads = []
