@@ -681,7 +681,7 @@ post_read_chunk():
 
     # 同时保护 executor queue 容量、host window 和 CUDA event 的复用
     reuse_guard =
-        max(chunk_id - MAX_PREFETCH_CHUNKS,
+        max(chunk_id - MAX_IO_DEPTH,
             chunk_id - io_depth)
     if reuse_guard >= 0:
         wait_read_chunk(reuse_guard)
@@ -806,8 +806,8 @@ Loader 自身运行在独立线程中。完成 `OPEN` 后，它会在没有 Pyth
 主要上限有两层：
 
 1. **Host/inflight 上限**：提交 chunk `k` 前等待
-   `max(k - MAX_PREFETCH_CHUNKS, k - io_depth)`，因此实际 inflight 不超过
-   `min(io_depth, MAX_PREFETCH_CHUNKS)`，并确保 host window/event 可复用；
+   `max(k - MAX_IO_DEPTH, k - io_depth)`，因此实际 inflight 不超过
+   `min(io_depth, MAX_IO_DEPTH)`，并确保 host window/event 可复用；
 2. **Device overwrite 上限**：`can_step()` 不允许超过当前 tensor 的
    `prefetch_chunk_id`。
 

@@ -5,7 +5,7 @@ import json
 import warnings
 import torch # must before instanttensor._C
 import torch.distributed as dist
-import instanttensor._C
+import instanttensor._C as _C
 from enum import Enum
 from typing import Union, Generator, Optional
 import threading
@@ -26,7 +26,7 @@ def debug_log(message, *args):
 
 
 try:
-    atexit.register(instanttensor._C.cleanup)
+    atexit.register(_C.cleanup)
 except AttributeError:
     # _C module is mocked (e.g., during Sphinx documentation build)
     debug_log("instanttensor._C is mocked, skipping cleanup registration")
@@ -55,13 +55,19 @@ except AttributeError:
 #   InstantTensor uses MMAP by default for in-memory filesystems. In other cases,
 #   it tries URING first and falls back to AIO to balance performance and broad
 #   compatibility.
+_backend_values = _C.backend_values()
+
+
 class Backend(Enum):
-    AIO = 0
-    AIO_BUFFERED = 1
-    URING = 2
-    URING_BUFFERED = 3
-    CUFILE = 4
-    MMAP = 5
+    AIO = _backend_values["AIO"]
+    AIO_BUFFERED = _backend_values["AIO_BUFFERED"]
+    URING = _backend_values["URING"]
+    URING_BUFFERED = _backend_values["URING_BUFFERED"]
+    CUFILE = _backend_values["CUFILE"]
+    MMAP = _backend_values["MMAP"]
+
+
+del _backend_values
 
 
 class BackendPolicy(Enum):
@@ -72,7 +78,7 @@ default_backend = [Backend.URING, Backend.AIO]
 default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]
 default_in_memory_backend = [Backend.MMAP]
 available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
-MAX_IO_DEPTH = 1024
+MAX_IO_DEPTH = _C.MAX_IO_DEPTH
 
 
 BackendCandidate = Union[Backend, BackendPolicy]
@@ -145,7 +151,7 @@ def select_backend(candidates: list[Backend], supported_backends: Optional[list[
         if supported_backends is not None and backend not in supported_backends:
             rejected.append(f"{backend.name} is not supported for this filesystem.")
             continue
-        available, reason, warning = instanttensor._C.backend_status(backend.value)
+        available, reason, warning = _C.backend_status(backend.value)
         if not available:
             rejected.append(
                 reason or f"{backend.name} is not available on this system."
@@ -317,7 +323,7 @@ def file_in_memory(filename: str) -> bool:
         ... else:
         ...     print("File is on disk, using standard I/O")
     """
-    return instanttensor._C.file_in_memory(filename)
+    return _C.file_in_memory(filename)
 
 def get_tensor_size(shape: list[int], dtype: torch.dtype) -> int:
     ret = torch.tensor([], dtype=dtype).element_size()
@@ -329,9 +335,9 @@ def get_tensor_size(shape: list[int], dtype: torch.dtype) -> int:
 def required_buffer_size_for_io(
     chunk_size: int, io_depth: int, world_size: int,
 ) -> int:
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    aligned_chunk_size = (chunk_size + page_size - 1) // page_size * page_size
-    return aligned_chunk_size * io_depth * world_size
+    return _C.required_buffer_size_for_io(
+        chunk_size, io_depth, world_size,
+    )
 
 
 def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor: float = 0.9) -> int:
@@ -797,7 +803,7 @@ class safe_open:
     def _open(self):
         self.open_time = time.perf_counter()
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
-        self.loader_handle = instanttensor._C.open(
+        self.loader_handle = _C.open(
             self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets)
 
@@ -812,7 +818,7 @@ class safe_open:
         stream.synchronize() # make sure all the data transfer is done
         self.exit_time = time.perf_counter()
         self._invalidated = True
-        instanttensor._C.close(self.loader_handle)
+        _C.close(self.loader_handle)
         self.close_time = time.perf_counter()
         total_time = self.close_time - self.init_time
         init_time = self.sync_time - self.init_time
@@ -864,7 +870,7 @@ class safe_open:
                 raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
 
             tensor_size = get_tensor_size(shape, torch_dtype)
-            dl_tensor = instanttensor._C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
+            dl_tensor = _C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
             tensor_int8 = torch.from_dlpack(dl_tensor)
 
             required_alignment = torch.empty((), dtype=torch_dtype).element_size()

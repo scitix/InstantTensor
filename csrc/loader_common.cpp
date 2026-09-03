@@ -73,7 +73,8 @@ void Loader::init_buffer() {
     }
     this->world_chunk_size = this->rank_chunk_size * this->world_size;
 
-    size_t inflight_device_buffer_size = this->io_depth * this->world_chunk_size;
+    size_t inflight_device_buffer_size = required_buffer_size_for_io(
+        this->rank_chunk_size, this->io_depth, this->world_size);
     if (this->buffer_size < inflight_device_buffer_size) this->buffer_size = inflight_device_buffer_size;
 
     // At most first_tensor_alignment bytes are padded both before and after the chunk
@@ -381,8 +382,9 @@ void Loader::open(OpenArgs args) {
     if(this->concurrency == 0) {
         print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
     }
-    if(this->io_depth == 0 || this->io_depth > MAX_PREFETCH_CHUNKS) {
-        print_and_throw(std::invalid_argument("io_depth must be between 1 and " + std::to_string(MAX_PREFETCH_CHUNKS)));
+    if(this->io_depth == 0 || this->io_depth > MAX_IO_DEPTH) {
+        print_and_throw(std::invalid_argument(
+            "io_depth must be between 1 and " + std::to_string(MAX_IO_DEPTH)));
     }
 
     if (this->world_size > 1 && this->group_communicator == NULL) {
@@ -457,7 +459,9 @@ void Loader::post_read_chunk() {
 
     cudaEvent_t event = this->cuda_events[window_idx];// NOTE: cudaEvent_t is a pointer type
 
-    chunk_id_t wait_chunk_id = max(chunk_id - (chunk_id_t)MAX_PREFETCH_CHUNKS, chunk_id - (chunk_id_t)this->io_depth);
+    chunk_id_t wait_chunk_id = max(
+        chunk_id - (chunk_id_t)MAX_IO_DEPTH,
+        chunk_id - (chunk_id_t)this->io_depth);
     if(wait_chunk_id >= 0) {
         // wait for the SingleThreadTaskExecutor to be available to post tasks
         // and wait for existing usage of host_buffer

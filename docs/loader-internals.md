@@ -691,7 +691,7 @@ post_read_chunk():
     c = chunks[chunk_id]
 
     reuse_guard =
-        max(chunk_id - MAX_PREFETCH_CHUNKS,
+        max(chunk_id - MAX_IO_DEPTH,
             chunk_id - io_depth)
     if reuse_guard >= 0:
         wait_read_chunk(reuse_guard)
@@ -815,8 +815,8 @@ After `OPEN`, the independent loader thread calls `try_step()` whenever no
 RPC is pending, until blocked by:
 
 1. **Host/in-flight bound:** before chunk `k`, wait for
-   `max(k - MAX_PREFETCH_CHUNKS, k - io_depth)`. In-flight count is at most
-   `min(io_depth, MAX_PREFETCH_CHUNKS)`.
+   `max(k - MAX_IO_DEPTH, k - io_depth)`. In-flight count is at most
+   `min(io_depth, MAX_IO_DEPTH)`.
 2. **Device-overwrite bound:** never pass the current
    `prefetch_chunk_id`.
 

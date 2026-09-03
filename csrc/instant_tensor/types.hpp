@@ -16,8 +16,8 @@ inline size_t rank_logical_size(
         : 0;
 }
 
-using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
-using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_PREFETCH_CHUNKS, MAX_PREFETCH_CHUNKS>;
+using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
+using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
 
 // NOTE: edit 
 enum Backend {

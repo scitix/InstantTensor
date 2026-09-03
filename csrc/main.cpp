@@ -168,6 +168,31 @@ bool backend_available(int backend) {
 
 PYBIND11_MODULE(_C, m) {
     m.doc() = "InstantTensor C++ extension module";
+    m.attr("MAX_IO_DEPTH") = pybind11::int_(instanttensor::MAX_IO_DEPTH);
+
+    m.def("backend_values", []() {
+              pybind11::dict values;
+              for (auto backend : {
+                       instanttensor::Backend::AIO,
+                       instanttensor::Backend::AIO_BUFFERED,
+                       instanttensor::Backend::URING,
+                       instanttensor::Backend::URING_BUFFERED,
+                       instanttensor::Backend::CUFILE,
+                       instanttensor::Backend::MMAP,
+                   }) {
+                  values[pybind11::str(instanttensor::backend_to_string(backend))]
+                      = static_cast<int>(backend);
+              }
+              return values;
+          },
+          "Return backend names and their native integer values");
+
+    m.def("required_buffer_size_for_io",
+          &instanttensor::required_buffer_size_for_io,
+          "Return the logical device-buffer size required by the I/O window",
+          pybind11::arg("chunk_size"),
+          pybind11::arg("io_depth"),
+          pybind11::arg("world_size"));
 
     m.def("open", &instanttensor::open,
           "Open a safetensors file for loading",

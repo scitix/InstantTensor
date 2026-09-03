@@ -33,7 +33,7 @@ using namespace instanttensor::cuda_binding;
 using namespace instanttensor::cufile_binding;
 using namespace instanttensor::nccl_binding;
 
-#define MAX_PREFETCH_CHUNKS 1024
+inline constexpr size_t MAX_IO_DEPTH = 1024;
 const size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);// typically 4096
 
 namespace py = pybind11;
@@ -67,6 +67,11 @@ T ROUND_UP(T x, T y) {
 template <typename T>
 T ROUND_DOWN(T x, T y) {
     return x / y * y;
+}
+
+inline size_t required_buffer_size_for_io(
+    size_t chunk_size, size_t io_depth, size_t world_size) {
+    return ROUND_UP(chunk_size, PAGE_SIZE) * io_depth * world_size;
 }
 
 #define CUDA_CHECK(_call) \
