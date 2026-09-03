@@ -767,6 +767,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Backend env mode: 'clone' clones a shared base environment per entry, "
             "or 'inplace' installs directly into the base environment and restores it after each entry."
+            "Defaults to 'clone'."
         ),
     )
     parser.add_argument(
