@@ -21,7 +21,16 @@
           "args": ["--checksum"],
           "pre_evict_page_cache": true,
           "envs": {
-            "INSTANTTENSOR_BACKEND": "BUFFERED"
+            "INSTANTTENSOR_BACKEND": "URING_BUFFERED"
+          },
+          "post_evict_page_cache": false
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"],
+          "pre_evict_page_cache": true,
+          "envs": {
+            "INSTANTTENSOR_BACKEND": "MMAP"
           },
           "post_evict_page_cache": false
         },
@@ -30,7 +39,25 @@
           "args": ["--checksum"],
           "pre_evict_page_cache": false,
           "envs": {
-            "INSTANTTENSOR_BACKEND": "BUFFERED"
+            "INSTANTTENSOR_BACKEND": "URING_BUFFERED"
+          },
+          "post_evict_page_cache": false
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"],
+          "pre_evict_page_cache": false,
+          "envs": {
+            "INSTANTTENSOR_BACKEND": "MMAP"
+          },
+          "post_evict_page_cache": false
+        },
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/",
+          "args": ["--checksum"],
+          "pre_evict_page_cache": false,
+          "envs": {
+            "INSTANTTENSOR_BACKEND": "URING_BUFFERED"
           },
           "post_evict_page_cache": true
         }
