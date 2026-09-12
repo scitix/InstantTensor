@@ -447,6 +447,18 @@ void Loader::close(CloseArgs args) {
     }
 }
 
+void Loader::set_fatal_error(std::exception_ptr error) {
+    if (!this->fatal_error) {
+        this->fatal_error = std::move(error);
+    }
+}
+
+void Loader::rethrow_fatal_error() const {
+    if (this->fatal_error) {
+        std::rethrow_exception(this->fatal_error);
+    }
+}
+
 void Loader::post_read_chunk() {
     this->chunk_reading.store(this->chunk_reading.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     chunk_id_t chunk_id = this->chunk_reading.load(std::memory_order_relaxed);
@@ -605,13 +617,39 @@ std::any Loader::dispatch(const RPCRequest &m) {
 
 void Loader::run() {
     while (!this->stop.load(std::memory_order_relaxed)) {
-        if (!this->can_step() || !this->input_queue->empty()) {
+        bool should_dispatch = false;
+        try {
+            should_dispatch = this->fatal_error || !this->can_step() || !this->input_queue->empty();
+        }
+        catch (...) {
+            this->set_fatal_error(std::current_exception());
+            should_dispatch = true;
+        }
+
+        if (should_dispatch) {
             RPCRequest m;
             this->input_queue->pop(m);
-            std::any ret = this->dispatch(m);
-            this->output_queue->push(RPCResponse{m.id, std::move(ret)});
+            try {
+                if (m.op != CLOSE) {
+                    this->rethrow_fatal_error(); // throw this to catch
+                }
+                std::any ret = this->dispatch(m);
+                this->output_queue->push(RPCResponse{m.id, std::move(ret)});
+            }
+            catch (...) {
+                auto error = std::current_exception();
+                this->set_fatal_error(error);
+                this->output_queue->push(RPCResponse{m.id, std::any(error)});
+            }
+            continue;
         }
-        this->try_step();
+
+        try {
+            this->try_step();
+        }
+        catch (...) {
+            this->set_fatal_error(std::current_exception());
+        }
     }
 }
 
@@ -622,7 +660,6 @@ void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQu
     }
     catch (const std::exception &e) {
         fprintf(stderr, "Loader thread exception: %s\n", e.what());
-        throw;
     }
 }
 

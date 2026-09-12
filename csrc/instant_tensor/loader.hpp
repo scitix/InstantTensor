@@ -85,6 +85,7 @@ public:
     atomic<bool> stop = false;
     atomic<chunk_id_t> chunk_reading = -1;
     atomic<chunk_id_t> chunk_read = -1;
+    std::exception_ptr fatal_error;
 
     alignas(64)
     atomic<size_t> io_depth_sum = 0;
@@ -115,6 +116,8 @@ public:
     void try_step();
     void wait_step(chunk_id_t chunk_id);
     void* get_tensor_ptr(GetTensorArgs args);
+    void set_fatal_error(std::exception_ptr error);
+    void rethrow_fatal_error() const;
     std::any dispatch(const RPCRequest &m);
     void run();
 

@@ -31,6 +31,9 @@ public:
         while (response.id != req_id) {
             handle.output_queue->pop(response);
         }
+        if (response.result.type() == typeid(std::exception_ptr)) {
+            std::rethrow_exception(std::any_cast<std::exception_ptr>(response.result));
+        }
         return response.result;
     }
 

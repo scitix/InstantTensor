@@ -38,7 +38,13 @@ public:
         TaskItem task = std::move(*pending_task);
         pending_task.reset();
 
-        std::any result = (*task.payload)();
+        std::any result;
+        try {
+            result = (*task.payload)();
+        }
+        catch (...) {
+            result = std::current_exception();
+        }
         if (!task.needs_result) {
             return {};
         }
@@ -89,10 +95,31 @@ public:
     void reap(int request_id, R& result) {
         std::any result_any;
         Base::reap(request_id, result_any);
+        rethrow_if_error(result_any);
         result = std::any_cast<R>(std::move(result_any));
     }
 
+    void reap(int request_id) {
+        std::any result;
+        Base::reap(request_id, result);
+        rethrow_if_error(result);
+    }
+
+    bool try_reap(int request_id, std::any& result) {
+        bool ready = Base::try_reap(request_id, result);
+        if (ready) {
+            rethrow_if_error(result);
+        }
+        return ready;
+    }
+
 private:
+    static void rethrow_if_error(const std::any& result) {
+        if (result.type() == typeid(std::exception_ptr)) {
+            std::rethrow_exception(std::any_cast<std::exception_ptr>(result));
+        }
+    }
+
     template<typename F>
     static TaskFn make_task_fn(F&& fn) {
         return [fn = std::forward<F>(fn)]() mutable -> std::any {
@@ -145,10 +172,31 @@ public:
     void reap(int request_id, R& result) {
         std::any result_any;
         Base::reap(request_id, result_any);
+        rethrow_if_error(result_any);
         result = std::any_cast<R>(std::move(result_any));
     }
 
+    void reap(int request_id) {
+        std::any result;
+        Base::reap(request_id, result);
+        rethrow_if_error(result);
+    }
+
+    bool try_reap(int request_id, std::any& result) {
+        bool ready = Base::try_reap(request_id, result);
+        if (ready) {
+            rethrow_if_error(result);
+        }
+        return ready;
+    }
+
 private:
+    static void rethrow_if_error(const std::any& result) {
+        if (result.type() == typeid(std::exception_ptr)) {
+            std::rethrow_exception(std::any_cast<std::exception_ptr>(result));
+        }
+    }
+
     template<typename F>
     static TaskFn make_task_fn(F&& fn) {
         return [fn = std::forward<F>(fn)]() mutable -> std::any {

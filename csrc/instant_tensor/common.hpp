@@ -49,8 +49,9 @@ using std::atomic;
 using std::max;
 using std::min;
 
+template <typename Exception>
 [[noreturn]]
-inline void print_and_throw(const std::exception& e) {
+inline void print_and_throw(const Exception& e) {
     fprintf(stderr, "%s\n", e.what());
     throw e;
 }
