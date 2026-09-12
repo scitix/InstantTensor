@@ -79,6 +79,7 @@ default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Bac
 default_in_memory_backend = [Backend.MMAP]
 available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
 MAX_IO_DEPTH = _C.MAX_IO_DEPTH
+MAX_CHUNK_SIZE = _C.MAX_CHUNK_SIZE
 
 
 BackendCandidate = Union[Backend, BackendPolicy]
@@ -298,11 +299,52 @@ def read_safetensors_metadata(filename: str) -> tuple:
         >>> print(f"Header size: {header_size} bytes")
     """
     with open(filename, "rb") as f:
-        metadata_size = int.from_bytes(f.read(8), "little")
+        file_size = os.fstat(f.fileno()).st_size
+        if file_size < 8:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: file size {file_size} B "
+                "is smaller than the 8-byte metadata length field"
+            )
+
+        metadata_size_bytes = f.read(8)
+        metadata_size = int.from_bytes(metadata_size_bytes, "little")
+        header_size = 8 + metadata_size
+        if file_size < header_size:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: file size {file_size} B "
+                f"is smaller than the metadata header size {header_size} B"
+            )
+
         metadata_str = f.read(metadata_size).decode("utf-8")
         tensor_metadata = json.loads(metadata_str)
         file_metadata = tensor_metadata.pop("__metadata__", None)
-        return file_metadata, tensor_metadata, 8 + metadata_size
+
+        if not tensor_metadata:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: no tensor metadata found"
+            )
+
+        last_tensor_name, last_tensor = next(reversed(tensor_metadata.items()))
+        data_offsets = last_tensor.get("data_offsets")
+        if (
+            not isinstance(data_offsets, list)
+            or len(data_offsets) != 2
+            or not all(isinstance(offset, int) and offset >= 0 for offset in data_offsets)
+            or data_offsets[1] < data_offsets[0]
+        ):
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: invalid data_offsets for "
+                f"tensor {last_tensor_name!r}"
+            )
+
+        payload_end = header_size + data_offsets[1]
+        if file_size < payload_end:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: file size {file_size} B "
+                f"is smaller than the last tensor payload end {payload_end} B"
+            )
+
+        return file_metadata, tensor_metadata, header_size
 
 def file_in_memory(filename: str) -> bool:
     """Check if a file is located in an in-memory filesystem.
@@ -643,6 +685,12 @@ class safe_open:
 
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than zero")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        aligned_chunk_size = ((chunk_size + page_size - 1) // page_size) * page_size
+        if aligned_chunk_size > MAX_CHUNK_SIZE:
+            raise ValueError(
+                f"chunk_size must be no greater than {MAX_CHUNK_SIZE} B after page alignment"
+            )
         if concurrency <= 0:
             raise ValueError("concurrency must be greater than zero")
         if io_depth <= 0:

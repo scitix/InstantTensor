@@ -169,6 +169,7 @@ bool backend_available(int backend) {
 PYBIND11_MODULE(_C, m) {
     m.doc() = "InstantTensor C++ extension module";
     m.attr("MAX_IO_DEPTH") = pybind11::int_(instanttensor::MAX_IO_DEPTH);
+    m.attr("MAX_CHUNK_SIZE") = pybind11::int_(instanttensor::MAX_CHUNK_SIZE);
 
     m.def("backend_values", []() {
               pybind11::dict values;

@@ -379,6 +379,11 @@ void Loader::open(OpenArgs args) {
     if(this->rank_chunk_size == 0) {
         print_and_throw(std::invalid_argument("chunk_size must be greater than zero"));
     }
+    if(ROUND_UP(this->rank_chunk_size, PAGE_SIZE) > MAX_CHUNK_SIZE) {
+        print_and_throw(std::invalid_argument(
+            "chunk_size must be no greater than " + std::to_string(MAX_CHUNK_SIZE) +
+            " bytes after page alignment"));
+    }
     if(this->concurrency == 0) {
         print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
     }

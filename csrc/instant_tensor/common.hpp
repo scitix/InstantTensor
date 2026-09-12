@@ -34,6 +34,7 @@ using namespace instanttensor::cufile_binding;
 using namespace instanttensor::nccl_binding;
 
 inline constexpr size_t MAX_IO_DEPTH = 1024;
+inline constexpr size_t MAX_CHUNK_SIZE = 1ULL << 30;
 const size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);// typically 4096
 
 namespace py = pybind11;
