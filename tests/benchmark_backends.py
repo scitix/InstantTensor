@@ -14,6 +14,9 @@ Backend specs:
 For local and local/<git-ref>, the backend is instanttensor and the package is
 installed from a temporary clean copy of this repository after checking out the ref.
 For instanttensor backend, only local specs are supported.
+
+Conda uses the conda-forge channel exclusively. Pip indexes remain controlled
+separately by INSTANTTENSOR_BENCH_PIP_ARGS.
 """
 
 from __future__ import annotations
@@ -225,6 +228,17 @@ def env_python_path(env_dir: Path) -> Path:
     return env_dir / suffix
 
 
+def conda_channel_options(*, log_file: Path | None, dry_run: bool) -> list[str]:
+    channel_args = ["--override-channels", "--channel", "conda-forge"]
+    message = "Conda channels: [\"conda-forge\"] (override configured channels)."
+    bench_print(message)
+    if log_file is not None and not dry_run:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8") as log:
+            log.write(message + "\n")
+    return channel_args
+
+
 def create_conda_env(
     python_version: str,
     env_dir: Path,
@@ -233,6 +247,7 @@ def create_conda_env(
     log_file: Path | None = None,
     dry_run: bool,
 ) -> Path:
+    channel_args = conda_channel_options(log_file=log_file, dry_run=dry_run)
     env_python = env_python_path(env_dir)
     if reuse_env and env_dir.exists() and env_python.exists():
         bench_print(f"Reusing conda env: {env_dir}", flush=True)
@@ -242,7 +257,8 @@ def create_conda_env(
         shutil.rmtree(env_dir)
 
     run_streamed(
-        ["conda", "create", "-y", "--quiet", "-p", str(env_dir), f"python={python_version}"],
+        ["conda", "create", "-y", "--quiet", "-p", str(env_dir),
+         *channel_args, f"python={python_version}"],
         log_file=log_file,
         dry_run=dry_run,
     )
@@ -257,6 +273,7 @@ def clone_conda_env(
     log_file: Path | None = None,
     dry_run: bool = False,
 ) -> Path:
+    channel_args = conda_channel_options(log_file=log_file, dry_run=dry_run)
     env_python = env_python_path(target_env)
     if reuse_env and target_env.exists() and env_python.exists():
         bench_print(f"Reusing cloned env: {target_env}", flush=True)
@@ -275,6 +292,7 @@ def clone_conda_env(
             str(source_env),
             "-p",
             str(target_env),
+            *channel_args,
         ],
         log_file=log_file,
         dry_run=dry_run,
@@ -722,7 +740,7 @@ def check_prerequisites() -> None:
         require_executable(executable)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark tests/test.py across backend package versions."
     )
@@ -790,7 +808,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print install and test commands without executing them.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    return args
 
 
 def main() -> int:
