@@ -394,7 +394,8 @@ void Loader::open(OpenArgs args) {
             "chunk_size must be no greater than " + std::to_string(MAX_CHUNK_SIZE) +
             " bytes after page alignment"));
     }
-    if(this->concurrency == 0) {
+    if(this->concurrency == 0 &&
+       (this->backend == Backend::MMAP || this->backend == Backend::CUFILE)) {
         print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
     }
     if(this->io_depth == 0 || this->io_depth > MAX_IO_DEPTH) {

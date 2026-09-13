@@ -75,7 +75,7 @@ class BackendPolicy(Enum):
 
 
 default_backend = [Backend.URING, Backend.AIO]
-default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]
+default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.MMAP]
 default_in_memory_backend = [Backend.MMAP]
 available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
 MAX_IO_DEPTH = _C.MAX_IO_DEPTH
@@ -632,56 +632,61 @@ class safe_open:
             if file_in_memory(filename) != in_memory:
                 raise ValueError(f"All files must be in the same filesystem. {self.filename[0]} is in memory, but {filename} is not.")
 
-        if in_memory:
-            if backend_candidates is None:
-                backend_candidates = default_in_memory_backend
-            backend = select_backend(backend_candidates, available_in_memory_backends)
+        if backend_candidates is None:
+            backend_candidates = default_in_memory_backend if in_memory else default_backend
+        elif in_memory:
+            backend_candidates = [
+                candidate for candidate in backend_candidates
+                if candidate in available_in_memory_backends
+            ]
+        backend = select_backend(backend_candidates)
 
+        if concurrency is not None:
+            if concurrency < 0:
+                raise ValueError("concurrency must not be negative")
+            if backend in (Backend.MMAP, Backend.CUFILE):
+                if concurrency == 0:
+                    raise ValueError(
+                        f"concurrency must be greater than zero for backend {backend.name}"
+                    )
+            elif concurrency > 0:
+                warnings.warn(
+                    f"Backend {backend.name} does not support concurrency; overriding "
+                    f"concurrency={concurrency} to 0.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                concurrency = 0
+
+        default_concurrency = max(min(32, os.cpu_count() or 1) // self.world_size, 1)
+        if backend == Backend.MMAP:
             if chunk_size is None:
-                chunk_size = 2*1024*1024
-            default_in_memory_concurrency = max(min(32, os.cpu_count() or 1) // self.world_size, 1)
-            if backend == Backend.MMAP:
-                if concurrency is None:
-                    concurrency = default_in_memory_concurrency
-                if io_depth is None:
-                    # Preserve three pipeline groups per worker.
-                    io_depth = 3 * concurrency
-            else:
-                if concurrency is None:
-                    concurrency = 1
-                if io_depth is None:
-                    # Preserve the previous native-async request depth without
-                    # making it depend on the public concurrency parameter.
-                    io_depth = 3 * default_in_memory_concurrency
-        else:
-            if backend_candidates is None:
-                backend_candidates = default_backend
-            backend = select_backend(backend_candidates)
-
-            if backend == Backend.CUFILE:
-                if chunk_size is None:
-                    chunk_size = 8*1024*1024
-                if concurrency is None:
-                    # Since these are all IO-intensive threads, using more threads than CPU cores is acceptable
-                    concurrency = max(32 // self.world_size, 1) 
-                if io_depth is None:
-                    # Preserve the previous 16 chunks of requests per worker.
-                    io_depth = 16 * concurrency
-            elif backend == Backend.MMAP:
-                if chunk_size is None:
-                    chunk_size = 2*1024*1024
-                if concurrency is None:
-                    concurrency = max(min(32, os.cpu_count() or 1) // self.world_size, 1)
-                if io_depth is None:
-                    io_depth = 3 * concurrency
-            else: 
-                # Native-async backends and disk-backed MMAP.
-                if chunk_size is None:
-                    chunk_size = 8*1024*1024
-                if concurrency is None:
-                    concurrency = 1
-                if io_depth is None:
-                    io_depth = max(512 // self.world_size, 3) # aio read + cudaMemcpyAsync + ncclAllGather
+                chunk_size = 2 * 1024 * 1024
+            if concurrency is None:
+                concurrency = default_concurrency
+            if io_depth is None:
+                io_depth = 3 * concurrency
+        elif backend in (Backend.URING_BUFFERED, Backend.AIO_BUFFERED):
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = 0
+            if io_depth is None:
+                io_depth = default_concurrency
+        elif backend in (Backend.URING, Backend.AIO):
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = 0
+            if io_depth is None:
+                io_depth = max(512 // self.world_size, 3)
+        elif backend == Backend.CUFILE:
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = max(32 // self.world_size, 1)
+            if io_depth is None:
+                io_depth = 2 * concurrency
 
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than zero")
@@ -691,8 +696,6 @@ class safe_open:
             raise ValueError(
                 f"chunk_size must be no greater than {MAX_CHUNK_SIZE} B after page alignment"
             )
-        if concurrency <= 0:
-            raise ValueError("concurrency must be greater than zero")
         if io_depth <= 0:
             raise ValueError("io_depth must be greater than zero")
         if io_depth > MAX_IO_DEPTH:
