@@ -191,8 +191,9 @@ safe_open("model.safetensors", framework="pt", device=0, backend=[Backend.URING,
 safe_open("model.safetensors", framework="pt", device=0, backend=BackendPolicy.BUFFERED)
 ```
 
-`BackendPolicy.BUFFERED` expands to `[Backend.URING_BUFFERED,
-Backend.AIO_BUFFERED, Backend.MMAP]`. This is a good choice when you want Buffered I/O.
+`BackendPolicy.BUFFERED` expands to `[Backend.URING_BUFFERED, Backend.MMAP]`. This is a
+good choice when you want Buffered I/O. `AIO_BUFFERED` remains available when selected
+explicitly.
 
 `INSTANTTENSOR_BACKEND` accepts comma-separated backend or policy names:
 
