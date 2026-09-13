@@ -73,6 +73,9 @@ public:
 
     // Worker side only. Returns whether this worker has an active working set.
     virtual bool has_pending_tasks() const = 0;
+
+    // Lifecycle side only. Stop accepting new work and drain pending work.
+    virtual void request_stop() {}
 };
 
 // ExecutorCore owns the task/result queues and worker thread lifecycle.
@@ -243,6 +246,13 @@ private:
                 while (driver->can_add_task() && task_queue.try_pop(task)) {
                     received_task = true;
                     if (task.is_stop()) {
+                        driver->request_stop();
+                        while (driver->has_pending_tasks()) {
+                            std::vector<ResultItem> result_items = driver->process_tasks();
+                            for (auto& result_item : result_items) {
+                                result_queue.push(std::move(result_item));
+                            }
+                        }
                         return;
                     }
                     driver->add_task(std::move(task));

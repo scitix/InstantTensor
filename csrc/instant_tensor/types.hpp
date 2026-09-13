@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <any>
 #include <cstdint>
+#include <functional>
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/function_executor.hpp>
 
@@ -18,6 +20,16 @@ inline size_t rank_logical_size(
 
 using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
 using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
+
+struct IOOperation {
+    std::function<void()> start;
+    std::function<bool()> poll;
+};
+
+using IOExecutorBase = SingleWorkerDriverExecutor<IOOperation, std::any,
+                                                MAX_IO_DEPTH, MAX_IO_DEPTH>;
+
+class IOExecutor;
 
 // NOTE: edit 
 enum Backend {
@@ -113,7 +125,20 @@ struct TensorMetadate {
 };
 
 struct ChunkExtraData {
-    size_t unfinished_cnt;
+    size_t total_logical_size;
+    size_t bytes_completed;
+    size_t request_file_offset;
+    size_t request_buffer_offset;
+    size_t request_logical_size;
+    // IO-driver-owned handle: AIO last-page submit or cuFile/MMAP read task.
+    // EXECUTOR_STOP_REQUEST_ID means no worker result is pending.
+    int pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
+};
+
+struct IORequest {
+    IOExecutor* executor;
+    int wait_handle;
+    bool loaded_to_device;
 };
 
 struct ChunkRequest {

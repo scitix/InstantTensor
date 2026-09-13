@@ -2,6 +2,7 @@
 
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/types.hpp>
+#include <instant_tensor/io_executor.hpp>
 #include <instant_tensor/io_context.hpp>
 #include <liburing.h>
 
@@ -31,7 +32,6 @@ public:
     bool use_internal_memory_register = false;
     bool need_host_buffer = false;
     bool need_worker_threads = false;
-    bool need_cuda_thread = false;
     void *device_buffer = nullptr;
     void* host_buffer = nullptr; // rank-local staging windows
     HostBufferCacheEntry host_buffer_entry = {nullptr, 0, nullptr};
@@ -39,9 +39,8 @@ public:
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
     unique_ptr<ThreadPoolTaskExecutor> worker_threads;
-    // A special thread to read the last page of a file when the file size is not page aligned, 
-    // which results in blocking I/O even with O_DIRECT and libaio/io_uring.
     unique_ptr<SingleThreadTaskExecutor> last_page_reader_thread;
+    unique_ptr<IOExecutor> io_thread;
     unique_ptr<SingleThreadTaskExecutor> cuda_thread;
     unique_ptr<SingleThreadTaskExecutor> wait_thread;
     std::thread io_depth_sample_thread;
@@ -91,9 +90,11 @@ public:
     atomic<size_t> io_depth_sum = 0;
     atomic<size_t> io_depth_sample = 0;
 
-    int executor_request_id = 0;
+    int loader_task_id = 0;
+    int io_worker_task_id = 0;
 
-    int next_executor_request_id();
+    int next_loader_task_id();
+    int next_io_worker_task_id();
 
     // Constructor
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
@@ -124,7 +125,7 @@ public:
     // In-memory IO path (loader_io_inmem.cpp)
     void open_file_inmem(FileInfo &f);   // open fd, mmap, optional cudaHostRegister
     void close_file_inmem(FileInfo &f);  // unregister, munmap defer, close fd
-    ChunkRequest post_read_chunk_inmem(const ChunkIOParams &p);
+    IORequest post_read_chunk_inmem(const ChunkIOParams &p);
 
     // cuFile IO path (loader_io_cufile.cpp)
     static bool cufile_available();
@@ -132,14 +133,14 @@ public:
     void close_file_cufile(FileInfo &f); // cuFileHandleDeregister, close fd
     void register_device_buffer_cufile();
     void deregister_device_buffer_cufile();
-    ChunkRequest post_read_chunk_cufile(const ChunkIOParams &p);
+    IORequest post_read_chunk_cufile(const ChunkIOParams &p);
 
     // AIO path (loader_io_aio.cpp)
     void open_file_aio(FileInfo &f);     // open fd with O_DIRECT, fstat
     void close_file_aio(FileInfo &f);    // close fd
     void initialize_aio_context();        // io_setup, allocate iocb arrays
     void destroy_aio_context();       // io_destroy
-    ChunkRequest post_read_chunk_aio(const ChunkIOParams &p);
+    IORequest post_read_chunk_aio(const ChunkIOParams &p);
 
     // io_uring path (loader_io_uring.cpp)
     static BackendStatus uring_status();
@@ -149,7 +150,7 @@ public:
     void destroy_uring_context();          // io_uring_queue_exit
     void register_host_buffer_uring();
     void deregister_host_buffer_uring();
-    ChunkRequest post_read_chunk_uring(const ChunkIOParams &p);
+    IORequest post_read_chunk_uring(const ChunkIOParams &p);
 };
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);

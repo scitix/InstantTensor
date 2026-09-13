@@ -22,7 +22,6 @@ void Loader::open_file_inmem(FileInfo &f) {
     else {
         this->need_host_buffer = true;
         this->need_worker_threads = true;
-        this->need_cuda_thread = true;
     }
 }
 
@@ -35,77 +34,48 @@ void Loader::close_file_inmem(FileInfo &f) {
     ::close(f.fd);
 }
 
-ChunkRequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
-    int completion_req_id = -1;
-    SingleThreadTaskExecutor *completion_thread = nullptr;
-
+IORequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
+    chunk_id_t chunk_id = p.chunk_id;
     if (!this->use_internal_memory_register) {
-        int memcpy_req_id = EXECUTOR_STOP_REQUEST_ID;
-        if(p.rank_size > 0) {
-            void *rank_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset;
-            void *rank_mid = (char*)this->host_buffer + p.window_offset;
-            size_t rank_size = p.rank_size;
-            auto memcpy_func = [=]() {
-                memcpy(rank_mid, rank_src, rank_size);
-            };
-            memcpy_req_id = this->next_executor_request_id();
-            this->worker_threads->submit(memcpy_req_id, std::move(memcpy_func));
-        }
-
+        ChunkExtraData &initial_state = this->chunks[chunk_id].extra_data;
+        initial_state.pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
+        void *rank_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset;
         void *rank_mid = (char*)this->host_buffer + p.window_offset;
-        void *rank_dst = p.rank_dst;
-        void *all_dst = p.all_dst;
         size_t rank_size = p.rank_size;
-        size_t padded_rank_size = p.padded_rank_size;
-        cudaEvent_t event = p.event;
-        auto cuda_func = [=]() {
-            if(memcpy_req_id != EXECUTOR_STOP_REQUEST_ID) {
-                this->worker_threads->reap(memcpy_req_id);
-            }
-            CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_mid, rank_size, cudaMemcpyHostToDevice, this->cuda_stream));// 240GB/s for 8 GPUs
-            CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
-            if(this->world_size > 1) {
-                CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
-                // In-place AllGather
-                NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclInt8, this->group_communicator, this->nccl_stream));// 320GB/s for 8 GPUs
-                CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
+        auto io_start = [=]() {
+            ChunkExtraData &state = this->chunks[chunk_id].extra_data;
+            if (rank_size > 0) {
+                state.pending_worker_request_id = this->next_io_worker_task_id();
+                this->worker_threads->submit(state.pending_worker_request_id, [=]() {
+                    memcpy(rank_mid, rank_src, rank_size);
+                });
             }
         };
-        int cuda_req_id = this->next_executor_request_id();
-        this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
-
-        auto wait_func = [=]() mutable {
-            this->cuda_thread->reap(cuda_req_id);
-            CUDA_CHECK(cudaEventSynchronize(event));
+        auto io_func = [=]() -> bool {
+            ChunkExtraData &state = this->chunks[chunk_id].extra_data;
+            if (state.pending_worker_request_id != EXECUTOR_STOP_REQUEST_ID) {
+                std::any ignored;
+                if (!this->worker_threads->try_reap(state.pending_worker_request_id, ignored)) {
+                    return false;
+                }
+                state.pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
+            }
+            return true;
         };
-        completion_req_id = this->next_executor_request_id();
-        this->wait_thread->submit(completion_req_id, std::move(wait_func));
-        completion_thread = this->wait_thread.get();
+        int io_req_id = this->next_loader_task_id();
+        this->io_thread->submit(io_req_id, IOOperation{std::move(io_start), std::move(io_func)});
+        return IORequest{this->io_thread.get(), io_req_id, false};
     }
-    else if (this->use_internal_memory_register) {
+    else {
         void *rank_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset;
         void *rank_dst = p.rank_dst;
-        void *all_dst = p.all_dst;
         size_t rank_size = p.rank_size;
-        size_t padded_rank_size = p.padded_rank_size;
-        cudaEvent_t event = p.event;
         CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_src, rank_size, cudaMemcpyHostToDevice, this->cuda_stream));// use default stream 0
-        CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
-        if(this->world_size > 1) {
-            CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
-            NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size, ncclInt8, this->group_communicator, this->nccl_stream));
-            CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
-        }
-
-        auto wait_func = [=]() {
-            CUDA_CHECK(cudaEventSynchronize(event));
-        };
-        completion_req_id = this->next_executor_request_id();
-        this->wait_thread->submit(completion_req_id, std::move(wait_func));
-        completion_thread = this->wait_thread.get();
+        auto io_func = []() -> bool { return true; };
+        int io_req_id = this->next_loader_task_id();
+        this->io_thread->submit(io_req_id, IOOperation{[] {}, std::move(io_func)});
+        return IORequest{this->io_thread.get(), io_req_id, true};
     }
-
-    return ChunkRequest{completion_thread, completion_req_id};
 }
 
 } // namespace instanttensor

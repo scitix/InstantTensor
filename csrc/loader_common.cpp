@@ -4,9 +4,15 @@
 namespace instanttensor {
 
 
-int Loader::next_executor_request_id() {
-    int request_id = this->executor_request_id;
-    this->executor_request_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
+int Loader::next_loader_task_id() {
+    int request_id = this->loader_task_id;
+    this->loader_task_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
+    return request_id;
+}
+
+int Loader::next_io_worker_task_id() {
+    int request_id = this->io_worker_task_id;
+    this->io_worker_task_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
     return request_id;
 }
 
@@ -150,17 +156,17 @@ void Loader::init_threads() {
             this->worker_threads = std::make_unique<ThreadPoolTaskExecutor>(this->concurrency, driver_factory);
         }
     }
-    if(this->need_cuda_thread) {
-        if(!this->cuda_thread) {
-            this->cuda_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
-        }
+    if(!this->io_thread) {
+        this->io_thread = std::make_unique<IOExecutor>();
     }
-    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-        if(!this->last_page_reader_thread) {
+    if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+        if (!this->last_page_reader_thread) {
             this->last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
         }
     }
-
+    if(!this->cuda_thread) {
+        this->cuda_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
+    }
     if(!this->cuda_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->cuda_stream, cudaStreamNonBlocking));
     }
@@ -191,11 +197,14 @@ void Loader::destroy_threads() {
     if (this->worker_threads) {
         this->worker_threads->join();
     }
-    if (this->cuda_thread) {
-        this->cuda_thread->join();
-    }
     if (this->last_page_reader_thread) {
         this->last_page_reader_thread->join();
+    }
+    if (this->io_thread) {
+        this->io_thread->join();
+    }
+    if (this->cuda_thread) {
+        this->cuda_thread->join();
     }
     if (this->wait_thread) {
         this->wait_thread->join();
@@ -496,18 +505,44 @@ void Loader::post_read_chunk() {
     ChunkIOParams params{chunk_id, chunk, f, padded_rank_size,
                          rank_offset, rank_size, window_idx, window_offset, rank_dst, all_dst, event};
 
-    ChunkRequest result;
+    IORequest io_request;
     if (this->backend == Backend::MMAP) {
-        result = this->post_read_chunk_inmem(params);
+        io_request = this->post_read_chunk_inmem(params);
     } else if (this->backend == Backend::CUFILE) {
-        result = this->post_read_chunk_cufile(params);
+        io_request = this->post_read_chunk_cufile(params);
     } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-        result = this->post_read_chunk_uring(params);
+        io_request = this->post_read_chunk_uring(params);
     } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-        result = this->post_read_chunk_aio(params);
+        io_request = this->post_read_chunk_aio(params);
     }
 
-    this->chunks[chunk_id].request = result;
+    auto cuda_func = [=]() {
+        io_request.executor->reap(io_request.wait_handle);
+        if (!io_request.loaded_to_device) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                rank_dst, (char*)this->host_buffer + params.window_offset,
+                rank_size, cudaMemcpyHostToDevice, this->cuda_stream));
+        }
+        CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
+        if (this->world_size > 1) {
+            CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
+            NCCL_CHECK(ncclAllGather(
+                rank_dst, all_dst, padded_rank_size, ncclInt8,
+                this->group_communicator, this->nccl_stream));
+            CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
+        }
+    };
+    int cuda_req_id = this->next_loader_task_id();
+    this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
+
+    auto wait_func = [=]() mutable {
+        this->cuda_thread->reap(cuda_req_id);
+        CUDA_CHECK(cudaEventSynchronize(event));
+    };
+    int completion_req_id = this->next_loader_task_id();
+    this->wait_thread->submit(completion_req_id, std::move(wait_func));
+    this->chunks[chunk_id].request = ChunkRequest{
+        this->wait_thread.get(), completion_req_id};
 }
 
 void Loader::poll_read_chunk() {

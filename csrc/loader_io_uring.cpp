@@ -171,7 +171,6 @@ void Loader::open_file_uring(FileInfo &f) {
     }
 
     this->need_host_buffer = true;
-    this->need_cuda_thread = true;
 }
 
 void Loader::initialize_uring_context() {
@@ -245,151 +244,135 @@ void Loader::deregister_host_buffer_uring() {
 
 // ─── chunk read ──────────────────────────────────────────────────────────────
 
-ChunkRequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
+IORequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
-    size_t rank_size_aligned = ROUND_UP(p.rank_size, this->rank_alignment);
-    bool unaligned_last_page = p.rank_size != rank_size_aligned;
+    ChunkExtraData &initial_state = this->chunks[chunk_id].extra_data;
+    initial_state.total_logical_size = p.rank_size;
+    initial_state.bytes_completed = 0;
+    initial_state.request_file_offset = p.chunk.file_offset + p.rank_offset;
+    initial_state.request_buffer_offset = p.window_offset;
+    initial_state.request_logical_size = p.rank_size;
 
-    struct io_uring *selected_ring = &this->uring_ring; // unaligned_last_page ? &this->uring_ring_last_page : &this->uring_ring;
-
-    size_t submit_cnt = 0;
-    if(p.rank_size > 0) {
-        void *buf = (char*)this->host_buffer + p.window_offset;
-        struct io_uring_sqe *sqe = io_uring_get_sqe(selected_ring);
-        if (!sqe) {
-            throw std::runtime_error(
-                "io_uring SQ full");
+    auto submit_chunk = [this](chunk_id_t id) {
+        Chunk &chunk = this->chunks[id];
+        ChunkExtraData &state = chunk.extra_data;
+        if (state.request_logical_size == 0) {
+            return;
         }
-        // Buffered I/O intentionally reuses the page-rounded direct-I/O size.
-        // H2D copies only the logically valid rank bytes.
-        int file_handle = this->uring_register_file ? p.chunk.file_index : p.file.fd;
-
+        size_t rank_size_aligned = ROUND_UP(state.request_logical_size, this->rank_alignment);
+        bool unaligned_last_page = state.request_logical_size != rank_size_aligned;
+        void *buf = (char*)this->host_buffer + state.request_buffer_offset;
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
+        if (!sqe) {
+            throw std::runtime_error("io_uring SQ full");
+        }
+        int file_handle = this->uring_register_file
+            ? static_cast<int>(chunk.file_index)
+            : this->file_info[chunk.file_index].fd;
         int buffer_index = -1;
-        if(this->uring_register_buffer) {
-            size_t left_buffer_index = ((char*)buf - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
-            size_t right_buffer_index = ((char*)buf + rank_size_aligned - 1 - (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
-            if(left_buffer_index == right_buffer_index) {
-                buffer_index = (int)left_buffer_index;
+        if (this->uring_register_buffer) {
+            size_t left = ((char*)buf - (char*)this->host_buffer_entry.ptr) /
+                IO_URING_REGISTER_BUFFER_SIZE;
+            size_t right = ((char*)buf + rank_size_aligned - 1 -
+                (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            if (left == right) {
+                buffer_index = static_cast<int>(left);
             }
         }
-        if(buffer_index != -1) {
+        if (buffer_index != -1) {
             io_uring_prep_read_fixed(sqe, file_handle, buf,
-                (unsigned)rank_size_aligned, p.chunk.file_offset + p.rank_offset, buffer_index);
-        }
-        else {
+                static_cast<unsigned>(rank_size_aligned),
+                state.request_file_offset, buffer_index);
+        } else {
             io_uring_prep_read(sqe, file_handle, buf,
-                (unsigned)rank_size_aligned, p.chunk.file_offset + p.rank_offset);
+                static_cast<unsigned>(rank_size_aligned),
+                state.request_file_offset);
         }
-        
-        if(this->uring_register_file) {
+        if (this->uring_register_file) {
             sqe->flags |= IOSQE_FIXED_FILE;
         }
-
-        // Normal operation for io_uring is to try and issue an sqe as
-        // non-blocking first (do IO in the current thread without sleeping or waiting), 
-        // and if that fails, execute it in an async manner (do IO in another thread). 
-        // However, the non-blocking path will perform "inline memory copy" 
-        // if the page cache is available under buffered IO (w/o O_DIRECT).
-        // Such inline copy is time consuming and does not benefit from multithreading.
-        // Thus we mark it as async, indicating that we prefer to do IO in another thread instead of inline.
-        // This significantly improves the performance if the page cache is available.
-        // Such optimization also applies to the last page of a chunk if 
-        // the file size is not aligned to pages and the last-page IO has to be blocking.
-        if(this->backend == Backend::URING_BUFFERED || unaligned_last_page) {
+        if (this->backend == Backend::URING_BUFFERED || unaligned_last_page) {
             sqe->flags |= IOSQE_ASYNC;
-            // or io_uring_sqe_set_flags(sqe, sqe->flags | IOSQE_ASYNC)
         }
-        // sqe->flags |= IOSQE_ASYNC;
-        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(chunk_id));
-        submit_cnt = 1;
-    }
-    this->chunks[chunk_id].extra_data.unfinished_cnt = submit_cnt;
-
-    auto uring_func = [=]() {
+        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(id));
         size_t submitted = 0;
-        while(submitted < submit_cnt) {
-            int ret = io_uring_submit(selected_ring);
-            if(ret < 0) {
+        while (submitted < 1) {
+            int ret = io_uring_submit(&this->uring_ring);
+            if (ret < 0) {
                 throw std::runtime_error(
                     "io_uring_submit failed: " + std::string(strerror(-ret)));
             }
             submitted += ret;
-            if(ret == 0) {
-                fprintf(stderr, "io_uring_submit returned 0, chunk_id: %zu, submitted: %zu, submit_cnt: %zu\n", chunk_id, submitted, submit_cnt);
-            }
         }
     };
 
-    if(submit_cnt > 0) {
-        uring_func();
-    }
-
-    // ── cuda_func: runs on cuda_thread ───────────────────────────────────────
-    // Consumes CQEs, then launches DMA host->GPU.
-    void  *rank_mid         = (char*)this->host_buffer + p.window_offset;
-    void  *rank_dst         = p.rank_dst;
-    void  *all_dst          = p.all_dst;
-    size_t rank_size        = p.rank_size;
-    size_t padded_rank_size = p.padded_rank_size;
-    cudaEvent_t event       = p.event;
-
-    auto cuda_func = [=]() {
-        size_t &unfinished_cnt = this->chunks[chunk_id].extra_data.unfinished_cnt;
-        while(unfinished_cnt > 0) {
+    // Consume CQEs and publish a complete host read to the common CUDA path.
+    auto io_func = [=]() -> bool {
+        ChunkExtraData &state = this->chunks[chunk_id].extra_data;
+        for (size_t i = 0; i < this->io_depth &&
+             state.bytes_completed < state.total_logical_size; ++i) {
             struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(selected_ring, &cqe);
+            int ret = io_uring_peek_cqe(&this->uring_ring, &cqe);
+            if (ret == -EAGAIN) {
+                break;
+            }
             if (ret != 0) {
                 throw std::runtime_error(
-                    "io_uring_wait_cqe failed: " + std::string(strerror(-ret)));
+                    "io_uring_peek_cqe failed: " + std::string(strerror(-ret)));
             }
             chunk_id_t cqe_chunk_id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqe));
             if (cqe->res < 0) {
                 std::string msg =
                     "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(-cqe->res));
-                io_uring_cqe_seen(selected_ring, cqe);
+                io_uring_cqe_seen(&this->uring_ring, cqe);
                 throw std::runtime_error(msg);
             }
-            const Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
+            Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
+            ChunkExtraData &event_state = cqe_chunk.extra_data;
             size_t padded_world_size = ROUND_UP(cqe_chunk.size, this->world_chunk_alignment);
             size_t padded_rank_size = padded_world_size / this->world_size;
             size_t logical_size = rank_logical_size(
                 cqe_chunk.size, padded_rank_size * this->rank, padded_rank_size);
+            size_t original_file_offset = cqe_chunk.file_offset +
+                padded_rank_size * this->rank;
             if(static_cast<size_t>(cqe->res) < logical_size) {
-                std::string msg =
-                    "Unexpected io_uring short read: chunk_id=" + std::to_string(cqe_chunk_id)
-                    + ", bytes_read=" + std::to_string(cqe->res)
-                    + ", logical_size=" + std::to_string(logical_size);
-                io_uring_cqe_seen(selected_ring, cqe);
-                throw std::runtime_error(msg);
+                int bytes_read = cqe->res;
+                io_uring_cqe_seen(&this->uring_ring, cqe);
+                struct stat st;
+                if (fstat(this->file_info[cqe_chunk.file_index].fd, &st) != 0 ||
+                    static_cast<size_t>(st.st_size) < cqe_chunk.file_offset +
+                        padded_rank_size * this->rank + logical_size) {
+                    throw std::runtime_error(
+                        "Unexpected io_uring short read at EOF: chunk_id=" +
+                        std::to_string(cqe_chunk_id) + ", bytes_read=" +
+                        std::to_string(bytes_read) + ", logical_size=" +
+                        std::to_string(logical_size));
+                }
+                size_t covered = event_state.request_file_offset - original_file_offset +
+                    static_cast<size_t>(bytes_read);
+                event_state.bytes_completed = std::min(
+                    logical_size, std::max(event_state.bytes_completed, covered));
+                size_t retry_offset = ROUND_DOWN(
+                    original_file_offset + event_state.bytes_completed,
+                    this->rank_alignment);
+                event_state.request_file_offset = retry_offset;
+                event_state.request_buffer_offset =
+                    (cqe_chunk_id % this->io_depth) * this->rank_chunk_size +
+                    (retry_offset - original_file_offset);
+                event_state.request_logical_size =
+                    original_file_offset + logical_size - retry_offset;
+                submit_chunk(cqe_chunk_id);
+                continue;
             }
-            this->chunks[cqe_chunk_id].extra_data.unfinished_cnt --;
-            io_uring_cqe_seen(selected_ring, cqe);
+            event_state.bytes_completed = logical_size;
+            io_uring_cqe_seen(&this->uring_ring, cqe);
         }
-
-        CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_mid, rank_size,
-                                   cudaMemcpyHostToDevice, this->cuda_stream));
-        CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
-        if (this->world_size > 1) {
-            CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
-            NCCL_CHECK(ncclAllGather(rank_dst, all_dst, padded_rank_size,
-                                     ncclInt8, this->group_communicator,
-                                     this->nccl_stream));
-            CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
-        }
+        return state.bytes_completed >= state.total_logical_size;
     };
-
-    int cuda_req_id = this->next_executor_request_id();
-    this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
-
-    // ── wait_func: runs on wait_thread ───────────────────────────────────────
-    auto wait_func = [=]() mutable {
-        this->cuda_thread->reap(cuda_req_id);
-        CUDA_CHECK(cudaEventSynchronize(event));
-    };
-
-    int completion_req_id = this->next_executor_request_id();
-    this->wait_thread->submit(completion_req_id, std::move(wait_func));
-    return ChunkRequest{this->wait_thread.get(), completion_req_id};
+    int io_req_id = this->next_loader_task_id();
+    this->io_thread->submit(io_req_id, IOOperation{
+        [=]() { submit_chunk(chunk_id); }, std::move(io_func)});
+    return IORequest{this->io_thread.get(), io_req_id, false};
 }
 
 } // namespace instanttensor
