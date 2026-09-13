@@ -384,6 +384,7 @@ void Loader::open(OpenArgs args) {
     this->concurrency = args.concurrency;
     this->io_depth = args.io_depth;
     this->backend = args.backend;
+    this->io_retry_warning_emitted = false;
 
     if(this->rank_chunk_size == 0) {
         print_and_throw(std::invalid_argument("chunk_size must be greater than zero"));

@@ -72,11 +72,24 @@ IORequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         while (true) {
             int ret = io_submit(this->aio_ctx, 1, this->aio_iocb_ptrs.data() + window_idx);
             if (ret < 0) {
+                if (ret == -EAGAIN || ret == -EINTR) {
+                    if (!this->io_retry_warning_emitted) {
+                        fprintf(stderr, "[InstantTensor][WARN] retrying AIO submit for chunk %zd after %s\n",
+                            id, strerror(-ret));
+                        this->io_retry_warning_emitted = true;
+                    }
+                    std::this_thread::yield();
+                    continue;
+                }
                 print_and_throw(std::runtime_error(
                     "Failed to submit aio: " + std::string(strerror(-ret))));
             }
             if (ret == 1) {
                 break;
+            }
+            if (!this->io_retry_warning_emitted) {
+                fprintf(stderr, "[InstantTensor][WARN] retrying AIO submit for chunk %zd after zero submission\n", id);
+                this->io_retry_warning_emitted = true;
             }
             std::this_thread::yield();
         }
@@ -111,19 +124,36 @@ IORequest Loader::post_read_chunk_aio(const ChunkIOParams &p) {
         int got = io_getevents(this->aio_ctx, 0, this->io_depth,
                                this->aio_events.data(), &timeout);
         if (got < 0) {
+            if (got == -EAGAIN || got == -EINTR) {
+                if (!this->io_retry_warning_emitted) {
+                    fprintf(stderr, "[InstantTensor][WARN] retrying AIO completion poll for chunk %zd after %s\n",
+                        chunk_id, strerror(-got));
+                    this->io_retry_warning_emitted = true;
+                }
+                return false;
+            }
             print_and_throw(std::runtime_error(
                 "Failed to get aio events: " + std::string(strerror(-got))));
         }
         for (int i = 0; i < got; i++) {
-            if (this->aio_events[i].res < 0) {
-                print_and_throw(std::runtime_error(
-                    "Failed to get aio events: " +
-                    std::string(strerror(-this->aio_events[i].res))));
-            }
             chunk_id_t event_chunk_id = static_cast<chunk_id_t>(
                 reinterpret_cast<uintptr_t>(this->aio_events[i].data));
             Chunk &event_chunk = this->chunks[event_chunk_id];
             ChunkExtraData &event_state = event_chunk.extra_data;
+            if (this->aio_events[i].res < 0) {
+                int error = static_cast<int>(-this->aio_events[i].res);
+                if (error == EAGAIN || error == EINTR) {
+                    if (!this->io_retry_warning_emitted) {
+                        fprintf(stderr, "[InstantTensor][WARN] retrying AIO read for chunk %zd after %s\n",
+                            event_chunk_id, strerror(error));
+                        this->io_retry_warning_emitted = true;
+                    }
+                    schedule_chunk(event_chunk_id);
+                    continue;
+                }
+                print_and_throw(std::runtime_error(
+                    "Failed to get aio events: " + std::string(strerror(error))));
+            }
             size_t padded_world_size = ROUND_UP(event_chunk.size, this->world_chunk_alignment);
             size_t padded_rank_size = padded_world_size / this->world_size;
             size_t event_rank_offset = padded_rank_size * this->rank;

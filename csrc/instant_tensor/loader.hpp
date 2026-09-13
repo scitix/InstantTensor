@@ -92,6 +92,7 @@ public:
 
     int loader_task_id = 0;
     int io_worker_task_id = 0;
+    bool io_retry_warning_emitted = false;
 
     int next_loader_task_id();
     int next_io_worker_task_id();

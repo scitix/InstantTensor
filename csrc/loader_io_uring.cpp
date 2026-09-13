@@ -299,10 +299,26 @@ IORequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
         while (submitted < 1) {
             int ret = io_uring_submit(&this->uring_ring);
             if (ret < 0) {
+                if (ret == -EAGAIN || ret == -EINTR) {
+                    if (!this->io_retry_warning_emitted) {
+                        fprintf(stderr, "[InstantTensor][WARN] retrying io_uring submit for chunk %zd after %s\n",
+                            id, strerror(-ret));
+                        this->io_retry_warning_emitted = true;
+                    }
+                    std::this_thread::yield();
+                    continue;
+                }
                 throw std::runtime_error(
                     "io_uring_submit failed: " + std::string(strerror(-ret)));
             }
             submitted += ret;
+            if (ret == 0) {
+                if (!this->io_retry_warning_emitted) {
+                    fprintf(stderr, "[InstantTensor][WARN] retrying io_uring submit for chunk %zd after zero submission\n", id);
+                    this->io_retry_warning_emitted = true;
+                }
+                std::this_thread::yield();
+            }
         }
     };
 
@@ -316,19 +332,36 @@ IORequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
             if (ret == -EAGAIN) {
                 break;
             }
+            if (ret == -EINTR) {
+                if (!this->io_retry_warning_emitted) {
+                    fprintf(stderr, "[InstantTensor][WARN] retrying io_uring completion poll for chunk %zd after EINTR\n", chunk_id);
+                    this->io_retry_warning_emitted = true;
+                }
+                return false;
+            }
             if (ret != 0) {
                 throw std::runtime_error(
                     "io_uring_peek_cqe failed: " + std::string(strerror(-ret)));
             }
             chunk_id_t cqe_chunk_id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqe));
-            if (cqe->res < 0) {
-                std::string msg =
-                    "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(-cqe->res));
-                io_uring_cqe_seen(&this->uring_ring, cqe);
-                throw std::runtime_error(msg);
-            }
             Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
             ChunkExtraData &event_state = cqe_chunk.extra_data;
+            if (cqe->res < 0) {
+                int error = -cqe->res;
+                io_uring_cqe_seen(&this->uring_ring, cqe);
+                if (error == EAGAIN || error == EINTR) {
+                    if (!this->io_retry_warning_emitted) {
+                        fprintf(stderr, "[InstantTensor][WARN] retrying io_uring read for chunk %zd after %s\n",
+                            cqe_chunk_id, strerror(error));
+                        this->io_retry_warning_emitted = true;
+                    }
+                    submit_chunk(cqe_chunk_id);
+                    continue;
+                }
+                std::string msg =
+                    "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(error));
+                throw std::runtime_error(msg);
+            }
             size_t padded_world_size = ROUND_UP(cqe_chunk.size, this->world_chunk_alignment);
             size_t padded_rank_size = padded_world_size / this->world_size;
             size_t logical_size = rank_logical_size(
