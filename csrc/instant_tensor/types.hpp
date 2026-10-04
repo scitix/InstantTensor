@@ -119,9 +119,10 @@ struct TensorMetadate {
     size_t file_index;
     size_t file_offset;
     size_t device_buffer_offset;
-    // last chunk that holds the tensor's data
+    // Empty tensors anchor both IDs to the previous emitted chunk, or -1 if none exists.
+    chunk_id_t first_chunk_id;
     chunk_id_t last_chunk_id;
-    // points to the furthest prefetchable chunk without overwriting current tensor's data
+    // Furthest prefetchable chunk without overwriting the tensor's first chunk.
     chunk_id_t prefetch_chunk_id;
 };
 

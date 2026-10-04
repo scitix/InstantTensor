@@ -77,7 +77,7 @@ described here. A production replacement still needs to define them.
 
 | Category | Requirement | Current enforcement |
 | --- | --- | --- |
-| File shape | The file list is nonempty; each safetensors file contains at least one tensor; normal supported inputs have nonempty payloads | Partly implicit; all-zero-sized inputs are not a supported compatibility target |
+| File shape | The file list is nonempty; each safetensors file contains at least one tensor | Zero-sized tensors do not create chunks |
 | Offsets | Tensor ranges are ordered by file offset and adjacent ranges are contiguous | Python sorts and validates continuity |
 | Dtype/alignment | Dtypes must be supported; file order does not need to preserve target-dtype alignment | Python clones an unaligned `int8` view before dtype reinterpretation |
 | Access order | Tensor indices advance in offset order; iteration is single-pass | Python iteration and C++ `current_tensor_index` rely on monotonic access |
@@ -241,10 +241,9 @@ The current implementation also assumes:
 
 - file indices start at zero and are contiguous; offsets are ordered by file and address;
 - every safetensors file has at least one tensor;
-- normal model inputs have nonempty payloads. Zero-sized tensors are not explicitly rejected, but an all-zero-sized file can fail to form a chunk under some alignments and leave no valid `last_chunk_id` completion.
+- zero-sized tensors anchor both `first_chunk_id` and `last_chunk_id` to the previous emitted chunk, or `-1` if none exists. They use the normal watermark scan/finalization, without indexing a chunk for their empty payload. All-empty inputs create no IO chunks.
 
-A replacement may reject metadata outside this domain. Supporting empty tensors
-requires explicit empty-view and completion semantics.
+A replacement may reject metadata outside this domain.
 
 ## 4. How `compute_layout` Creates Chunks
 
@@ -334,6 +333,7 @@ Each tensor records:
 size
 file_index / file_offset
 device_buffer_offset
+first_chunk_id
 last_chunk_id
 prefetch_chunk_id
 ```
@@ -360,7 +360,10 @@ reuse an older tensor region, layout assigns that tensor a
 `prefetch_chunk_id`.
 
 The value is the last chunk that may be submitted while the tensor can still be
-in use without overwriting its device bytes. Runtime prefetch continues only
+in use without overwriting its first chunk, including the prefix before tensor data.
+Protecting only the tensor start can allow in-flight H2D/NCCL or cuFile writes to
+overlap in that prefix. Chunks containing only header or reread-prefix bytes are
+not emitted. Runtime prefetch continues only
 while:
 
 ```text
@@ -437,6 +440,7 @@ state:
     chunk_file_offset
     chunk_device_offset = 0
     current_chunk_size = 0
+    current_chunk_payload_size = 0
     tensor_id = 0
     in_buffer_tensor_id = 0
     left_most_tensor_id = 0
@@ -445,7 +449,7 @@ tensor_device_offset(file_offset):
     return file_offset - chunk_file_offset + chunk_device_offset
 
 finish_chunk():
-    if current_chunk_size == 0:
+    if current_chunk_payload_size == 0:
         return
     chunks.push({
         size: current_chunk_size,
@@ -461,10 +465,12 @@ finish_chunk():
     # Reserve an Aw-aligned device range for rank partitioning.
     chunk_device_offset += round_up(current_chunk_size, Aw)
     current_chunk_size %= A
+    current_chunk_payload_size = 0
 
     previous_chunk_id = len(chunks) - 2
     while in_buffer_tensor_id < left_most_tensor_id and
-          tensors[in_buffer_tensor_id].device_buffer_offset < chunk_device_offset:
+          (tensors[in_buffer_tensor_id].size == 0 or
+           chunks[tensors[in_buffer_tensor_id].first_chunk_id].device_buffer_offset < chunk_device_offset):
         tensors[in_buffer_tensor_id].prefetch_chunk_id = previous_chunk_id
         in_buffer_tensor_id += 1
 
@@ -512,6 +518,9 @@ for each adjacent pair (offsets[i], offsets[i + 1]):
         finish_chunk()
         reset_device_region(tensor_id)
 
+    if current_chunk_size == W:
+        finish_chunk()
+    first_chunk_id = len(chunks) if tensor_size else len(chunks) - 1
     first_device_offset = tensor_device_offset(tensor_file_offset)
     bytes_left = tensor_size
 
@@ -519,16 +528,19 @@ for each adjacent pair (offsets[i], offsets[i + 1]):
     while current_chunk_size + bytes_left > W:
         bytes_to_boundary = W - current_chunk_size
         current_chunk_size += bytes_to_boundary
+        current_chunk_payload_size += bytes_to_boundary
         bytes_left -= bytes_to_boundary
         finish_chunk()
 
     current_chunk_size += bytes_left
+    current_chunk_payload_size += bytes_left
     tensors[tensor_id] = {
         size: tensor_size,
         file_index: file_index,
         file_offset: tensor_file_offset,
         device_buffer_offset: first_device_offset,
-        last_chunk_id: len(chunks),   # ID of the unfinished current chunk
+        first_chunk_id: first_chunk_id,
+        last_chunk_id: len(chunks) if tensor_size else first_chunk_id,
     }
     tensor_id += 1
 
@@ -537,6 +549,7 @@ finish_chunk()
 # Finalize the previous linear region, then the final region.
 reset_device_region(tensor_id)
 reset_device_region(tensor_id)
+
 ```
 
 Commonly missed details:
@@ -868,6 +881,8 @@ synchronization and lifetime control.
 
 For every chunk:
 
+At least one byte must belong to a mapped tensor payload, not only a header or reread prefix.
+
 ```text
 0 < chunk.size <= W
 chunk.file_offset % A == 0
@@ -875,10 +890,11 @@ round_up(chunk.size, Aw) % P == 0
 (round_up(chunk.size, Aw) / P) % A == 0
 ```
 
-For every tensor:
+For every nonempty tensor:
 
 ```text
 tensor.size == next_file_offset - tensor.file_offset
+tensor.first_chunk_id contains the first tensor byte
 tensor.last_chunk_id contains the final tensor byte
 tensor.device_buffer_offset + tensor.size <= allocated_device_buffer_size
 tensor.device_buffer_offset % dtype_itemsize == 0
@@ -895,6 +911,11 @@ chunk.device_buffer_offset
 
 Cross-chunk payload fragments must be adjacent on the device. Disk reread bytes
 and device padding must not appear inside tensor payload.
+
+Before the current tensor is ready, only earlier tensors are guaranteed complete.
+All chunks after that completed prefix through the current prefetch watermark must
+have nonoverlapping GPU write spans, including NCCL padding. Empty tensors anchor
+to a previously emitted chunk (or -1) and do not introduce an unfinished chunk dependency.
 
 For each visible tensor `i`:
 

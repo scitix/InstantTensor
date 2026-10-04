@@ -71,7 +71,7 @@ flowchart TD
 
 | 分类 | 要求 | 当前约束方式 |
 | --- | --- | --- |
-| 文件形态 | 文件列表非空；每个 safetensors 文件至少包含一个 tensor；正常受支持输入具有非空 payload | 部分为隐含前提；全零长度输入不属于兼容目标 |
+| 文件形态 | 文件列表非空；每个 safetensors 文件至少包含一个 tensor | 零长度 tensor 不生成 chunk |
 | Offset | tensor range 按文件 offset 排序，相邻 range 连续 | Python 排序并检查连续性 |
 | Dtype/对齐 | dtype 必须受支持；文件排列不需要天然满足目标 dtype 对齐 | Python 在 dtype reinterpretation 前 clone 未对齐的 `int8` view |
 | 访问顺序 | tensor index 按 offset 单调前进，iteration 只能执行一次 | Python iteration 和 C++ `current_tensor_index` 都依赖单调访问 |
@@ -229,9 +229,9 @@ Python frontend 首先：
 
 - file index 必须从 0 开始连续递增，并且 offsets 按 file、再按文件内地址排列；C++ 通过“最后一个 file index + 1”推导文件数；
 - 每个 safetensors 文件至少包含一个 tensor；Python 需要读取排序结果的最后一个元素来追加文件结束 offset；
-- 本文针对正常模型文件中的非空 payload。frontend 没有显式拒绝零长度 tensor，但全零长度文件在某些对齐情况下无法形成可供 `last_chunk_id` 等待的 chunk，不应作为受支持输入依赖。
+- 零长度 tensor 的 `first_chunk_id` 和 `last_chunk_id` 都锚定前一个已输出 chunk，没有则为 `-1`。水位沿用正常扫描和收尾流程，空 payload 不通过 chunk 索引判断覆盖。全零长度输入不产生 IO chunk。
 
-行为等价实现可以在入口显式拒绝不满足这些前提的 metadata；如果选择兼容零长度 tensor，则需要单独定义其 completion 和空 view 语义，而不能直接照搬当前 `last_chunk_id` 逻辑。
+行为等价实现可以在入口显式拒绝不满足这些前提的 metadata。
 
 ## 4. `compute_layout` 如何生成 chunk
 
@@ -314,6 +314,7 @@ zero-copy。
 size
 file_index / file_offset
 device_buffer_offset
+first_chunk_id
 last_chunk_id
 prefetch_chunk_id
 ```
@@ -344,6 +345,10 @@ device ring 会复用低地址。`compute_layout` 同时追踪：
 > 用户仍在使用该 tensor 时，loader 最远可以提交到哪个 chunk，而不会覆盖该 tensor 的 device 字节。
 
 运行时 `can_step()` 只允许 `chunk_reading < current_tensor.prefetch_chunk_id` 时继续 prefetch。
+
+保护边界是 tensor 首个 chunk 的起点，而不是 tensor 起点，包含 tensor 前面的页前缀。
+否则后续 H2D/NCCL 或 cuFile 可能与在途 chunk 的前缀写入重叠。
+仅含文件头或重读页前缀、不承载 tensor payload 的 chunk 不输出。
 
 #### 包含 Ring Wrap 的数值例子
 
@@ -416,6 +421,7 @@ state:
     chunk_file_offset
     chunk_device_offset = 0
     current_chunk_size = 0
+    current_chunk_payload_size = 0
     tensor_id = 0
     in_buffer_tensor_id = 0
     left_most_tensor_id = 0
@@ -424,7 +430,7 @@ tensor_device_offset(file_offset):
     return file_offset - chunk_file_offset + chunk_device_offset
 
 finish_chunk():
-    if current_chunk_size == 0:
+    if current_chunk_payload_size == 0:
         return
     chunks.push({
         size: current_chunk_size,
@@ -440,10 +446,12 @@ finish_chunk():
     # device 侧为 rank 等分保留 Aw 对齐空间
     chunk_device_offset += round_up(current_chunk_size, Aw)
     current_chunk_size %= A
+    current_chunk_payload_size = 0
 
     previous_chunk_id = len(chunks) - 2
     while in_buffer_tensor_id < left_most_tensor_id and
-          tensors[in_buffer_tensor_id].device_buffer_offset < chunk_device_offset:
+          (tensors[in_buffer_tensor_id].size == 0 or
+           chunks[tensors[in_buffer_tensor_id].first_chunk_id].device_buffer_offset < chunk_device_offset):
         tensors[in_buffer_tensor_id].prefetch_chunk_id = previous_chunk_id
         in_buffer_tensor_id += 1
 
@@ -491,6 +499,9 @@ for each adjacent pair (offsets[i], offsets[i + 1]):
         finish_chunk()
         reset_device_region(tensor_id)
 
+    if current_chunk_size == W:
+        finish_chunk()
+    first_chunk_id = len(chunks) if tensor_size else len(chunks) - 1
     first_device_offset = tensor_device_offset(tensor_file_offset)
     bytes_left = tensor_size
 
@@ -498,16 +509,19 @@ for each adjacent pair (offsets[i], offsets[i + 1]):
     while current_chunk_size + bytes_left > W:
         bytes_to_boundary = W - current_chunk_size
         current_chunk_size += bytes_to_boundary
+        current_chunk_payload_size += bytes_to_boundary
         bytes_left -= bytes_to_boundary
         finish_chunk()
 
     current_chunk_size += bytes_left
+    current_chunk_payload_size += bytes_left
     tensors[tensor_id] = {
         size: tensor_size,
         file_index: file_index,
         file_offset: tensor_file_offset,
         device_buffer_offset: first_device_offset,
-        last_chunk_id: len(chunks),   # 当前尚未 finish 的 chunk id
+        first_chunk_id: first_chunk_id,
+        last_chunk_id: len(chunks) if tensor_size else first_chunk_id,
     }
     tensor_id += 1
 
@@ -516,6 +530,7 @@ finish_chunk()
 # 第一次处理上一个线性布局段，第二次处理最后一个布局段
 reset_device_region(tensor_id)
 reset_device_region(tensor_id)
+
 ```
 
 复现时最容易漏掉的三个细节是：
@@ -860,6 +875,8 @@ Python generator 在每次获取下一个 tensor 前同步当前 CUDA stream。�
 
 对每个 chunk：
 
+至少有一个字节属于实际映射的 tensor payload，不能仅包含文件头或重读页前缀。
+
 ```text
 0 < chunk.size <= W
 chunk.file_offset % A == 0
@@ -867,10 +884,11 @@ round_up(chunk.size, Aw) % P == 0
 (round_up(chunk.size, Aw) / P) % A == 0
 ```
 
-对每个 tensor：
+对每个非空 tensor：
 
 ```text
 tensor.size == next_file_offset - tensor.file_offset
+tensor.first_chunk_id 是覆盖 tensor 第一个字节的 chunk
 tensor.last_chunk_id 是覆盖 tensor 最后一个字节的 chunk
 tensor.device_buffer_offset + tensor.size <= allocated_device_buffer_size
 tensor.device_buffer_offset % dtype_itemsize == 0
@@ -886,6 +904,10 @@ chunk.device_buffer_offset
 ```
 
 若一个 tensor 横跨相邻 chunk，则相邻 payload 片段在 device 上必须首尾相接。disk 页重读和 device padding 不得出现在 tensor payload 中间。
+
+在当前 tensor 就绪前，只能保证此前 tensor 的 chunk 已完成。从这个完成前缀之后，
+到当前预取水位之间，所有 chunk 的 GPU 写入范围都不得重叠，包括 NCCL padding。
+零长度 tensor 锚定此前已输出的 chunk（没有则为 -1），不引入尚未输出的 chunk 依赖。
 
 对每个 tensor i，在它已经可见后允许继续预取的区间应满足：
 

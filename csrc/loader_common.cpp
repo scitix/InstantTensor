@@ -232,6 +232,7 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
     size_t chunk_file_offset = 0; // The chunk offset from the beginning of the file, aligned to rank_alignment (typically == PAGE_SIZE)
     size_t chunk_device_buffer_offset = 0;
     size_t current_chunk_size = 0;
+    size_t current_chunk_payload_size = 0;
 
     // Points to the current tensor
     size_t tensor_id = 0;
@@ -252,27 +253,32 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
     };
 
     auto finish_chunk = [&]() {
-        if(current_chunk_size > 0) {
-            // ROUND_UP/DOWN make real effect only at the right most chunk
-            this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}, {}});
+        // Between reset_chunk_file() and an immediate reset_chunk_buffer_offset(),
+        // this can run with only a page prefix and no tensor payload.
+        if(current_chunk_payload_size == 0) {
+            return;
+        }
+        // ROUND_UP/DOWN make real effect only at the right most chunk
+        this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}, {}});
 
-            if(chunk_file_offset % this->rank_alignment != 0) {
-                throw std::runtime_error("Internal error: Chunk alignment error.");
-            }
+        if(chunk_file_offset % this->rank_alignment != 0) {
+            throw std::runtime_error("Internal error: Chunk alignment error.");
+        }
 
-            // may reread the last file page
-            chunk_file_offset += ROUND_DOWN(current_chunk_size, this->rank_alignment);
-            chunk_device_buffer_offset += ROUND_UP(current_chunk_size, this->world_chunk_alignment);
-            // equals to "current_chunk_size -= ROUND_DOWN(current_chunk_size, this->rank_alignment);""
-            current_chunk_size %= this->rank_alignment;
+        // may reread the last file page
+        chunk_file_offset += ROUND_DOWN(current_chunk_size, this->rank_alignment);
+        chunk_device_buffer_offset += ROUND_UP(current_chunk_size, this->world_chunk_alignment);
+        // equals to "current_chunk_size -= ROUND_DOWN(current_chunk_size, this->rank_alignment);""
+        current_chunk_size %= this->rank_alignment;
+        current_chunk_payload_size = 0;
 
 
-            chunk_id_t prev_chunk_id = (chunk_id_t)this->chunks.size() - 2;
-            while(in_buffer_tensor_id < left_most_tensor_id
-                && this->tensors[in_buffer_tensor_id].device_buffer_offset < chunk_device_buffer_offset) {
-                this->tensors[in_buffer_tensor_id].prefetch_chunk_id = prev_chunk_id;
-                in_buffer_tensor_id++;
-            }
+        chunk_id_t prev_chunk_id = (chunk_id_t)this->chunks.size() - 2;
+        while(in_buffer_tensor_id < left_most_tensor_id
+            && (this->tensors[in_buffer_tensor_id].size == 0 ||
+                this->chunks[this->tensors[in_buffer_tensor_id].first_chunk_id].device_buffer_offset < chunk_device_buffer_offset)) {
+            this->tensors[in_buffer_tensor_id].prefetch_chunk_id = prev_chunk_id;
+            in_buffer_tensor_id++;
         }
     };
     auto reset_chunk_buffer_offset = [&](size_t new_left_most_tensor_id) {
@@ -322,17 +328,26 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
             // place the tensor at the beginning of the buffer
             reset_chunk_buffer_offset(tensor_id);
         }
+        // Finish a full chunk before assigning the next tensor's first chunk ID.
+        if (current_chunk_size == this->world_chunk_size) {
+            finish_chunk();
+        }
+        chunk_id_t next_chunk_id = static_cast<chunk_id_t>(this->chunks.size());
+        // Empty tensors anchor to the previous emitted chunk, or -1 if none exists.
+        chunk_id_t first_chunk_id = tensor_size ? next_chunk_id : next_chunk_id - 1;
         size_t _tensor_device_buffer_offset = tensor_device_buffer_offset(tensor_file_offset);
         size_t tensor_size_left = tensor_size;
         while(current_chunk_size + tensor_size_left > this->world_chunk_size) {
             size_t size_add = this->world_chunk_size - current_chunk_size;
             current_chunk_size += size_add;
+            current_chunk_payload_size += size_add;
             tensor_size_left -= size_add;
             finish_chunk();
         }
         current_chunk_size += tensor_size_left;
-        chunk_id_t current_chunk_id = (chunk_id_t)this->chunks.size();
-        this->tensors[tensor_id] = TensorMetadate{tensor_size, file_index, tensor_file_offset, _tensor_device_buffer_offset, current_chunk_id, 0};
+        current_chunk_payload_size += tensor_size_left;
+        chunk_id_t last_chunk_id = tensor_size ? static_cast<chunk_id_t>(this->chunks.size()) : first_chunk_id;
+        this->tensors[tensor_id] = TensorMetadate{tensor_size, file_index, tensor_file_offset, _tensor_device_buffer_offset, first_chunk_id, last_chunk_id, 0};
 
         tensor_id ++;
     }
