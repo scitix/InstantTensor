@@ -659,7 +659,7 @@ class safe_open:
                 )
                 concurrency = 0
 
-        default_concurrency = max(min(32, cpu_count()) // self.world_size, 1)
+        default_concurrency = max(min(32, cpu_count()) // self.world_size - 4, 1)
         if backend == Backend.MMAP:
             if chunk_size is None:
                 chunk_size = 2 * 1024 * 1024

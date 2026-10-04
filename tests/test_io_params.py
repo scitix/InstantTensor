@@ -77,6 +77,7 @@ class IOParamsTest(unittest.TestCase):
         io_depth=None,
         buffer_size=None,
         free_bytes=1 << 50,
+        cpus=64,
     ):
         loader = impl.safe_open.__new__(impl.safe_open)
         loader.filename = ["model.safetensors"]
@@ -87,7 +88,7 @@ class IOParamsTest(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(impl, "file_in_memory", return_value=in_memory))
             stack.enter_context(mock.patch.object(impl, "select_backend", return_value=selected_backend))
-            stack.enter_context(mock.patch.object(impl, "cpu_count", return_value=64))
+            stack.enter_context(mock.patch.object(impl, "cpu_count", return_value=cpus))
             stack.enter_context(mock.patch.object(
                 impl.torch.cuda,
                 "mem_get_info",
@@ -127,7 +128,7 @@ class IOParamsTest(unittest.TestCase):
         )
 
         self.assertEqual(loader.chunk_size, 2 * 1024 * 1024)
-        self.assertEqual(loader.concurrency, 32)
+        self.assertEqual(loader.concurrency, 28)
         self.assertEqual(loader.io_depth, 3 * loader.concurrency)
 
     def test_cufile_default_depth_includes_worker_concurrency(self):
@@ -140,6 +141,13 @@ class IOParamsTest(unittest.TestCase):
         self.assertEqual(loader.chunk_size, 8 * 1024 * 1024)
         self.assertEqual(loader.concurrency, 16)
         self.assertEqual(loader.io_depth, 2 * loader.concurrency)
+
+    def test_cpu_reservation_is_per_rank_with_minimum_one(self):
+        for cpus, world_size, workers in ((64, 1, 28), (64, 2, 12), (8, 2, 1), (1, 8, 1)):
+            with self.subTest(cpus=cpus, world_size=world_size):
+                loader = self.determine_io_params(selected_backend=impl.Backend.MMAP,
+                    in_memory=False, cpus=cpus, world_size=world_size)
+                self.assertEqual(loader.concurrency, workers)
 
     def test_native_async_depth_does_not_depend_on_concurrency(self):
         with self.assertWarnsRegex(RuntimeWarning, "does not support concurrency"):
@@ -169,7 +177,7 @@ class IOParamsTest(unittest.TestCase):
         )
 
         self.assertEqual(loader.concurrency, 0)
-        self.assertEqual(loader.io_depth, 32)
+        self.assertEqual(loader.io_depth, 28)
         loader.tensor_sizes = [1]
         loader._finalize_buffer_size(None)
         self.assertEqual(
@@ -186,7 +194,7 @@ class IOParamsTest(unittest.TestCase):
             )
 
         self.assertEqual(loader.concurrency, 0)
-        self.assertEqual(loader.io_depth, 32)
+        self.assertEqual(loader.io_depth, 28)
 
     def test_memory_limit_shrinks_depth_not_worker_concurrency(self):
         chunk_size = 8 * 1024 * 1024
