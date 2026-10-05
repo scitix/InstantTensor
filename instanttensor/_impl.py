@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import warnings
+import math
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
@@ -201,6 +202,15 @@ def env_max_free_mem_usage():
 def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
+
+
+def _host_available_bytes():
+    with open("/proc/meminfo", encoding="ascii") as meminfo:
+        for line in meminfo:
+            if line.startswith("MemAvailable:"):
+                _, available_kb, _ = line.split()
+                return int(available_kb) * 1024
+    raise ValueError("Missing MemAvailable in /proc/meminfo")
 
 
 def _resolve_open_config(
@@ -464,8 +474,8 @@ class safe_open:
         io_depth: The maximum number of rank-local I/O operations in flight. If ``None`` (default),
             uses ``INSTANTTENSOR_IO_DEPTH`` when set; otherwise automatically
             determined based on storage type and system capabilities.
-        max_free_mem_usage: Maximum fraction of currently free device memory
-            available to the logical GPU buffer. If ``None`` (default), uses
+        max_free_mem_usage: Maximum fraction of available memory allowed for the
+            logical GPU buffer. If ``None`` (default), uses
             ``INSTANTTENSOR_MAX_FREE_MEM_USAGE`` when set; otherwise defaults
             to 0.5. The internal allocation also includes a small alignment
             guard.
@@ -738,8 +748,24 @@ class safe_open:
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
         
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        avail_bytes = int(free_bytes * max_free_mem_usage)
+        budget_error = None
+        try:
+            if not math.isfinite(max_free_mem_usage) or not 0 < max_free_mem_usage <= 1:
+                raise ValueError("max_free_mem_usage must be finite and satisfy 0 < value <= 1")
+            # Managed-memory support alone does not imply shared physical memory.
+            if sys.platform == "linux" and torch.cuda.get_device_properties(self.device).is_integrated:
+                avail_bytes = _host_available_bytes()
+                debug_log("MemAvailable: %d bytes", avail_bytes)
+            else:
+                avail_bytes = torch.cuda.mem_get_info(self.device)[0]
+                debug_log("CUDA free memory: %d bytes", avail_bytes)
+            avail_bytes = int(avail_bytes * max_free_mem_usage)
+        except (OSError, ValueError, AttributeError) as error:
+            # Participate in the existing MIN collective before rejecting, so
+            # invalid budget input on one rank cannot strand another rank there.
+            budget_error = error
+            avail_bytes = 0
+        debug_log("Local memory budget: %d bytes (fraction=%s)", avail_bytes, max_free_mem_usage)
 
         self.sync_time = time.perf_counter()
         if self.process_group is not None:
@@ -752,6 +778,9 @@ class safe_open:
             # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
 
         self._device_memory_budget = avail_bytes
+        debug_log("Device memory budget: %d bytes", avail_bytes)
+        if budget_error is not None:
+            raise RuntimeError("Cannot select memory budget: " + str(budget_error)) from budget_error
         buffer_size_per_io_depth = required_buffer_size_for_io(
             chunk_size, 1, self.world_size,
         )
