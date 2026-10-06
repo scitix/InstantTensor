@@ -856,14 +856,16 @@ Python generator 在每次获取下一个 tensor 前同步当前 CUDA stream。�
 2. `concurrency` 只控制 MMAP/cuFile worker pool，不影响 chunk geometry、buffer、AIO 或 io_uring。
 3. Tensor element size 非递增时，首 tensor 按 16 bytes 对齐后可继续保持 zero-copy 对齐。其他顺序可能产生未对齐地址；frontend 会先按 `int8` clone 这些 tensor，再做 dtype reinterpretation，并保留返回地址整除检查作为最终保护。
 
-4. 当前 I/O 路径使用一个基于 poll 的 `IOWorkerDriver` 负责 AIO/io_uring 的提交和完成。
-   它维护多个 active task，在没有 completion 时执行 yield，并且只有 logical payload
-   完整后才发布 task。AIO 非页对齐尾部提交仍可能使用专用的
+4. 所有 backend 统一使用基于 poll 的 `IOWorkerDriver`，通过 `poll_completions`
+   返回已完成的 request ID，不再逐任务 poll。它在提交之间回收并发布完成，没有
+   completion 时执行 yield，只有 logical payload 完整后才发布 task。AIO 非页对齐尾部提交仍可能使用专用的
    `last_page_reader_thread`，因为 `io_submit()` 在文件最后一页可能阻塞。
-5. cuFile 和 staged MMAP 的 worker read 都从 IO driver 的 task start callback 中提交。
+5. cuFile 和 staged MMAP 的 worker read 都从 IO driver 的 task start callback 中提交，
+   沿用 IO task 的 request ID，共用完成回调通过 `try_reap_any` 回收 worker 结果。
    cuFile 在 worker task 内处理同步 partial read，公共 CUDA 路径只看到完整的 IO 结果。
-6. `ChunkExtraData.pending_worker_request_id` 是 worker task handle，用于 AIO last-page
-   提交以及 cuFile/MMAP worker 操作；它不是在途 chunk read 的计数器。
+6. AIO 完成事件直接推进读取，不等待 last-page helper 返回。`aio_last_page_submissions`
+   单独跟踪 helper 结果：成功返回只删除关联，提交错误触发重试或失败。
+   关闭时先回收迟到的 helper 结果，再 join helper 线程。
 
 这些细节不改变上文描述的数据路径，但修改 buffer sizing、io_uring 并发模型或 dtype 支持时需要考虑。
 

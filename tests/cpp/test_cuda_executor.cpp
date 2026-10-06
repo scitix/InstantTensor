@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <instant_tensor/cuda_executor.hpp>
@@ -50,18 +51,40 @@ void wait_until(const char* name, Predicate predicate) {
     }
 }
 
-IORequest submit_io(IOExecutor& executor, int id, std::atomic<bool>& ready) {
-    executor.submit(id, IOOperation{
-        [] {},
-        [&ready]() { return ready.load(); },
-    });
-    return IORequest{&executor, id, false};
-}
+struct MockIOExecutor {
+    std::mutex mutex;
+    std::unordered_set<int> started;
+    std::vector<IOCompletion> completed;
+    IOExecutor executor{[this](auto& output) {
+        std::lock_guard<std::mutex> lock(mutex);
+        output.swap(completed);
+    }, [] {}};
+
+    IORequest submit(int id, bool ready = true, std::exception_ptr error = {}) {
+        executor.submit(id, [this, id, ready, error]() {
+            std::lock_guard<std::mutex> lock(mutex);
+            started.insert(id);
+            if (ready) completed.push_back({id, error});
+            return IOSubmitStatus::Submitted;
+        });
+        return IORequest{&executor, id, false};
+    }
+
+    void complete(int id) {
+        wait_until("IO start", [&]() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return started.count(id) != 0;
+        });
+        std::lock_guard<std::mutex> lock(mutex);
+        completed.push_back({id, {}});
+    }
+
+    void join() { executor.join(); }
+};
 
 void test_ordered_launch_and_out_of_order_completion() {
-    IOExecutor io;
+    MockIOExecutor io;
     CUDAExecutor cuda(0);
-    std::atomic<bool> io_ready[2] = {false, false};
     std::mutex launch_mutex;
     std::vector<int> launch_order;
     std::vector<std::thread::id> launch_threads;
@@ -69,7 +92,7 @@ void test_ordered_launch_and_out_of_order_completion() {
     event_status[0] = cudaErrorNotReady;
     event_status[1] = cudaErrorNotReady;
     cuda.submit(0, CUDAOperation{
-        submit_io(io, 10, io_ready[0]),
+        io.submit(10, false),
         [&]() {
             std::lock_guard<std::mutex> lock(launch_mutex);
             launch_order.push_back(0);
@@ -78,7 +101,7 @@ void test_ordered_launch_and_out_of_order_completion() {
         reinterpret_cast<cudaEvent_t>(1),
     });
     cuda.submit(1, CUDAOperation{
-        submit_io(io, 11, io_ready[1]),
+        io.submit(11, false),
         [&]() {
             std::lock_guard<std::mutex> lock(launch_mutex);
             launch_order.push_back(1);
@@ -87,14 +110,14 @@ void test_ordered_launch_and_out_of_order_completion() {
         reinterpret_cast<cudaEvent_t>(2),
     });
 
-    io_ready[1] = true;
+    io.complete(11);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     {
         std::lock_guard<std::mutex> lock(launch_mutex);
         assert(launch_order.empty());
     }
 
-    io_ready[0] = true;
+    io.complete(10);
     wait_until("ordered launches", [&]() {
         std::lock_guard<std::mutex> lock(launch_mutex);
         return launch_order.size() == 2;
@@ -119,12 +142,11 @@ void test_ordered_launch_and_out_of_order_completion() {
 }
 
 void test_not_ready() {
-    IOExecutor io;
+    MockIOExecutor io;
     CUDAExecutor cuda(0);
-    std::atomic<bool> io_ready = true;
     event_status[2] = cudaErrorNotReady;
     cuda.submit(2, CUDAOperation{
-        submit_io(io, 12, io_ready),
+        io.submit(12),
         [] {},
         reinterpret_cast<cudaEvent_t>(3),
     });
@@ -140,14 +162,10 @@ void test_not_ready() {
 }
 
 void test_error_propagation() {
-    IOExecutor io;
+    MockIOExecutor io;
     CUDAExecutor cuda(0);
-    io.submit(13, IOOperation{
-        [] {},
-        []() -> bool { throw std::runtime_error("I/O failure"); },
-    });
     cuda.submit(3, CUDAOperation{
-        IORequest{&io, 13, false},
+        io.submit(13, true, std::make_exception_ptr(std::runtime_error("I/O failure"))),
         [] {},
         reinterpret_cast<cudaEvent_t>(4),
     });
@@ -166,24 +184,19 @@ void test_error_propagation() {
 }
 
 void test_io_failure_blocks_later_launches() {
-    IOExecutor io;
+    MockIOExecutor io;
     CUDAExecutor cuda(0);
-    std::atomic<bool> first_ready = false;
     std::atomic<bool> first_launched = false;
     std::atomic<bool> second_launched = false;
 
     event_status[0] = 0;
     cuda.submit(4, CUDAOperation{
-        submit_io(io, 14, first_ready),
+        io.submit(14, false),
         [&]() { first_launched = true; },
         reinterpret_cast<cudaEvent_t>(1),
     });
-    io.submit(15, IOOperation{
-        [] {},
-        []() -> bool { throw std::runtime_error("ordered I/O failure"); },
-    });
     cuda.submit(5, CUDAOperation{
-        IORequest{&io, 15, false},
+        io.submit(15, true, std::make_exception_ptr(std::runtime_error("ordered I/O failure"))),
         [&]() { second_launched = true; },
         reinterpret_cast<cudaEvent_t>(2),
     });
@@ -192,7 +205,7 @@ void test_io_failure_blocks_later_launches() {
     assert(!first_launched.load());
     assert(!second_launched.load());
 
-    first_ready = true;
+    io.complete(14);
     cuda.reap(4);
     bool threw = false;
     try {
@@ -211,17 +224,16 @@ void test_io_failure_blocks_later_launches() {
 
 void test_launch_and_query_errors() {
     {
-        IOExecutor io;
+        MockIOExecutor io;
         CUDAExecutor cuda(0);
-        std::atomic<bool> ready[2] = {true, true};
         std::atomic<bool> second_launched = false;
         cuda.submit(6, CUDAOperation{
-            submit_io(io, 16, ready[0]),
+            io.submit(16),
             [] { throw std::runtime_error("launch failure"); },
             reinterpret_cast<cudaEvent_t>(1),
         });
         cuda.submit(7, CUDAOperation{
-            submit_io(io, 17, ready[1]),
+            io.submit(17),
             [&]() { second_launched = true; },
             reinterpret_cast<cudaEvent_t>(2),
         });
@@ -242,12 +254,11 @@ void test_launch_and_query_errors() {
     }
 
     {
-        IOExecutor io;
+        MockIOExecutor io;
         CUDAExecutor cuda(0);
-        std::atomic<bool> ready = true;
         event_status[3] = 999;
         cuda.submit(8, CUDAOperation{
-            submit_io(io, 18, ready),
+            io.submit(18),
             [] {},
             reinterpret_cast<cudaEvent_t>(4),
         });
@@ -266,13 +277,12 @@ void test_launch_and_query_errors() {
 }
 
 void test_join_drains_pending_event() {
-    IOExecutor io;
+    MockIOExecutor io;
     CUDAExecutor cuda(0);
-    std::atomic<bool> ready = true;
     std::atomic<bool> launched = false;
     event_status[0] = cudaErrorNotReady;
     cuda.submit(9, CUDAOperation{
-        submit_io(io, 19, ready),
+        io.submit(19),
         [&]() { launched = true; },
         reinterpret_cast<cudaEvent_t>(1),
     });

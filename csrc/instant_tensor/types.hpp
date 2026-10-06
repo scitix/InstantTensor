@@ -21,12 +21,21 @@ inline size_t rank_logical_size(
 using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
 using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
 
-struct IOOperation {
-    std::function<void()> start;
-    std::function<bool()> poll;
+struct IOCompletion {
+    int request_id;
+    std::exception_ptr error;
+    bool retry = false;
 };
 
-using IOExecutorBase = SingleWorkerDriverExecutor<IOOperation, std::any,
+enum class IOSubmitStatus {
+    // Dispatched to the kernel/worker; completion will arrive through polling.
+    Submitted,
+    Retry,
+    // The IO stage is complete; CUDA/NCCL still follows the normal pipeline.
+    Completed,
+};
+
+using IOExecutorBase = SingleWorkerDriverExecutor<std::function<IOSubmitStatus()>, std::any,
                                                 MAX_IO_DEPTH, MAX_IO_DEPTH>;
 
 class IOExecutor;
@@ -126,15 +135,16 @@ struct TensorMetadate {
     chunk_id_t prefetch_chunk_id;
 };
 
-struct ChunkExtraData {
-    size_t total_logical_size;
+struct ChunkIOState {
+    int io_request_id;
+    // Rank-local read range and staging window, fixed before submission and across retries.
+    size_t rank_size;
+    size_t rank_file_offset;
+    size_t window_offset;
     size_t bytes_completed;
-    size_t request_file_offset;
-    size_t request_buffer_offset;
-    size_t request_logical_size;
-    // IO-driver-owned handle: AIO last-page submit or cuFile/MMAP read task.
-    // EXECUTOR_STOP_REQUEST_ID means no worker result is pending.
-    int pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
+    // Loader-owned handle for completion of IO, CUDA and optional NCCL work.
+    CUDAExecutor* cuda_executor;
+    int cuda_request_id;
 };
 
 struct IORequest {
@@ -143,18 +153,12 @@ struct IORequest {
     bool loaded_to_device;
 };
 
-struct ChunkRequest {
-    CUDAExecutor* executor;
-    int wait_handle;
-};
-
 struct Chunk {
     size_t size; // size of the chunk in bytes
     size_t file_index;
     size_t file_offset;
     size_t device_buffer_offset;
-    ChunkRequest request;
-    ChunkExtraData extra_data;
+    ChunkIOState io_state;
 };
 
 struct HostBufferCacheEntry {
@@ -170,6 +174,17 @@ struct FileInfo {
     off_t size;
     void* mapped_memory;
     CUfileHandle_t cufile_handle;
+};
+
+// Transient submission parameters; persistent IO parameters live in chunk.io_state.
+struct ChunkIOParams {
+    chunk_id_t chunk_id;
+    const Chunk &chunk;
+    const FileInfo &file;
+    size_t window_idx;
+    void *rank_dst;
+    void *all_dst;
+    cudaEvent_t event;
 };
 
 } // namespace instanttensor

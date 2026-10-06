@@ -6,7 +6,7 @@ namespace instanttensor {
 struct RPCHandle {
     int latest_req_id;
     SPSCQueue<RPCRequest>* input_queue;
-    SPSCQueue<RPCResponse>* output_queue;
+    std::shared_ptr<SPSCQueue<RPCResponse>> output_queue;
 };
 
 class LoaderManager {
@@ -50,11 +50,11 @@ public:
         this->device_idx = device_idx;
 
         int loader_handle = loader_id_iter++;
-        // input_queue and output_queue are deleted by Loader
+        // Keep the response queue alive until CLOSE's caller has consumed its reply.
         SPSCQueue<RPCRequest> *input_queue = new SPSCQueue<RPCRequest>();
-        SPSCQueue<RPCResponse> *output_queue = new SPSCQueue<RPCResponse>();
+        auto output_queue = std::make_shared<SPSCQueue<RPCResponse>>();
         this->loader_handle_to_queue[loader_handle] = RPCHandle{0, input_queue, output_queue};
-        std::thread loader_thread(run_loader, std::unique_ptr<SPSCQueue<RPCRequest>>(input_queue), std::unique_ptr<SPSCQueue<RPCResponse>>(output_queue));
+        std::thread loader_thread(run_loader, std::unique_ptr<SPSCQueue<RPCRequest>>(input_queue), output_queue);
         loader_thread.detach();
 
         ncclComm_t nccl_group_communicator = nullptr;

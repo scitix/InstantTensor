@@ -9,25 +9,10 @@
 
 namespace instanttensor {
 
-// Parameters computed in post_read_chunk preamble, passed to IO-specific methods
-struct ChunkIOParams {
-    chunk_id_t chunk_id;
-    const Chunk &chunk;
-    const FileInfo &file;
-    size_t padded_rank_size;
-    size_t rank_offset;
-    size_t rank_size;
-    size_t window_idx;
-    size_t window_offset;
-    void *rank_dst;
-    void *all_dst;
-    cudaEvent_t event;
-};
-
 class Loader {// NOTE: do not use any python object in pure C++ thread
 public:
     unique_ptr<SPSCQueue<RPCRequest>> input_queue;
-    unique_ptr<SPSCQueue<RPCResponse>> output_queue;
+    std::shared_ptr<SPSCQueue<RPCResponse>> output_queue;
 
     vector<FileInfo> file_info;
     bool use_internal_memory_register = false;
@@ -63,6 +48,7 @@ public:
     vector<struct iocb> aio_iocbs;
     vector<struct iocb*> aio_iocb_ptrs;
     vector<struct io_event> aio_events;
+    std::unordered_map<int, chunk_id_t> aio_last_page_submissions;
 
     // io_uring (loader_io_uring.cpp)
     bool uring_context_initialized = false;
@@ -70,6 +56,7 @@ public:
     bool uring_register_buffer = true; // **important for buffered IO performance**
     struct io_uring uring_ring = {};
     struct io_uring uring_ring_last_page = {};
+    size_t uring_reads_pending = 0;
 
     int device_idx = -1;
     ncclComm_t group_communicator = nullptr;
@@ -98,7 +85,7 @@ public:
     int next_io_worker_task_id();
 
     // Constructor
-    Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
+    Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 
     // Common methods (loader_common.cpp)
     void open_file();
@@ -107,6 +94,9 @@ public:
     void destroy_buffer();
     void init_threads();
     void destroy_threads();
+    void abort_io();
+    void poll_worker_completions(std::vector<IOCompletion> &completed);
+    IOCompletion complete_native_read(chunk_id_t id, ssize_t result);
     void compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets);
     void open(OpenArgs args);
     void close(CloseArgs args);
@@ -142,6 +132,10 @@ public:
     void initialize_aio_context();        // io_setup, allocate iocb arrays
     void destroy_aio_context();       // io_destroy
     IORequest post_read_chunk_aio(const ChunkIOParams &p);
+    IOSubmitStatus submit_read_aio(chunk_id_t id);
+    IOSubmitStatus schedule_read_aio(chunk_id_t id);
+    void poll_aio(std::vector<IOCompletion> &completed);
+    void drain_aio_submissions();
 
     // io_uring path (loader_io_uring.cpp)
     static BackendStatus uring_status();
@@ -149,11 +143,14 @@ public:
     void close_file_uring(FileInfo &f);  // close fd
     void initialize_uring_context();           // io_uring_queue_init
     void destroy_uring_context();          // io_uring_queue_exit
+    void abort_io_uring();
     void register_host_buffer_uring();
     void deregister_host_buffer_uring();
     IORequest post_read_chunk_uring(const ChunkIOParams &p);
+    IOSubmitStatus submit_read_uring(chunk_id_t id);
+    void poll_uring(std::vector<IOCompletion> &completed);
 };
 
-void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue);
+void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 
 } // namespace instanttensor

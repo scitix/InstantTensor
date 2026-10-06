@@ -35,45 +35,31 @@ void Loader::close_file_inmem(FileInfo &f) {
 }
 
 IORequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
-    chunk_id_t chunk_id = p.chunk_id;
     if (!this->use_internal_memory_register) {
-        ChunkExtraData &initial_state = this->chunks[chunk_id].extra_data;
-        initial_state.pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
-        void *rank_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset;
-        void *rank_mid = (char*)this->host_buffer + p.window_offset;
-        size_t rank_size = p.rank_size;
+        void *rank_src = (char*)p.file.mapped_memory + p.chunk.io_state.rank_file_offset;
+        void *rank_mid = (char*)this->host_buffer + p.chunk.io_state.window_offset;
+        size_t rank_size = p.chunk.io_state.rank_size;
+        int io_req_id = this->next_loader_task_id();
         auto io_start = [=]() {
-            ChunkExtraData &state = this->chunks[chunk_id].extra_data;
             if (rank_size > 0) {
-                state.pending_worker_request_id = this->next_io_worker_task_id();
-                this->worker_threads->submit(state.pending_worker_request_id, [=]() {
+                this->worker_threads->submit(io_req_id, [=]() {
                     memcpy(rank_mid, rank_src, rank_size);
                 });
+            } else {
+                return IOSubmitStatus::Completed;
             }
+            return IOSubmitStatus::Submitted;
         };
-        auto io_func = [=]() -> bool {
-            ChunkExtraData &state = this->chunks[chunk_id].extra_data;
-            if (state.pending_worker_request_id != EXECUTOR_STOP_REQUEST_ID) {
-                std::any ignored;
-                if (!this->worker_threads->try_reap(state.pending_worker_request_id, ignored)) {
-                    return false;
-                }
-                state.pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
-            }
-            return true;
-        };
-        int io_req_id = this->next_loader_task_id();
-        this->io_thread->submit(io_req_id, IOOperation{std::move(io_start), std::move(io_func)});
+        this->io_thread->submit(io_req_id, std::move(io_start));
         return IORequest{this->io_thread.get(), io_req_id, false};
     }
     else {
-        void *rank_src = (char*)p.file.mapped_memory + p.chunk.file_offset + p.rank_offset;
+        void *rank_src = (char*)p.file.mapped_memory + p.chunk.io_state.rank_file_offset;
         void *rank_dst = p.rank_dst;
-        size_t rank_size = p.rank_size;
+        size_t rank_size = p.chunk.io_state.rank_size;
         CUDA_CHECK(cudaMemcpyAsync(rank_dst, rank_src, rank_size, cudaMemcpyHostToDevice, this->cuda_stream));// use default stream 0
-        auto io_func = []() -> bool { return true; };
         int io_req_id = this->next_loader_task_id();
-        this->io_thread->submit(io_req_id, IOOperation{[] {}, std::move(io_func)});
+        this->io_thread->submit(io_req_id, []() { return IOSubmitStatus::Completed; });
         return IORequest{this->io_thread.get(), io_req_id, true};
     }
 }

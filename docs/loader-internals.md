@@ -863,17 +863,19 @@ synchronization and lifetime control.
 2. `concurrency` only controls the MMAP/cuFile worker pool. It does not affect chunk geometry, buffers, AIO, or io_uring.
 3. Non-increasing tensor element sizes preserve zero-copy alignment after the first tensor is aligned to 16 bytes. Other orders may create unaligned addresses; the frontend clones those tensors as `int8` before dtype reinterpretation and retains the returned-address divisibility check as a final guard.
 
-4. The current I/O path uses one poll-based `IOWorkerDriver` to own AIO/io_uring
-   submission and completion. It keeps multiple active tasks, yields when no
-   completion is available, and only publishes a task after its logical payload is
-   complete. AIO non-page-aligned tail submission may use the dedicated
+4. All backends use one poll-based `IOWorkerDriver` and `poll_completions` to
+   return completed request IDs without per-task polling. The driver publishes
+   completions between submissions, yields when none are available, and only
+   publishes a task after its logical payload is complete. AIO tail submission may use the dedicated
    `last_page_reader_thread` because `io_submit()` can block on the final file page.
 5. cuFile and staged MMAP worker reads are submitted from the I/O driver's task
-   start callback. cuFile handles synchronous partial reads inside the worker task;
-   the common CUDA path sees only complete I/O results.
-6. `pending_worker_request_id` is a worker-task handle in `ChunkExtraData`; it is
-   used for AIO last-page submission and cuFile/MMAP worker operations. It is not
-   a count of in-flight chunk reads.
+   start callback, using the same request ID as the IO task. Their shared completion
+   callback drains worker results with `try_reap_any`. cuFile handles synchronous
+   partial reads inside the worker task; CUDA sees only complete I/O results.
+6. AIO completion events advance reads without waiting for the last-page helper
+   to return. `aio_last_page_submissions` tracks helper results separately: successful
+   returns only remove the association, while submission errors trigger retry or
+   failure. Shutdown drains late helper results before joining the helper thread.
 
 ## 11. Acceptance Criteria
 

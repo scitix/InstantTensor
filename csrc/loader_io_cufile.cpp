@@ -43,16 +43,13 @@ void Loader::deregister_device_buffer_cufile() {
 IORequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
     CUfileHandle_t handle = p.file.cufile_handle;
-    size_t file_offset = p.chunk.file_offset + p.rank_offset;
-    size_t device_offset = p.chunk.device_buffer_offset + p.rank_offset;
-    size_t logical_size = p.rank_size;
-    ChunkExtraData &initial_state = this->chunks[chunk_id].extra_data;
-    initial_state.pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
+    size_t file_offset = p.chunk.io_state.rank_file_offset;
+    size_t device_offset = p.chunk.device_buffer_offset + (file_offset - p.chunk.file_offset);
+    size_t logical_size = p.chunk.io_state.rank_size;
+    int io_req_id = this->next_loader_task_id();
     auto io_start = [=]() {
-        ChunkExtraData &state = this->chunks[chunk_id].extra_data;
         if (logical_size > 0) {
-            state.pending_worker_request_id = this->next_io_worker_task_id();
-            this->worker_threads->submit(state.pending_worker_request_id, [=]() {
+            this->worker_threads->submit(io_req_id, [=]() {
                 size_t bytes_completed = 0;
                 while (bytes_completed < logical_size) {
                     size_t remaining = logical_size - bytes_completed;
@@ -76,21 +73,12 @@ IORequest Loader::post_read_chunk_cufile(const ChunkIOParams &p) {
                     bytes_completed += static_cast<size_t>(ret);
                 }
             });
+        } else {
+            return IOSubmitStatus::Completed;
         }
+        return IOSubmitStatus::Submitted;
     };
-    auto io_func = [=]() -> bool {
-        ChunkExtraData &state = this->chunks[chunk_id].extra_data;
-        if (state.pending_worker_request_id != EXECUTOR_STOP_REQUEST_ID) {
-            std::any result;
-            if (!this->worker_threads->try_reap(state.pending_worker_request_id, result)) {
-                return false;
-            }
-            state.pending_worker_request_id = EXECUTOR_STOP_REQUEST_ID;
-        }
-        return true;
-    };
-    int io_req_id = this->next_loader_task_id();
-    this->io_thread->submit(io_req_id, IOOperation{std::move(io_start), std::move(io_func)});
+    this->io_thread->submit(io_req_id, std::move(io_start));
     return IORequest{this->io_thread.get(), io_req_id, true};
 }
 

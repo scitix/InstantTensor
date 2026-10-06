@@ -4,8 +4,7 @@
 
 namespace instanttensor {
 
-// The loader thread prepares and submits SQEs. The CUDA completion worker consumes
-// CQEs before launching H2D and NCCL work. Each side has a single ring caller.
+// The IO worker owns both SQ and CQ. CUDA sees only complete logical reads.
 
 #define IO_URING_REGISTER_BUFFER_SIZE (1<<30) // 1GiB buffer size limit
 
@@ -179,6 +178,7 @@ void Loader::initialize_uring_context() {
         throw std::runtime_error(
             "io_uring_queue_init failed: " + std::string(strerror(-ret)));
     }
+    this->uring_context_initialized = true;
     // Since the SQ and CQ of uring both operate in SPSC mode, we use an extra ring to submit IO for the last page.
     // ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring_last_page, 0);
     // if (ret < 0) {
@@ -208,12 +208,34 @@ void Loader::close_file_uring(FileInfo &f) {
 }
 
 void Loader::destroy_uring_context() {
+    if (!this->uring_context_initialized) return;
     if(this->uring_register_file) {
         io_uring_unregister_files(&this->uring_ring);
     }
 
     // io_uring_queue_exit(&this->uring_ring_last_page);
     io_uring_queue_exit(&this->uring_ring);
+    this->uring_context_initialized = false;
+}
+
+void Loader::abort_io_uring() {
+    // close(ring_fd) alone need not synchronously finish kernel teardown.
+    // Drain accepted reads before unpinning or releasing their host windows.
+    while (this->uring_reads_pending != 0) {
+        struct io_uring_cqe *cqe;
+        int ret = io_uring_wait_cqe(&this->uring_ring, &cqe);
+        if (ret == -EINTR || ret == -EAGAIN) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (ret != 0) {
+            throw std::runtime_error("Failed to drain io_uring: " + std::string(strerror(-ret)));
+        }
+        io_uring_cqe_seen(&this->uring_ring, cqe);
+        --this->uring_reads_pending;
+    }
+    this->deregister_host_buffer_uring();
+    this->destroy_uring_context();
 }
 
 void Loader::register_host_buffer_uring() {
@@ -237,175 +259,104 @@ void Loader::register_host_buffer_uring() {
 }
 
 void Loader::deregister_host_buffer_uring() {
-    if(this->uring_register_buffer) {
+    if(this->uring_context_initialized && this->uring_register_buffer) {
         io_uring_unregister_buffers(&this->uring_ring);
     }
 }
 
 // ─── chunk read ──────────────────────────────────────────────────────────────
 
+IOSubmitStatus Loader::submit_read_uring(chunk_id_t id) {
+    Chunk &chunk = this->chunks[id];
+    const ChunkIOState &state = chunk.io_state;
+    if (state.bytes_completed >= state.rank_size) {
+        return IOSubmitStatus::Completed;
+    }
+    size_t read_offset = ROUND_DOWN(state.bytes_completed, this->rank_alignment);
+    size_t remaining_size = state.rank_size - read_offset;
+    size_t rank_size_aligned = ROUND_UP(remaining_size, this->rank_alignment);
+    bool unaligned_last_page = remaining_size != rank_size_aligned;
+    void *buf = (char*)this->host_buffer + state.window_offset + read_offset;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
+    if (!sqe) {
+        throw std::runtime_error("io_uring SQ full");
+    }
+    int file_handle = this->uring_register_file
+        ? static_cast<int>(chunk.file_index)
+        : this->file_info[chunk.file_index].fd;
+    int buffer_index = -1;
+    if (this->uring_register_buffer) {
+        size_t left = ((char*)buf - (char*)this->host_buffer_entry.ptr) /
+            IO_URING_REGISTER_BUFFER_SIZE;
+        size_t right = ((char*)buf + rank_size_aligned - 1 -
+            (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+        if (left == right) {
+            buffer_index = static_cast<int>(left);
+        }
+    }
+    if (buffer_index != -1) {
+        io_uring_prep_read_fixed(sqe, file_handle, buf,
+            static_cast<unsigned>(rank_size_aligned),
+            state.rank_file_offset + read_offset, buffer_index);
+    } else {
+        io_uring_prep_read(sqe, file_handle, buf,
+            static_cast<unsigned>(rank_size_aligned),
+            state.rank_file_offset + read_offset);
+    }
+    if (this->uring_register_file) {
+        sqe->flags |= IOSQE_FIXED_FILE;
+    }
+    if (this->backend == Backend::URING_BUFFERED || unaligned_last_page) {
+        sqe->flags |= IOSQE_ASYNC;
+    }
+    io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(id));
+    // submit() may already have flushed the SQE; retry without preparing another.
+    while (true) {
+        int ret = io_uring_submit(&this->uring_ring);
+        if (ret == -EAGAIN || ret == -EINTR || ret == 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (ret != 1) {
+            throw std::runtime_error("io_uring_submit failed: " + std::string(strerror(-ret)));
+        }
+        break;
+    }
+    ++this->uring_reads_pending;
+    return IOSubmitStatus::Submitted;
+}
+
+void Loader::poll_uring(std::vector<IOCompletion> &completed) {
+    struct io_uring_cqe *cqes[MAX_IO_DEPTH];
+    unsigned count = io_uring_peek_batch_cqe(
+        &this->uring_ring, cqes, static_cast<unsigned>(this->io_depth));
+    if (count == 0) {
+        // Batch peek hides CQ flush errors; preserve the single-peek error path.
+        int ret = io_uring_peek_cqe(&this->uring_ring, &cqes[0]);
+        if (ret == -EAGAIN || ret == -EINTR) return;
+        if (ret != 0) {
+            throw std::runtime_error("io_uring_peek_cqe failed: " + std::string(strerror(-ret)));
+        }
+        count = 1;
+    }
+    completed.reserve(completed.size() + count);
+    for (unsigned i = 0; i < count; ++i) {
+        chunk_id_t id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqes[i]));
+        completed.push_back(this->complete_native_read(id, cqes[i]->res));
+    }
+    io_uring_cq_advance(&this->uring_ring, count);
+    this->uring_reads_pending -= count;
+}
+
 IORequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
-    chunk_id_t chunk_id = p.chunk_id;
-    ChunkExtraData &initial_state = this->chunks[chunk_id].extra_data;
-    initial_state.total_logical_size = p.rank_size;
-    initial_state.bytes_completed = 0;
-    initial_state.request_file_offset = p.chunk.file_offset + p.rank_offset;
-    initial_state.request_buffer_offset = p.window_offset;
-    initial_state.request_logical_size = p.rank_size;
-
-    auto submit_chunk = [this](chunk_id_t id) {
-        Chunk &chunk = this->chunks[id];
-        ChunkExtraData &state = chunk.extra_data;
-        if (state.request_logical_size == 0) {
-            return;
-        }
-        size_t rank_size_aligned = ROUND_UP(state.request_logical_size, this->rank_alignment);
-        bool unaligned_last_page = state.request_logical_size != rank_size_aligned;
-        void *buf = (char*)this->host_buffer + state.request_buffer_offset;
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
-        if (!sqe) {
-            throw std::runtime_error("io_uring SQ full");
-        }
-        int file_handle = this->uring_register_file
-            ? static_cast<int>(chunk.file_index)
-            : this->file_info[chunk.file_index].fd;
-        int buffer_index = -1;
-        if (this->uring_register_buffer) {
-            size_t left = ((char*)buf - (char*)this->host_buffer_entry.ptr) /
-                IO_URING_REGISTER_BUFFER_SIZE;
-            size_t right = ((char*)buf + rank_size_aligned - 1 -
-                (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
-            if (left == right) {
-                buffer_index = static_cast<int>(left);
-            }
-        }
-        if (buffer_index != -1) {
-            io_uring_prep_read_fixed(sqe, file_handle, buf,
-                static_cast<unsigned>(rank_size_aligned),
-                state.request_file_offset, buffer_index);
-        } else {
-            io_uring_prep_read(sqe, file_handle, buf,
-                static_cast<unsigned>(rank_size_aligned),
-                state.request_file_offset);
-        }
-        if (this->uring_register_file) {
-            sqe->flags |= IOSQE_FIXED_FILE;
-        }
-        if (this->backend == Backend::URING_BUFFERED || unaligned_last_page) {
-            sqe->flags |= IOSQE_ASYNC;
-        }
-        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(id));
-        size_t submitted = 0;
-        while (submitted < 1) {
-            int ret = io_uring_submit(&this->uring_ring);
-            if (ret < 0) {
-                if (ret == -EAGAIN || ret == -EINTR) {
-                    if (!this->io_retry_warning_emitted) {
-                        fprintf(stderr, "[InstantTensor][WARN] retrying io_uring submit for chunk %zd after %s\n",
-                            id, strerror(-ret));
-                        this->io_retry_warning_emitted = true;
-                    }
-                    std::this_thread::yield();
-                    continue;
-                }
-                throw std::runtime_error(
-                    "io_uring_submit failed: " + std::string(strerror(-ret)));
-            }
-            submitted += ret;
-            if (ret == 0) {
-                if (!this->io_retry_warning_emitted) {
-                    fprintf(stderr, "[InstantTensor][WARN] retrying io_uring submit for chunk %zd after zero submission\n", id);
-                    this->io_retry_warning_emitted = true;
-                }
-                std::this_thread::yield();
-            }
-        }
-    };
-
-    // Consume CQEs and publish a complete host read to the common CUDA path.
-    auto io_func = [=]() -> bool {
-        ChunkExtraData &state = this->chunks[chunk_id].extra_data;
-        for (size_t i = 0; i < this->io_depth &&
-             state.bytes_completed < state.total_logical_size; ++i) {
-            struct io_uring_cqe *cqe;
-            int ret = io_uring_peek_cqe(&this->uring_ring, &cqe);
-            if (ret == -EAGAIN) {
-                break;
-            }
-            if (ret == -EINTR) {
-                if (!this->io_retry_warning_emitted) {
-                    fprintf(stderr, "[InstantTensor][WARN] retrying io_uring completion poll for chunk %zd after EINTR\n", chunk_id);
-                    this->io_retry_warning_emitted = true;
-                }
-                return false;
-            }
-            if (ret != 0) {
-                throw std::runtime_error(
-                    "io_uring_peek_cqe failed: " + std::string(strerror(-ret)));
-            }
-            chunk_id_t cqe_chunk_id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqe));
-            Chunk &cqe_chunk = this->chunks[cqe_chunk_id];
-            ChunkExtraData &event_state = cqe_chunk.extra_data;
-            if (cqe->res < 0) {
-                int error = -cqe->res;
-                io_uring_cqe_seen(&this->uring_ring, cqe);
-                if (error == EAGAIN || error == EINTR) {
-                    if (!this->io_retry_warning_emitted) {
-                        fprintf(stderr, "[InstantTensor][WARN] retrying io_uring read for chunk %zd after %s\n",
-                            cqe_chunk_id, strerror(error));
-                        this->io_retry_warning_emitted = true;
-                    }
-                    submit_chunk(cqe_chunk_id);
-                    continue;
-                }
-                std::string msg =
-                    "io_uring read error for chunk id: " + std::to_string(cqe_chunk_id) + ", error: " + std::string(strerror(error));
-                throw std::runtime_error(msg);
-            }
-            size_t padded_world_size = ROUND_UP(cqe_chunk.size, this->world_chunk_alignment);
-            size_t padded_rank_size = padded_world_size / this->world_size;
-            size_t logical_size = rank_logical_size(
-                cqe_chunk.size, padded_rank_size * this->rank, padded_rank_size);
-            size_t original_file_offset = cqe_chunk.file_offset +
-                padded_rank_size * this->rank;
-            if(static_cast<size_t>(cqe->res) < logical_size) {
-                int bytes_read = cqe->res;
-                io_uring_cqe_seen(&this->uring_ring, cqe);
-                struct stat st;
-                if (fstat(this->file_info[cqe_chunk.file_index].fd, &st) != 0 ||
-                    static_cast<size_t>(st.st_size) < cqe_chunk.file_offset +
-                        padded_rank_size * this->rank + logical_size) {
-                    throw std::runtime_error(
-                        "Unexpected io_uring short read at EOF: chunk_id=" +
-                        std::to_string(cqe_chunk_id) + ", bytes_read=" +
-                        std::to_string(bytes_read) + ", logical_size=" +
-                        std::to_string(logical_size));
-                }
-                size_t covered = event_state.request_file_offset - original_file_offset +
-                    static_cast<size_t>(bytes_read);
-                event_state.bytes_completed = std::min(
-                    logical_size, std::max(event_state.bytes_completed, covered));
-                size_t retry_offset = ROUND_DOWN(
-                    original_file_offset + event_state.bytes_completed,
-                    this->rank_alignment);
-                event_state.request_file_offset = retry_offset;
-                event_state.request_buffer_offset =
-                    (cqe_chunk_id % this->io_depth) * this->rank_chunk_size +
-                    (retry_offset - original_file_offset);
-                event_state.request_logical_size =
-                    original_file_offset + logical_size - retry_offset;
-                submit_chunk(cqe_chunk_id);
-                continue;
-            }
-            event_state.bytes_completed = logical_size;
-            io_uring_cqe_seen(&this->uring_ring, cqe);
-        }
-        return state.bytes_completed >= state.total_logical_size;
-    };
-    int io_req_id = this->next_loader_task_id();
-    this->io_thread->submit(io_req_id, IOOperation{
-        [=]() { submit_chunk(chunk_id); }, std::move(io_func)});
-    return IORequest{this->io_thread.get(), io_req_id, false};
+    chunk_id_t id = p.chunk_id;
+    ChunkIOState &state = this->chunks[id].io_state;
+    int request_id = this->next_loader_task_id();
+    state.io_request_id = request_id;
+    state.bytes_completed = 0;
+    this->io_thread->submit(request_id,
+        [this, id]() { return this->submit_read_uring(id); });
+    return IORequest{this->io_thread.get(), request_id, false};
 }
 
 } // namespace instanttensor

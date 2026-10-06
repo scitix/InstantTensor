@@ -16,7 +16,7 @@ int Loader::next_io_worker_task_id() {
     return request_id;
 }
 
-Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
+Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue) {
     this->input_queue = std::move(input_queue);
     this->output_queue = std::move(output_queue);
     this->use_internal_memory_register = _env_use_internal_memory_register();
@@ -157,7 +157,16 @@ void Loader::init_threads() {
         }
     }
     if(!this->io_thread) {
-        this->io_thread = std::make_unique<IOExecutor>();
+        IOWorkerDriver::PollCompletions poll;
+        if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+            poll = [this](auto& completed) { this->poll_aio(completed); };
+        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+            poll = [this](auto& completed) { this->poll_uring(completed); };
+        } else {
+            poll = [this](auto& completed) { this->poll_worker_completions(completed); };
+        }
+        this->io_thread = std::make_unique<IOExecutor>(
+            std::move(poll), [this]() { this->abort_io(); });
     }
     if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         if (!this->last_page_reader_thread) {
@@ -190,6 +199,63 @@ void Loader::init_threads() {
     }
 }
 
+void Loader::poll_worker_completions(std::vector<IOCompletion> &completed) {
+    if (!this->worker_threads) return;
+    ThreadPoolTaskExecutor::ResultItem result;
+    while (this->worker_threads->try_reap_any(result)) {
+        std::exception_ptr error;
+        if (result.value.type() == typeid(std::exception_ptr)) {
+            error = std::any_cast<std::exception_ptr>(result.value);
+        }
+        completed.push_back({result.request_id, error});
+    }
+}
+
+void Loader::abort_io() {
+    if (this->worker_threads) {
+        this->worker_threads->join();
+    }
+    if (this->aio_context_initialized) {
+        if (this->last_page_reader_thread) {
+            this->drain_aio_submissions();
+            this->last_page_reader_thread->join();
+        }
+        this->destroy_aio_context();
+        this->aio_last_page_submissions.clear();
+    }
+    if (this->uring_context_initialized) {
+        this->abort_io_uring();
+    }
+}
+
+IOCompletion Loader::complete_native_read(chunk_id_t id, ssize_t result) {
+    Chunk &chunk = this->chunks[id];
+    ChunkIOState &state = chunk.io_state;
+    IOCompletion completion{state.io_request_id, {}};
+    try {
+        if (result == -EAGAIN || result == -EINTR) {
+            completion.retry = true;
+            return completion;
+        }
+        std::string name = backend_to_string(this->backend);
+        if (result < 0) {
+            throw std::runtime_error(name + " read error for chunk id: " +
+                std::to_string(id) + ", error: " + strerror(-result));
+        }
+        size_t read_offset = ROUND_DOWN(state.bytes_completed, this->rank_alignment);
+        size_t covered = read_offset + static_cast<size_t>(result);
+        state.bytes_completed = std::min(state.rank_size,
+            std::max(state.bytes_completed, covered));
+        if (state.bytes_completed >= state.rank_size) {
+            return completion;
+        }
+        completion.retry = true;
+    } catch (...) {
+        completion.error = std::current_exception();
+    }
+    return completion;
+}
+
 void Loader::destroy_threads() {
     if (this->cuda_executor) {
         this->cuda_executor->join();
@@ -201,6 +267,7 @@ void Loader::destroy_threads() {
         this->worker_threads->join();
     }
     if (this->last_page_reader_thread) {
+        this->drain_aio_submissions();
         this->last_page_reader_thread->join();
     }
     if (this->cuda_stream) {
@@ -259,7 +326,7 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets) 
             return;
         }
         // ROUND_UP/DOWN make real effect only at the right most chunk
-        this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}, {}});
+        this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}});
 
         if(chunk_file_offset % this->rank_alignment != 0) {
             throw std::runtime_error("Internal error: Chunk alignment error.");
@@ -513,8 +580,10 @@ void Loader::post_read_chunk() {
     // }
 
     FileInfo &f = this->file_info[chunk.file_index];
-    ChunkIOParams params{chunk_id, chunk, f, padded_rank_size,
-                         rank_offset, rank_size, window_idx, window_offset, rank_dst, all_dst, event};
+    chunk.io_state.rank_size = rank_size;
+    chunk.io_state.rank_file_offset = chunk.file_offset + rank_offset;
+    chunk.io_state.window_offset = window_offset;
+    ChunkIOParams params{chunk_id, chunk, f, window_idx, rank_dst, all_dst, event};
 
     IORequest io_request;
     if (this->backend == Backend::MMAP) {
@@ -547,16 +616,17 @@ void Loader::post_read_chunk() {
     int completion_req_id = this->next_loader_task_id();
     this->cuda_executor->submit(completion_req_id, CUDAOperation{
         io_request, std::move(launch), event});
-    this->chunks[chunk_id].request = ChunkRequest{
-        this->cuda_executor.get(), completion_req_id};
+    ChunkIOState &state = chunk.io_state;
+    state.cuda_executor = this->cuda_executor.get();
+    state.cuda_request_id = completion_req_id;
 }
 
 void Loader::poll_read_chunk() {
     chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
     while(next_chunck_id <= this->chunk_reading.load(std::memory_order_relaxed)) {
-        ChunkRequest &request = this->chunks[next_chunck_id].request;
+        ChunkIOState &state = this->chunks[next_chunck_id].io_state;
         std::any ignored;
-        if(!request.executor->try_reap(request.wait_handle, ignored)) {
+        if(!state.cuda_executor->try_reap(state.cuda_request_id, ignored)) {
             break;
         }
         next_chunck_id++;
@@ -570,8 +640,8 @@ void Loader::wait_read_chunk(chunk_id_t chunk_id) {
         print_and_throw(std::runtime_error("Internal error: chunk_id out of range."));
     }
     while(next_chunck_id <= chunk_id) {
-        ChunkRequest &request = this->chunks[next_chunck_id].request;
-        request.executor->reap(request.wait_handle);
+        ChunkIOState &state = this->chunks[next_chunck_id].io_state;
+        state.cuda_executor->reap(state.cuda_request_id);
         next_chunck_id++;
     }
     this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
@@ -694,7 +764,7 @@ void Loader::run() {
     }
 }
 
-void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, unique_ptr<SPSCQueue<RPCResponse>> output_queue) {
+void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue) {
     try {
         Loader loader(std::move(input_queue), std::move(output_queue));
         loader.run();

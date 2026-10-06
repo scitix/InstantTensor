@@ -155,6 +155,17 @@ public:
         return take_until_ready(request_id, result);
     }
 
+    // Reaper side only. Returns the raw result (including any exception payload).
+    bool try_reap_any(ResultItem& result) {
+        if (!completed_results.empty()) {
+            auto it = completed_results.begin();
+            result = ResultItem{it->first, std::move(it->second)};
+            completed_results.erase(it);
+            return true;
+        }
+        return result_queue.try_pop(result);
+    }
+
     // Reaper side only.
     void reap(int request_id, Result& result) {
         if (take_cached_result(request_id, result)) {
