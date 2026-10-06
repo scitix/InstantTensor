@@ -72,7 +72,7 @@ class BuildExt(build_ext):
             libaio_clean_cmd = ["make", "--silent", "-C", libaio_dir, "clean"]
             print(" ".join(libaio_clean_cmd))
             subprocess.run(libaio_clean_cmd, check=True)
-            liburing_clean_cmd = ["make", "--silent", "-C", liburing_dir, "clean"]
+            liburing_clean_cmd = ["make", "--silent", "-C", liburing_src, "clean"]
             print(" ".join(liburing_clean_cmd))
             subprocess.run(liburing_clean_cmd, check=True)
             liburing_config_log = os.path.join(liburing_dir, "config.log")

@@ -1,5 +1,13 @@
 recursive-include csrc *
 
+prune csrc/third_party/atomic_queue/results
+prune csrc/third_party/pybind11/tests
+prune csrc/third_party/pybind11/docs
+prune csrc/third_party/liburing/man
+prune csrc/third_party/dlpack/docs
+prune csrc/third_party/liburing/test
+prune csrc/third_party/liburing/examples
+
 global-exclude *.py[cod] __pycache__ *.o *.os *.ol *.a *.so *.so.* *.dylib *.dll
 prune build
 prune dist
