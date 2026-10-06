@@ -1,5 +1,6 @@
 #include <cassert>
 #include <atomic>
+#include <cmath>
 #include <deque>
 #include <mutex>
 #include <instant_tensor/loader.hpp>
@@ -235,6 +236,44 @@ void check_completed_status() {
     result = driver.process_tasks();
     assert(result.size() == 2 && result[0].request_id == 3 && result[1].request_id == 2);
     assert(polls == 2 && !driver.has_pending_tasks());
+}
+
+void check_io_statistics(bool enabled) {
+    IOWorkerDriver::Statistics stats;
+    {
+        IOWorkerDriver driver([](auto&) {}, [] { assert(false); }, enabled ? &stats : nullptr);
+        assert(driver.average_active_tasks() == 0);
+        int attempts = 0;
+        driver.add_task(IOWorkerDriver::TaskItem::make_task(0, [&] {
+            return ++attempts < 3 ? IOSubmitStatus::Retry : IOSubmitStatus::Completed;
+        }));
+        assert(driver.process_tasks().empty());
+        assert(driver.process_tasks().empty());
+        assert(driver.process_tasks().size() == 1);
+        assert(!driver.has_pending_tasks());
+        double average = driver.average_active_tasks();
+        assert(std::abs(average - (enabled ? 1.0 : 0.0)) < 1e-9);
+        for (int i = 0; i < 100; ++i) assert(driver.process_tasks().empty());
+        assert(driver.average_active_tasks() == average);
+    }
+    // Statistics survive the worker driver and are read only after it has drained.
+    assert(std::abs(stats.average_active_tasks() - (enabled ? 1.0 : 0.0)) < 1e-9);
+}
+
+void check_io_statistics_on_abort() {
+    IOWorkerDriver::Statistics stats;
+    int aborts = 0;
+    IOWorkerDriver driver([](auto&) {}, [&] { ++aborts; }, &stats);
+    driver.add_task(IOWorkerDriver::TaskItem::make_task(0,
+        [] { return IOSubmitStatus::Submitted; }));
+    assert(driver.process_tasks().empty());
+    driver.add_task(IOWorkerDriver::TaskItem::make_task(1, []() -> IOSubmitStatus {
+        throw std::runtime_error("submit failed");
+    }));
+    assert(driver.process_tasks().size() == 2 && aborts == 1);
+    assert(!driver.has_pending_tasks());
+    double average = driver.average_active_tasks();
+    assert(std::isfinite(average) && average >= 1 && average <= 2);
 }
 
 struct Fixture {
@@ -735,6 +774,9 @@ int main() {
     check_publishing();
     check_driver();
     check_completed_status();
+    check_io_statistics(false);
+    check_io_statistics(true);
+    check_io_statistics_on_abort();
     check_close_reply_lifetime();
     check_chunk_completion_handles();
     check_worker_poll_batch();

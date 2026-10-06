@@ -166,7 +166,8 @@ void Loader::init_threads() {
             poll = [this](auto& completed) { this->poll_worker_completions(completed); };
         }
         this->io_thread = std::make_unique<IOExecutor>(
-            std::move(poll), [this]() { this->abort_io(); });
+            std::move(poll), [this]() { this->abort_io(); },
+            _env_debug() ? &this->io_stats : nullptr);
     }
     if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
         if (!this->last_page_reader_thread) {
@@ -174,7 +175,8 @@ void Loader::init_threads() {
         }
     }
     if(!this->cuda_executor) {
-        this->cuda_executor = std::make_unique<CUDAExecutor>(this->device_idx);
+        this->cuda_executor = std::make_unique<CUDAExecutor>(
+            this->device_idx, _env_debug() ? &this->cuda_stats : nullptr);
     }
     if(!this->cuda_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->cuda_stream, cudaStreamNonBlocking));
@@ -188,15 +190,6 @@ void Loader::init_threads() {
         CUDA_CHECK(cudaEventCreateWithFlags(&this->cuda_events[i], cudaEventDisableTiming));
     }
 
-    if(_env_debug()) {
-        this->io_depth_sample_thread = std::thread([=]() {
-            while(!this->stop) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                this->io_depth_sum += this->chunk_reading - this->chunk_read;
-                this->io_depth_sample ++;
-            }
-        });
-    }
 }
 
 void Loader::poll_worker_completions(std::vector<IOCompletion> &completed) {
@@ -275,9 +268,6 @@ void Loader::destroy_threads() {
     }
     if (this->nccl_stream) {
         CUDA_CHECK(cudaStreamDestroy(this->nccl_stream));
-    }
-    if(this->io_depth_sample_thread.joinable()) {
-        this->io_depth_sample_thread.join();
     }
 }
 
@@ -530,7 +520,9 @@ void Loader::close(CloseArgs args) {
     std::chrono::duration<double> d4 = t4 - t3;
     if(_env_debug()) {
         debug_log("Close time: threads=%f, buffer=%f, file=%f, comm=%f", d1.count(), d2.count(), d3.count(), d4.count());
-        debug_log("Average io_depth = %.2lf", 1.0 * this->io_depth_sum / this->io_depth_sample);
+        auto counts = this->cuda_stats.average_stage_counts();
+        debug_log("Average queue depth: IO=%.3f, IO_READY=%.3f, CUDA=%.3f",
+            this->io_stats.average_active_tasks(), counts[0], counts[1]);
     }
 }
 

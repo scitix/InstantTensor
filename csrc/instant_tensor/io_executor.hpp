@@ -1,6 +1,7 @@
 #pragma once
 
 #include <any>
+#include <chrono>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -17,10 +18,28 @@ public:
     using TaskItem = typename Base::TaskItem;
     using ResultItem = typename Base::ResultItem;
     using PollCompletions = std::function<void(std::vector<IOCompletion>&)>;
+    using Clock = std::chrono::steady_clock;
+
+    struct Statistics {
+        bool started = false;
+        Clock::time_point start{}, end{};
+        double active_task_seconds = 0;
+
+        double average_active_tasks() const {
+            double seconds = std::chrono::duration<double>(end - start).count();
+            return seconds > 0 ? active_task_seconds / seconds : 0;
+        }
+    };
 
     IOWorkerDriver(PollCompletions poll_completions,
-                   std::function<void()> abort_io)
-        : poll_completions(std::move(poll_completions)), abort_io(std::move(abort_io)) {}
+                   std::function<void()> abort_io, Statistics* stats = nullptr)
+        : poll_completions(std::move(poll_completions)), abort_io(std::move(abort_io)),
+          stats(stats) {}
+
+    // Worker side, after drain. Excludes tasks still waiting in the executor input queue.
+    double average_active_tasks() const {
+        return stats ? stats->average_active_tasks() : 0;
+    }
 
     bool can_add_task() const override {
         return !stopping && pending_submissions.empty() &&
@@ -33,6 +52,7 @@ public:
 
     void add_task(TaskItem&& task) override {
         int id = task.request_id;
+        record_active_tasks();
         active_tasks.emplace(id, std::move(task));
         pending_submissions.push_back(id);
     }
@@ -81,6 +101,21 @@ private:
     std::function<void()> abort_io;
     std::exception_ptr failure;
     bool stopping = false;
+    Statistics* stats;
+
+    // Integrate the old count immediately before changing active_tasks.
+    void record_active_tasks() {
+        if (!stats) return;
+        auto now = Clock::now();
+        if (!stats->started) {
+            stats->start = now;
+            stats->started = true;
+        } else {
+            stats->active_task_seconds +=
+                std::chrono::duration<double>(now - stats->end).count() * active_tasks.size();
+        }
+        stats->end = now;
+    }
 
     void finish_task(int id, std::exception_ptr error = {}) {
         auto it = active_tasks.find(id);
@@ -90,6 +125,7 @@ private:
         if (it->second.needs_result) {
             completed.push_back({id, error ? std::any(error) : std::any{}});
         }
+        record_active_tasks();
         active_tasks.erase(it);
     }
 
@@ -132,10 +168,12 @@ private:
 
 class IOExecutor : public IOExecutorBase {
 public:
+    // Optional statistics storage must outlive this executor.
     IOExecutor(IOWorkerDriver::PollCompletions poll_completions,
-               std::function<void()> abort_io)
-      : IOExecutorBase([poll_completions, abort_io]() {
-            return std::make_unique<IOWorkerDriver>(poll_completions, abort_io);
+               std::function<void()> abort_io, IOWorkerDriver::Statistics* stats = nullptr)
+      : IOExecutorBase([poll_completions, abort_io, stats]() {
+            return std::make_unique<IOWorkerDriver>(
+                poll_completions, abort_io, stats);
         })
     {
         IOExecutorBase::start();

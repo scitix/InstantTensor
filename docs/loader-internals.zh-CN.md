@@ -867,6 +867,17 @@ Python generator 在每次获取下一个 tensor 前同步当前 CUDA stream。�
    单独跟踪 helper 结果：成功返回只删除关联，提交错误触发重试或失败。
    关闭时先回收迟到的 helper 结果，再 join helper 线程。
 
+开启 `INSTANTTENSOR_DEBUG=1` 时，`Loader::close()` 在线程 join 后输出时间加权
+平均任务数，不使用额外采样线程。IO driver 对 `active_tasks.size()` 积分，不含
+executor 输入队列中尚未接收的任务，但包含已接收、待提交或待重试的任务。
+CUDA 侧只统计 `IO_READY`（有序提交等待及 CUDA/NCCL 主机端提交调用）和
+`GPU_PENDING`（直到观察到 event 完成），不再统计 `IO_PENDING`。
+各 driver 分别以首个任务进入到最后一个任务完成为时间窗口，包含任务间空闲，
+无任务时输出零。因此这些指标是独立的软件占用量，不是硬件队列深度，也不能直接
+相加当作端到端 depth。统计存储由 Loader 持有，经 executor 传指针给 driver；
+统计成员声明在 executor 之前，确保其生命周期覆盖 worker 的退出过程。
+未开启 debug 时不执行计时。
+
 这些细节不改变上文描述的数据路径，但修改 buffer sizing、io_uring 并发模型或 dtype 支持时需要考虑。
 
 ## 11. 行为等价实现的验收标准

@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -297,6 +298,88 @@ void test_join_drains_pending_event() {
     io.join();
 }
 
+void test_stage_statistics() {
+    MockIOExecutor io;
+    CUDAWorkerDriver::Statistics stats;
+    CUDAWorkerDriver driver(0, &stats);
+    assert((driver.average_stage_counts() == std::array<double, 2>{}));
+    event_status[0] = event_status[1] = cudaErrorNotReady;
+    driver.add_task(CUDAWorkerDriver::TaskItem::make_task(100, CUDAOperation{
+        io.submit(100, false), [] {}, reinterpret_cast<cudaEvent_t>(1)}));
+    driver.add_task(CUDAWorkerDriver::TaskItem::make_task(101, CUDAOperation{
+        io.submit(101, false), [] {}, reinterpret_cast<cudaEvent_t>(2)}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    io.complete(101);
+    io.executor.wait(101);
+    assert(driver.process_tasks().empty()); // Second task is IO_READY behind the first.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    for (int i = 0; i < 100; ++i) assert(driver.process_tasks().empty());
+    io.complete(100);
+    io.executor.wait(100);
+    assert(driver.process_tasks().empty()); // Both are now GPU_PENDING.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    event_status[0] = event_status[1] = cudaSuccess;
+    assert(driver.process_tasks().size() == 2);
+    assert(!driver.has_pending_tasks());
+    auto counts = driver.average_stage_counts();
+    double total = 0;
+    for (double count : counts) {
+        assert(std::isfinite(count) && count > 0);
+        total += count;
+    }
+    assert(total > 0 && total <= 2);
+    // Empty polls after the last completion must not dilute the observation window.
+    for (int i = 0; i < 100; ++i) assert(driver.process_tasks().empty());
+    assert(driver.average_stage_counts() == counts);
+    io.join();
+}
+
+void test_stage_statistics_on_failure(bool collect_stats) {
+    MockIOExecutor io;
+    CUDAWorkerDriver::Statistics stats;
+    CUDAWorkerDriver driver(0, collect_stats ? &stats : nullptr);
+    driver.add_task(CUDAWorkerDriver::TaskItem::make_task(102, CUDAOperation{
+        io.submit(102), [] { throw std::runtime_error("launch failed"); }, nullptr}));
+    io.executor.wait(102);
+    auto result = driver.process_tasks();
+    assert(result.size() == 1 && result[0].value.type() == typeid(std::exception_ptr));
+    assert(!driver.has_pending_tasks());
+    auto counts = driver.average_stage_counts();
+    if (collect_stats) {
+        assert(std::isfinite(counts[0]) && counts[0] > 0 && counts[0] <= 1);
+        assert(counts[1] == 0);
+    } else {
+        assert((counts == std::array<double, 2>{}));
+    }
+    io.join();
+}
+
+void test_external_statistics_lifetime(bool enabled) {
+    IOWorkerDriver::Statistics io_stats;
+    CUDAWorkerDriver::Statistics cuda_stats;
+    bool launched = false;
+    event_status[0] = cudaSuccess;
+    {
+        IOExecutor io([](auto&) {}, [] { assert(false); }, enabled ? &io_stats : nullptr);
+        CUDAExecutor cuda(0, enabled ? &cuda_stats : nullptr);
+        io.submit(103, [] { return IOSubmitStatus::Completed; });
+        cuda.submit(103, CUDAOperation{
+            IORequest{&io, 103, false}, [&] { launched = true; },
+            reinterpret_cast<cudaEvent_t>(1)});
+        // Rely on ExecutorCore destruction to join, with no derived-class join.
+    }
+    assert(launched);
+    assert(io_stats.started == enabled && cuda_stats.started == enabled);
+    assert(std::abs(io_stats.average_active_tasks() - (enabled ? 1.0 : 0.0)) < 1e-9);
+    auto counts = cuda_stats.average_stage_counts();
+    for (double count : counts) assert(std::isfinite(count) && count >= 0 && count <= 1);
+    if (enabled) {
+        assert(counts[0] + counts[1] > 0);
+    } else {
+        assert((counts == std::array<double, 2>{}));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -310,5 +393,10 @@ int main() {
     test_io_failure_blocks_later_launches();
     test_launch_and_query_errors();
     test_join_drains_pending_event();
+    test_stage_statistics();
+    test_stage_statistics_on_failure(true);
+    test_stage_statistics_on_failure(false);
+    test_external_statistics_lifetime(false);
+    test_external_statistics_lifetime(true);
     return 0;
 }

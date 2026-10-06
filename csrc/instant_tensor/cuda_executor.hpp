@@ -1,6 +1,8 @@
 #pragma once
 
 #include <any>
+#include <array>
+#include <chrono>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -23,8 +25,25 @@ public:
     using Base = WorkerDriver<CUDAOperation, std::any>;
     using TaskItem = typename Base::TaskItem;
     using ResultItem = typename Base::ResultItem;
+    using Clock = std::chrono::steady_clock;
 
-    explicit CUDAWorkerDriver(int device_idx) {
+    struct Statistics {
+        bool started = false;
+        Clock::time_point start{}, end{};
+        std::array<Clock::duration, 2> stage_times{};
+
+        std::array<double, 2> average_stage_counts() const {
+            double seconds = std::chrono::duration<double>(end - start).count();
+            if (seconds <= 0) return {};
+            return {
+                std::chrono::duration<double>(stage_times[0]).count() / seconds,
+                std::chrono::duration<double>(stage_times[1]).count() / seconds,
+            };
+        }
+    };
+
+    explicit CUDAWorkerDriver(int device_idx, Statistics* stats = nullptr)
+        : stats(stats) {
         try {
             CUDA_CHECK(cudaSetDevice(device_idx));
         }
@@ -33,12 +52,21 @@ public:
         }
     }
 
+    // Worker side, after drain. Order: IO_READY, GPU_PENDING.
+    std::array<double, 2> average_stage_counts() const {
+        return stats ? stats->average_stage_counts() : std::array<double, 2>{};
+    }
+
     bool can_add_task() const override {
         return active_tasks.size() < MAX_IO_DEPTH;
     }
 
     void add_task(TaskItem&& task) override {
         active_tasks.push_back(ActiveTask{std::move(task)});
+        if (stats && !stats->started) {
+            stats->start = Clock::now();
+            stats->started = true;
+        }
     }
 
     std::vector<ResultItem> process_tasks() override {
@@ -54,12 +82,12 @@ public:
                     CUDAOperation& operation = *active.task.payload;
                     if (operation.io_request.executor->try_reap(
                             operation.io_request.wait_handle, ignored)) {
-                        active.stage = Stage::IO_READY;
+                        set_stage(active, Stage::IO_READY);
                     }
                 }
                 catch (...) {
                     active.error = std::current_exception();
-                    active.stage = Stage::IO_READY;
+                    set_stage(active, Stage::IO_READY);
                 }
             }
 
@@ -72,16 +100,16 @@ public:
                 }
                 if (launch_failure) {
                     active.error = launch_failure;
-                    active.stage = Stage::FAILED;
+                    set_stage(active, Stage::FAILED);
                 }
                 else {
                     try {
                         active.task.payload->launch();
-                        active.stage = Stage::GPU_PENDING;
+                        set_stage(active, Stage::GPU_PENDING);
                     }
                     catch (...) {
                         active.error = std::current_exception();
-                        active.stage = Stage::FAILED;
+                        set_stage(active, Stage::FAILED);
                         launch_failure = active.error;
                     }
                 }
@@ -92,7 +120,7 @@ public:
                     cudaError_t error = cudaEventQuery(
                         active.task.payload->completion_event);
                     if (error == cudaSuccess) {
-                        active.stage = Stage::COMPLETE;
+                        set_stage(active, Stage::COMPLETE);
                     }
                     else if (!cudaErrorIsNotReady(error)) {
                         CUDA_CHECK(error);
@@ -100,7 +128,7 @@ public:
                 }
                 catch (...) {
                     active.error = std::current_exception();
-                    active.stage = Stage::FAILED;
+                    set_stage(active, Stage::FAILED);
                 }
             }
 
@@ -142,8 +170,25 @@ private:
         TaskItem task;
         Stage stage = Stage::IO_PENDING;
         std::exception_ptr error;
+        Clock::time_point stage_started{};
     };
 
+    // Sum per-task residence times, equivalent to integrating each stage's task count.
+    void set_stage(ActiveTask& active, Stage stage) {
+        if (stats) {
+            auto now = Clock::now();
+            if (active.stage == Stage::IO_READY) {
+                stats->stage_times[0] += now - active.stage_started;
+            } else if (active.stage == Stage::GPU_PENDING) {
+                stats->stage_times[1] += now - active.stage_started;
+            }
+            active.stage_started = now;
+            stats->end = now;
+        }
+        active.stage = stage;
+    }
+
+    Statistics* stats;
     std::exception_ptr launch_failure;
     std::deque<ActiveTask> active_tasks;
 };
@@ -153,9 +198,10 @@ using CUDAExecutorBase = SingleWorkerDriverExecutor<CUDAOperation, std::any,
 
 class CUDAExecutor : public CUDAExecutorBase {
 public:
-    explicit CUDAExecutor(int device_idx)
-      : CUDAExecutorBase([device_idx]() {
-            return std::make_unique<CUDAWorkerDriver>(device_idx);
+    // Optional statistics storage must outlive this executor.
+    explicit CUDAExecutor(int device_idx, CUDAWorkerDriver::Statistics* stats = nullptr)
+      : CUDAExecutorBase([device_idx, stats]() {
+            return std::make_unique<CUDAWorkerDriver>(device_idx, stats);
         })
     {
         CUDAExecutorBase::start();

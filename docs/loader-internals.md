@@ -877,6 +877,19 @@ synchronization and lifetime control.
    returns only remove the association, while submission errors trigger retry or
    failure. Shutdown drains late helper results before joining the helper thread.
 
+With `INSTANTTENSOR_DEBUG=1`, `Loader::close()` reports time-weighted average task
+counts after joining the workers, without a sampling thread. The IO driver
+integrates `active_tasks.size()`, excluding tasks still in its executor input
+queue but including accepted tasks awaiting submission or retry. CUDA statistics
+cover only `IO_READY` (ordered-launch waiting and host CUDA/NCCL launch calls) and
+`GPU_PENDING` (until event completion is observed), not `IO_PENDING`.
+Each driver uses its own first-admission-to-last-completion time window, including
+idle gaps between tasks; an empty driver reports zeros. Thus these are separate
+software occupancies, not hardware queue depths or an additive end-to-end depth.
+The Loader owns the statistics storage and passes pointers through the executors
+to their drivers. These members precede the executors so they outlive worker exit.
+Timing is disabled when debug logging is off.
+
 ## 11. Acceptance Criteria
 
 ### 11.1 Static Layout Invariants

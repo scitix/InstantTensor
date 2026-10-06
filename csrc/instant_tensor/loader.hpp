@@ -24,11 +24,13 @@ public:
     vector<TensorMetadate> tensors;
     vector<Chunk> chunks;
     size_t current_tensor_index = 0;
+    // Declared before the executors so their workers cannot outlive this storage.
+    IOWorkerDriver::Statistics io_stats;
+    CUDAWorkerDriver::Statistics cuda_stats;
     unique_ptr<ThreadPoolTaskExecutor> worker_threads;
     unique_ptr<SingleThreadTaskExecutor> last_page_reader_thread;
     unique_ptr<IOExecutor> io_thread;
     unique_ptr<CUDAExecutor> cuda_executor;
-    std::thread io_depth_sample_thread;
     cudaStream_t cuda_stream = nullptr;
     cudaStream_t nccl_stream = nullptr;
     vector<cudaEvent_t> cuda_events;
@@ -72,10 +74,6 @@ public:
     atomic<chunk_id_t> chunk_reading = -1;
     atomic<chunk_id_t> chunk_read = -1;
     std::exception_ptr fatal_error;
-
-    alignas(64)
-    atomic<size_t> io_depth_sum = 0;
-    atomic<size_t> io_depth_sample = 0;
 
     int loader_task_id = 0;
     int io_worker_task_id = 0;
