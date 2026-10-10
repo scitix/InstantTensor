@@ -244,6 +244,7 @@ argument takes precedence over its corresponding environment variable.
 | `INSTANTTENSOR_CONCURRENCY` | Number of worker threads for `MMAP` and `CUFILE`; other backends ignore it. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_IO_DEPTH` | Maximum number of rank-local I/O operations in flight. Higher values can increase throughput and staging-memory usage; the maximum is 1024. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Maximum fraction of currently free GPU memory available to the logical device buffer. | `0.5` |
+| `INSTANTTENSOR_HOST_FALLBACK` | Set to `1` to load files whose largest tensor exceeds the device-memory budget through host memory instead of failing (see below). | `0` |
 | `INSTANTTENSOR_CACHE_BUFFER` | Set to `1` to cache pinned host staging buffers across loader opens. Cached memory remains pinned until process cleanup. | `0` |
 | `INSTANTTENSOR_DEBUG` | Set to `1` to print backend selection, buffer sizes, timing, and throughput diagnostics. | `0` |
 
@@ -254,8 +255,21 @@ tensor-layout recommendation. When `buffer_size` and `io_depth` are both set,
 they must be compatible. When only `buffer_size` is set, InstantTensor reduces
 the default `io_depth` as needed. The internal device allocation includes a
 small additional alignment guard beyond the logical `buffer_size`. If the
-final logical buffer exceeds the resulting device-memory budget, opening fails
-before the native allocation is attempted.
+final logical buffer exceeds the resulting device-memory budget, the automatic
+buffer is shrunk to the budget (less I/O overlap) as long as every tensor on
+the device path still fits; an explicit `buffer_size` that exceeds the budget
+fails before the native allocation is attempted.
+
+A file that contains a single tensor larger than the budget cannot be staged
+through the device ring buffer at all; by default `safe_open` fails and names
+the tensor. With `INSTANTTENSOR_HOST_FALLBACK=1` (or `host_fallback=True`)
+such files are instead loaded into host memory with plain buffered reads and
+their tensors are yielded as CPU tensors, with a `RuntimeWarning` naming the
+files; every other file keeps the device path. Checkpoints that place very
+large embedding or expert tables in dedicated shards (for example
+DeepSeek-V4.1-Flash, whose two 91.6 GiB engram embedding tables each sit in
+their own shard) can then be loaded on devices whose budget is below those
+tensors, as long as the consumer accepts CPU tensors for them.
 
 For example:
 

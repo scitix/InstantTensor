@@ -97,6 +97,7 @@ class _OpenConfig:
     io_depth: Optional[int]
     max_free_mem_usage: Optional[float]
     backend: BackendCandidates
+    host_fallback: Optional[bool]
 
 
 def parse_backend(name: str) -> BackendCandidate:
@@ -203,6 +204,14 @@ def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
 
+def env_host_fallback():
+    ret = os.environ.get("INSTANTTENSOR_HOST_FALLBACK")
+    if ret is None:
+        return None
+    if ret not in ("0", "1"):
+        raise ValueError("INSTANTTENSOR_HOST_FALLBACK must be 0 or 1")
+    return ret == "1"
+
 
 def _host_available_bytes():
     with open("/proc/meminfo", encoding="ascii") as meminfo:
@@ -220,6 +229,7 @@ def _resolve_open_config(
     io_depth: Optional[int],
     max_free_mem_usage: Optional[float],
     backend: BackendCandidates,
+    host_fallback: Optional[bool] = None,
 ) -> _OpenConfig:
     return _OpenConfig(
         buffer_size=buffer_size if buffer_size is not None else env_buffer_size(),
@@ -232,6 +242,7 @@ def _resolve_open_config(
             else env_max_free_mem_usage()
         ),
         backend=backend if backend is not None else env_backend(),
+        host_fallback=host_fallback if host_fallback is not None else env_host_fallback(),
     )
 
 # runai reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
@@ -430,6 +441,38 @@ def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor:
 
 
 
+HOST_READ_CHUNK_SIZE = 64 << 20
+
+
+def read_host_tensor(filename: str, header_size: int, data_offsets: list[int],
+                     torch_dtype: torch.dtype, shape: list[int]) -> torch.Tensor:
+    """Read one tensor from a safetensors file into host memory.
+
+    This is the fallback path for tensors that cannot be staged through the
+    device ring buffer. The bytes are read with plain buffered reads in
+    ``HOST_READ_CHUNK_SIZE`` pieces into a freshly allocated CPU tensor that
+    owns its memory, then reinterpreted as ``torch_dtype`` and ``shape``.
+    """
+    start, end = data_offsets
+    nbytes = end - start
+    flat = torch.empty(nbytes, dtype=torch.uint8)
+    with open(filename, "rb") as f:
+        f.seek(header_size + start)
+        done = 0
+        while done < nbytes:
+            want = min(HOST_READ_CHUNK_SIZE, nbytes - done)
+            buf = f.read(want)
+            if not buf:
+                raise ValueError(
+                    f"Unexpected end of file in {filename!r}: read {done} of {nbytes} B"
+                )
+            flat[done:done + len(buf)] = torch.frombuffer(bytearray(buf), dtype=torch.uint8)
+            done += len(buf)
+    if nbytes == 0:
+        return torch.empty(torch.Size(shape), dtype=torch_dtype)
+    return flat.view(torch_dtype).view(torch.Size(shape))
+
+
 group_communicator_cache = {}
 
 class safe_open:
@@ -541,11 +584,24 @@ class safe_open:
         ...                process_group=process_group) as f:
         ...     for name, tensor in f.tensors():
         ...         tensors[name] = tensor
+        host_fallback: Whether files that contain a tensor larger than the
+            device-memory budget are loaded into host memory instead of the
+            device ring buffer. The buffer can never be smaller than the
+            largest tensor it carries, so without this such a file cannot be
+            loaded at all. Affected files are reported with a
+            ``RuntimeWarning`` and their tensors are yielded on the CPU; all
+            other files keep the device path. The file is the unit of
+            exclusion because the native loader requires contiguous byte
+            ranges within a file. If ``None`` (default), uses
+            ``INSTANTTENSOR_HOST_FALLBACK`` when set; otherwise disabled, and
+            such a file makes ``safe_open`` raise ``RuntimeError`` naming the
+            tensor.
     """
     def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
-            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None):
+            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
+            host_fallback: Optional[bool] = None):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -572,6 +628,7 @@ class safe_open:
         self.device_idx = device.index
         self.process_group = process_group
         self.loader_handle = None
+        self._opened = False
         self.distributed_metadata_read = False
 
         self.ordered_tensor_metadatas = []
@@ -583,8 +640,9 @@ class safe_open:
 
         config = _resolve_open_config(
             buffer_size, chunk_size, concurrency, io_depth,
-            max_free_mem_usage, backend,
+            max_free_mem_usage, backend, host_fallback,
         )
+        self.host_fallback = False if config.host_fallback is None else bool(config.host_fallback)
         self._determine_io_params(config)
 
         self.meta_read_time = time.perf_counter()
@@ -592,6 +650,7 @@ class safe_open:
         meta_read_results = self._read_metadata()
 
         self.file_metadata = None
+        per_file = []  # (filename, header_size, ordered (name, metadata) pairs)
         for f_idx, f in enumerate(self.filename):
             file_metadata, tensor_metadata, tensor_offset = meta_read_results[f_idx]
             if file_metadata is not None:
@@ -602,23 +661,85 @@ class safe_open:
             ordered_tensor_metadatas = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
             if not all(ordered_tensor_metadatas[i][1]["data_offsets"][1] == ordered_tensor_metadatas[i+1][1]["data_offsets"][0] for i in range(len(ordered_tensor_metadatas) - 1)):
                 raise ValueError("Safetensors data offsets must be contiguous")
-            
-            self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
-            self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
-        
+            per_file.append((f, tensor_offset, ordered_tensor_metadatas))
+
+        # Files holding a tensor larger than the device-memory budget cannot be
+        # staged through the device ring buffer at all (the buffer can never be
+        # smaller than the largest tensor it carries).  With host_fallback those
+        # files are read into host memory instead and their tensors are yielded
+        # on the CPU; the remaining files keep the native device path.  The
+        # native loader needs the byte ranges of a file to be contiguous, so the
+        # file is the unit of exclusion.
+        self.host_files = []  # file indices served from host memory
+        oversized = []  # (file index, tensor name, tensor size) of the largest tensor per oversized file
+        for f_idx, (f, header_size, metadatas) in enumerate(per_file):
+            name, v = max(metadatas, key=lambda kv: kv[1]["data_offsets"][1] - kv[1]["data_offsets"][0])
+            largest = v["data_offsets"][1] - v["data_offsets"][0]
+            if largest > self._device_memory_budget:
+                oversized.append((f_idx, name, largest))
+        if oversized and not self.host_fallback:
+            f_idx, name, largest = oversized[0]
+            raise RuntimeError(
+                f"Tensor {name!r} in {per_file[f_idx][0]!r} is {largest} B, larger than the device "
+                f"memory budget ({self._device_memory_budget} B); it cannot be staged through the "
+                "device ring buffer. Raise INSTANTTENSOR_MAX_FREE_MEM_USAGE or free device memory, "
+                "or set host_fallback=True (INSTANTTENSOR_HOST_FALLBACK=1) to load the "
+                f"{len(oversized)} affected file(s) into host memory."
+            )
+        if self.host_fallback:
+            self.host_files = [f_idx for f_idx, _, _ in oversized]
+            if self.host_files:
+                described = ", ".join(
+                    f"{os.path.basename(per_file[i][0])} (largest tensor "
+                    f"{max(v['data_offsets'][1] - v['data_offsets'][0] for _, v in per_file[i][2])} B)"
+                    for i in self.host_files
+                )
+                warnings.warn(
+                    f"{len(self.host_files)} of {len(per_file)} file(s) contain a tensor larger than "
+                    f"the device memory budget ({self._device_memory_budget} B) and will be "
+                    f"loaded into host memory instead of the device ring buffer: {described}. "
+                    "Tensors from these files are yielded on the CPU. Raise "
+                    "INSTANTTENSOR_MAX_FREE_MEM_USAGE or free device memory to load them "
+                    "on the device; set host_fallback=False to fail instead.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        host_file_set = set(self.host_files)
+
+        # Global, file-ordered view over every tensor (public API: keys(),
+        # offset_keys(), tensors() order, get_tensor_metadata()) plus, per
+        # tensor, where it comes from: ("native", index into the native loader)
+        # or ("host", filename, header_size, data_offsets).
+        self.ordered_tensor_metadatas = []
+        self._tensor_sources = []
+        self.native_filename = []
+        native_sizes = []
+        for f_idx, (f, header_size, metadatas) in enumerate(per_file):
+            if f_idx in host_file_set:
+                for name, v in metadatas:
+                    self.ordered_tensor_metadatas.append((name, v))
+                    self._tensor_sources.append(("host", f, header_size, v["data_offsets"]))
+                continue
+            native_f_idx = len(self.native_filename)
+            self.native_filename.append(f)
+            self.tensor_offsets.extend([(native_f_idx, v["data_offsets"][0] + header_size) for _, v in metadatas] + [(native_f_idx, metadatas[-1][1]["data_offsets"][1] + header_size)])
+            for name, v in metadatas:
+                self.ordered_tensor_metadatas.append((name, v))
+                self._tensor_sources.append(("native", len(native_sizes)))
+                native_sizes.append(v["data_offsets"][1] - v["data_offsets"][0])
 
         self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
 
-        # adjust buffer size    
-        self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
-        self.total_tensor_size = sum(self.tensor_sizes)
+        # adjust buffer size: only tensors on the native path go through the ring buffer
+        self.tensor_sizes = native_sizes
+        self.total_tensor_size = sum(v["data_offsets"][1] - v["data_offsets"][0] for _, v in self.ordered_tensor_metadatas)
 
         self._finalize_buffer_size(config.buffer_size)
 
-        if not self.copy and self.buffer_size < self.total_tensor_size:
+        if not self.copy and self.buffer_size < sum(self.tensor_sizes):
             warnings.warn(
                 f"copy=False with buffer_size ({self.buffer_size} B) < "
-                f"total_tensor_size ({self.total_tensor_size} B): earlier "
+                f"total_tensor_size ({sum(self.tensor_sizes)} B): earlier "
                 f"tensors may be overwritten during iteration. This warning "
                 f"can be ignored if tensors are consumed inline; otherwise, "
                 f"use copy=True.",
@@ -805,13 +926,33 @@ class safe_open:
         self.backend = backend
 
     def _finalize_buffer_size(self, buffer_size):
+        buffer_size_for_io = required_buffer_size_for_io(
+            self.chunk_size, self.io_depth, self.world_size,
+        )
+        if not self.tensor_sizes:
+            # Every file is served from host memory; the native loader is not
+            # opened, so the ring buffer only has to satisfy bookkeeping.
+            self.buffer_size = buffer_size_for_io if buffer_size is None else buffer_size
+            return
         if buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
             buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
-            buffer_size_for_io = required_buffer_size_for_io(
-                self.chunk_size, self.io_depth, self.world_size,
-            )
             self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
+            # The recommendation trades device memory for I/O overlap.  When it
+            # does not fit the budget but every tensor on the native path does,
+            # shrink to the budget instead of failing: loading still works, it
+            # merely overlaps less.  _determine_io_params already bounded
+            # buffer_size_for_io by the same budget.
+            min_buffer_size = max(max(self.tensor_sizes), buffer_size_for_io)
+            if self.buffer_size > self._device_memory_budget >= min_buffer_size:
+                warnings.warn(
+                    f"Shrink buffer size from {self.buffer_size} to "
+                    f"{self._device_memory_budget} to fit the device memory budget; "
+                    "tensor loading will overlap less with consumption.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self.buffer_size = self._device_memory_budget
         else:
             self.buffer_size = buffer_size
             min_buffer_size = max(self.tensor_sizes)
@@ -823,12 +964,7 @@ class safe_open:
                 )
                 self.buffer_size = min_buffer_size
 
-            max_buffer_size = max(
-                self.total_tensor_size,
-                required_buffer_size_for_io(
-                    self.chunk_size, self.io_depth, self.world_size,
-                ),
-            )
+            max_buffer_size = max(sum(self.tensor_sizes), buffer_size_for_io)
             if self.buffer_size > max_buffer_size:
                 warnings.warn(
                     f"Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste.",
@@ -883,23 +1019,29 @@ class safe_open:
 
     def _open(self):
         self.open_time = time.perf_counter()
+        self._opened = True
+        if not self.native_filename:
+            debug_log("all files are served from host memory; native loader not opened")
+            return
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
         self.loader_handle = _C.open(
-            self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
+            self.native_filename, self.device_idx, nccl_communicator, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets)
 
     def __enter__(self) -> 'safe_open':
-        if self.loader_handle is None:
+        if not getattr(self, "_opened", False):
             self._open()
         self.enter_time = time.perf_counter()
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
-        stream = torch.cuda.current_stream()
-        stream.synchronize() # make sure all the data transfer is done
+        if self.loader_handle is not None:
+            stream = torch.cuda.current_stream()
+            stream.synchronize() # make sure all the data transfer is done
         self.exit_time = time.perf_counter()
         self._invalidated = True
-        _C.close(self.loader_handle)
+        if self.loader_handle is not None:
+            _C.close(self.loader_handle)
         self.close_time = time.perf_counter()
         total_time = self.close_time - self.init_time
         init_time = self.sync_time - self.init_time
@@ -930,7 +1072,9 @@ class safe_open:
 
         Yields ``(name, tensor)`` pairs. With ``copy=True`` (default) tensors
         own their memory; with ``copy=False`` they are zero-copy views into
-        the ring buffer (see ``safe_open``).
+        the ring buffer (see ``safe_open``). Tensors from files served by the
+        host fallback (see ``host_fallback``) are CPU tensors that always own
+        their memory.
 
         Note:
             Synchronizes the current CUDA stream to ensure data transfer
@@ -941,15 +1085,21 @@ class safe_open:
         if self.iterated:
             raise RuntimeError("tensors() can only be called once")
         self.iterated = True
-        for tensor_index, (name, metadata) in enumerate(self.ordered_tensor_metadatas):
-            stream = torch.cuda.current_stream()
-            stream.synchronize()
+        for (name, metadata), source in zip(self.ordered_tensor_metadatas, self._tensor_sources):
             shape = metadata["shape"]
             safetensors_dtype = metadata["dtype"]
             torch_dtype = safetensors_to_torch_dtype.get(safetensors_dtype, None)
             if torch_dtype is None:
                 raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
 
+            if source[0] == "host":
+                _, filename, header_size, data_offsets = source
+                yield name, read_host_tensor(filename, header_size, data_offsets, torch_dtype, shape)
+                continue
+
+            tensor_index = source[1]
+            stream = torch.cuda.current_stream()
+            stream.synchronize()
             tensor_size = get_tensor_size(shape, torch_dtype)
             dl_tensor = _C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
             tensor_int8 = torch.from_dlpack(dl_tensor)
