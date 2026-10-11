@@ -4,12 +4,14 @@ import time
 import json
 import warnings
 import math
+import mmap
+import re
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
 from instanttensor._cpu_count import cpu_count
 from enum import Enum
-from typing import Union, Generator, Optional
+from typing import Any, Union, Generator, Optional
 import threading
 import atexit
 from collections import defaultdict
@@ -97,6 +99,7 @@ class _OpenConfig:
     io_depth: Optional[int]
     max_free_mem_usage: Optional[float]
     backend: BackendCandidates
+    tensor_distribution_config: Any
 
 
 def parse_backend(name: str) -> BackendCandidate:
@@ -203,6 +206,98 @@ def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
 
+def env_tensor_distribution_config():
+    ret = os.environ.get("INSTANTTENSOR_TENSOR_DISTRIBUTION_CONFIG")
+    if ret is None or not ret.strip():
+        return None
+    try:
+        return json.loads(ret)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"INSTANTTENSOR_TENSOR_DISTRIBUTION_CONFIG is not valid JSON: {error}"
+        ) from error
+
+
+TensorDistributionRule = tuple["re.Pattern[str]", Optional[str]]
+
+
+def parse_tensor_distribution_config(config, default_device: torch.device) -> list[TensorDistributionRule]:
+    """Normalize a tensor distribution config into ``[(compiled_regex, device)]``.
+
+    ``config`` is an ordered collection of ``(pattern, rule)`` entries, given
+    either as a ``dict`` (insertion order) or as a list of 2-item pairs.
+    ``pattern`` is a regular expression matched with ``re.search`` against the
+    tensor name; the first matching entry wins and a name matching no entry
+    keeps the default placement.  ``rule`` is a dict; the only supported key
+    for now is ``"device"``, which overrides the device the tensor is loaded
+    to.  ``device`` may be ``"cpu"`` or the ``safe_open`` device itself (a
+    no-op); omitting it keeps the default placement.
+
+    Returned devices are ``"cpu"`` or ``None`` (default placement).
+    """
+    if config is None:
+        return []
+    if isinstance(config, dict):
+        entries = list(config.items())
+    elif isinstance(config, (list, tuple)):
+        entries = []
+        for entry in config:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise ValueError(
+                    "tensor_distribution_config entries must be (pattern, rule) pairs, "
+                    f"got {entry!r}"
+                )
+            entries.append((entry[0], entry[1]))
+    else:
+        raise ValueError(
+            "tensor_distribution_config must be a dict or a list of (pattern, rule) pairs, "
+            f"got {type(config).__name__}"
+        )
+
+    rules = []
+    for pattern, rule in entries:
+        if not isinstance(pattern, str):
+            raise ValueError(f"tensor_distribution_config pattern must be a str, got {pattern!r}")
+        try:
+            compiled = re.compile(pattern)
+        except re.error as error:
+            raise ValueError(f"Invalid tensor_distribution_config pattern {pattern!r}: {error}") from error
+        if rule is None:
+            rule = {}
+        if not isinstance(rule, dict):
+            raise ValueError(f"tensor_distribution_config rule for {pattern!r} must be a dict, got {rule!r}")
+        unknown = set(rule) - {"device"}
+        if unknown:
+            raise ValueError(
+                f"Unsupported keys {sorted(unknown)} in tensor_distribution_config rule for {pattern!r}; "
+                "supported keys: ['device']"
+            )
+        device = rule.get("device")
+        if device is not None:
+            try:
+                device = torch.device(device)
+            except (RuntimeError, TypeError) as error:
+                raise ValueError(f"Invalid device {rule['device']!r} for pattern {pattern!r}") from error
+            if device.type == "cpu":
+                device = "cpu"
+            elif device.type == default_device.type and device.index in (None, default_device.index):
+                device = None
+            else:
+                raise ValueError(
+                    f"Unsupported device {rule['device']!r} for pattern {pattern!r}: only 'cpu' "
+                    f"or the safe_open device ({default_device}) are supported for now"
+                )
+        rules.append((compiled, device))
+    return rules
+
+
+def resolve_tensor_device(name: str, rules: list[TensorDistributionRule]) -> Optional[str]:
+    """Return ``"cpu"`` or ``None`` (default placement) for ``name``: first matching rule wins."""
+    for compiled, device in rules:
+        if compiled.search(name):
+            return device
+    return None
+
 
 def _host_available_bytes():
     with open("/proc/meminfo", encoding="ascii") as meminfo:
@@ -220,6 +315,7 @@ def _resolve_open_config(
     io_depth: Optional[int],
     max_free_mem_usage: Optional[float],
     backend: BackendCandidates,
+    tensor_distribution_config: Any = None,
 ) -> _OpenConfig:
     return _OpenConfig(
         buffer_size=buffer_size if buffer_size is not None else env_buffer_size(),
@@ -232,6 +328,11 @@ def _resolve_open_config(
             else env_max_free_mem_usage()
         ),
         backend=backend if backend is not None else env_backend(),
+        tensor_distribution_config=(
+            tensor_distribution_config
+            if tensor_distribution_config is not None
+            else env_tensor_distribution_config()
+        ),
     )
 
 # runai reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
@@ -430,6 +531,30 @@ def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor:
 
 
 
+def read_cpu_tensor(mapped: mmap.mmap, header_size: int, data_offsets: list[int],
+                    torch_dtype: torch.dtype, shape: list[int], copy: bool) -> torch.Tensor:
+    """Return one tensor of a memory-mapped safetensors file as a CPU tensor.
+
+    The file is mapped copy-on-write (``mmap.ACCESS_COPY``), so the result is
+    writable without ever modifying the file.  With ``copy=True`` the bytes
+    are cloned into memory owned by the tensor; with ``copy=False`` the tensor
+    is a zero-copy view of the mapping that keeps it alive for as long as the
+    tensor exists (it is cloned anyway if its offset is not aligned to the
+    dtype).
+    """
+    start, end = data_offsets
+    nbytes = end - start
+    if nbytes == 0:
+        return torch.empty(torch.Size(shape), dtype=torch_dtype)
+    with warnings.catch_warnings():
+        # frombuffer warns about sharing memory with the buffer; that is the point here.
+        warnings.simplefilter("ignore", UserWarning)
+        flat = torch.frombuffer(mapped, dtype=torch.uint8, count=nbytes, offset=header_size + start)
+    if copy or flat.data_ptr() % torch.empty((), dtype=torch_dtype).element_size() != 0:
+        flat = flat.clone()
+    return flat.view(torch_dtype).view(torch.Size(shape))
+
+
 group_communicator_cache = {}
 
 class safe_open:
@@ -541,11 +666,27 @@ class safe_open:
         ...                process_group=process_group) as f:
         ...     for name, tensor in f.tensors():
         ...         tensors[name] = tensor
+        tensor_distribution_config: Per-tensor placement rules, an ordered
+            collection of ``(pattern, rule)`` entries given as a ``dict`` or
+            a list of pairs. ``pattern`` is a regular expression matched with
+            ``re.search`` against each tensor name; the first matching entry
+            applies and a name that matches no entry keeps the default
+            placement. ``rule`` is a dict whose only supported key for now is
+            ``"device"``: ``"cpu"`` loads the tensor into host memory from a
+            copy-on-write memory map of the file instead of through the
+            device ring buffer, which is how a tensor larger than the device
+            memory budget can be loaded at all; the ``safe_open`` device
+            itself keeps the default. CPU tensors honour ``copy`` (owned
+            memory, or a zero-copy view of the mapping) and never occupy the
+            ring buffer. Example: ``{r"\\.engram\\.": {"device": "cpu"}}``.
+            If ``None`` (default), uses the JSON in
+            ``INSTANTTENSOR_TENSOR_DISTRIBUTION_CONFIG`` when set.
     """
     def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
-            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None):
+            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
+            tensor_distribution_config: Any = None):
         """Initialize the safe_open context manager.
         
         See class docstring for detailed parameter descriptions.
@@ -572,6 +713,7 @@ class safe_open:
         self.device_idx = device.index
         self.process_group = process_group
         self.loader_handle = None
+        self._opened = False
         self.distributed_metadata_read = False
 
         self.ordered_tensor_metadatas = []
@@ -583,7 +725,10 @@ class safe_open:
 
         config = _resolve_open_config(
             buffer_size, chunk_size, concurrency, io_depth,
-            max_free_mem_usage, backend,
+            max_free_mem_usage, backend, tensor_distribution_config,
+        )
+        self._distribution_rules = parse_tensor_distribution_config(
+            config.tensor_distribution_config, self.device,
         )
         self._determine_io_params(config)
 
@@ -592,6 +737,7 @@ class safe_open:
         meta_read_results = self._read_metadata()
 
         self.file_metadata = None
+        per_file = []  # (filename, header_size, ordered (name, metadata) pairs)
         for f_idx, f in enumerate(self.filename):
             file_metadata, tensor_metadata, tensor_offset = meta_read_results[f_idx]
             if file_metadata is not None:
@@ -602,23 +748,84 @@ class safe_open:
             ordered_tensor_metadatas = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
             if not all(ordered_tensor_metadatas[i][1]["data_offsets"][1] == ordered_tensor_metadatas[i+1][1]["data_offsets"][0] for i in range(len(ordered_tensor_metadatas) - 1)):
                 raise ValueError("Safetensors data offsets must be contiguous")
-            
-            self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
-            self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
-        
+            per_file.append((f, tensor_offset, ordered_tensor_metadatas))
+
+        # Place every tensor: "cpu" tensors are read from a memory map of their
+        # file, everything else goes through the native loader and the device
+        # ring buffer.  The native loader needs the byte ranges of one entry to
+        # be contiguous, so each maximal run of device tensors in a file becomes
+        # its own native entry (the same file may appear several times).
+        #
+        # Public views (keys(), offset_keys(), tensors() order,
+        # get_tensor_metadata(), total_tensor_size) keep covering every tensor
+        # in file order; only ring-buffer sizing (tensor_sizes) is restricted
+        # to the device path.
+        self.ordered_tensor_metadatas = []
+        self._tensor_sources = []  # ("native", native index) | ("cpu", file index, header size, data_offsets)
+        self.native_filename = []
+        self.cpu_tensor_names = []
+        native_sizes = []
+        for f_idx, (f, header_size, metadatas) in enumerate(per_file):
+            run_open = False
+            run_end = None
+            for name, v in metadatas:
+                self.ordered_tensor_metadatas.append((name, v))
+                start, end = v["data_offsets"]
+                if resolve_tensor_device(name, self._distribution_rules) == "cpu":
+                    if run_open:
+                        self.tensor_offsets.append((len(self.native_filename) - 1, run_end + header_size))
+                        run_open = False
+                    self._tensor_sources.append(("cpu", f_idx, header_size, v["data_offsets"]))
+                    self.cpu_tensor_names.append(name)
+                    continue
+                if not run_open:
+                    self.native_filename.append(f)
+                    run_open = True
+                self.tensor_offsets.append((len(self.native_filename) - 1, start + header_size))
+                self._tensor_sources.append(("native", len(native_sizes)))
+                native_sizes.append(end - start)
+                run_end = end
+            if run_open:
+                self.tensor_offsets.append((len(self.native_filename) - 1, run_end + header_size))
+        if self.cpu_tensor_names:
+            debug_log(
+                "tensor_distribution_config: %d of %d tensor(s) loaded on the CPU via mmap, "
+                "%d native entr%s",
+                len(self.cpu_tensor_names), len(self.ordered_tensor_metadatas),
+                len(self.native_filename), "y" if len(self.native_filename) == 1 else "ies",
+            )
+
+        # The device ring buffer can never be smaller than the largest tensor it
+        # carries.  Name the culprit instead of failing on the buffer size.
+        if native_sizes:
+            largest_index = max(range(len(native_sizes)), key=native_sizes.__getitem__)
+            if native_sizes[largest_index] > self._device_memory_budget:
+                native_names = [
+                    name for (name, _), source in zip(self.ordered_tensor_metadatas, self._tensor_sources)
+                    if source[0] == "native"
+                ]
+                name = native_names[largest_index]
+                raise RuntimeError(
+                    f"Tensor {name!r} is {native_sizes[largest_index]} B, larger than the device "
+                    f"memory budget ({self._device_memory_budget} B), so it cannot be staged "
+                    "through the device ring buffer. Free device memory, raise "
+                    "INSTANTTENSOR_MAX_FREE_MEM_USAGE, or load it on the CPU with "
+                    f"tensor_distribution_config={{{re.escape(name)!r}: {{'device': 'cpu'}}}}."
+                )
 
         self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
 
-        # adjust buffer size    
-        self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
-        self.total_tensor_size = sum(self.tensor_sizes)
+        # adjust buffer size: only tensors on the native path go through the ring buffer
+        self.tensor_sizes = native_sizes
+        self.total_tensor_size = sum(v["data_offsets"][1] - v["data_offsets"][0] for _, v in self.ordered_tensor_metadatas)
+        self._mapped_files = {}
 
         self._finalize_buffer_size(config.buffer_size)
 
-        if not self.copy and self.buffer_size < self.total_tensor_size:
+        if not self.copy and self.buffer_size < sum(self.tensor_sizes):
             warnings.warn(
                 f"copy=False with buffer_size ({self.buffer_size} B) < "
-                f"total_tensor_size ({self.total_tensor_size} B): earlier "
+                f"total_tensor_size ({sum(self.tensor_sizes)} B): earlier "
                 f"tensors may be overwritten during iteration. This warning "
                 f"can be ignored if tensors are consumed inline; otherwise, "
                 f"use copy=True.",
@@ -805,13 +1012,33 @@ class safe_open:
         self.backend = backend
 
     def _finalize_buffer_size(self, buffer_size):
+        buffer_size_for_io = required_buffer_size_for_io(
+            self.chunk_size, self.io_depth, self.world_size,
+        )
+        if not self.tensor_sizes:
+            # Every tensor is placed on the CPU; the native loader is not
+            # opened, so the ring buffer only has to satisfy bookkeeping.
+            self.buffer_size = buffer_size_for_io if buffer_size is None else buffer_size
+            return
         if buffer_size is None:
             # make sure any two contiguous tensors will not be overlapped with each other in the buffer
             buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
-            buffer_size_for_io = required_buffer_size_for_io(
-                self.chunk_size, self.io_depth, self.world_size,
-            )
             self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
+            # The recommendation trades device memory for I/O overlap.  When it
+            # does not fit the budget but every tensor on the native path does,
+            # shrink to the budget instead of failing: loading still works, it
+            # merely overlaps less.  _determine_io_params already bounded
+            # buffer_size_for_io by the same budget.
+            min_buffer_size = max(max(self.tensor_sizes), buffer_size_for_io)
+            if self.buffer_size > self._device_memory_budget >= min_buffer_size:
+                warnings.warn(
+                    f"Shrink buffer size from {self.buffer_size} to "
+                    f"{self._device_memory_budget} to fit the device memory budget; "
+                    "tensor loading will overlap less with consumption.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self.buffer_size = self._device_memory_budget
         else:
             self.buffer_size = buffer_size
             min_buffer_size = max(self.tensor_sizes)
@@ -823,12 +1050,7 @@ class safe_open:
                 )
                 self.buffer_size = min_buffer_size
 
-            max_buffer_size = max(
-                self.total_tensor_size,
-                required_buffer_size_for_io(
-                    self.chunk_size, self.io_depth, self.world_size,
-                ),
-            )
+            max_buffer_size = max(sum(self.tensor_sizes), buffer_size_for_io)
             if self.buffer_size > max_buffer_size:
                 warnings.warn(
                     f"Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste.",
@@ -883,23 +1105,32 @@ class safe_open:
 
     def _open(self):
         self.open_time = time.perf_counter()
+        self._opened = True
+        if not self.native_filename:
+            debug_log("all tensors are placed on the CPU; native loader not opened")
+            return
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
         self.loader_handle = _C.open(
-            self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
+            self.native_filename, self.device_idx, nccl_communicator, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets)
 
     def __enter__(self) -> 'safe_open':
-        if self.loader_handle is None:
+        if not getattr(self, "_opened", False):
             self._open()
         self.enter_time = time.perf_counter()
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
-        stream = torch.cuda.current_stream()
-        stream.synchronize() # make sure all the data transfer is done
+        if self.loader_handle is not None:
+            stream = torch.cuda.current_stream()
+            stream.synchronize() # make sure all the data transfer is done
         self.exit_time = time.perf_counter()
         self._invalidated = True
-        _C.close(self.loader_handle)
+        # Drop our references; CPU views handed out with copy=False keep their
+        # mapping alive until they are freed, so the maps are not closed here.
+        self._mapped_files = {}
+        if self.loader_handle is not None:
+            _C.close(self.loader_handle)
         self.close_time = time.perf_counter()
         total_time = self.close_time - self.init_time
         init_time = self.sync_time - self.init_time
@@ -930,7 +1161,10 @@ class safe_open:
 
         Yields ``(name, tensor)`` pairs. With ``copy=True`` (default) tensors
         own their memory; with ``copy=False`` they are zero-copy views into
-        the ring buffer (see ``safe_open``).
+        the ring buffer (see ``safe_open``). Tensors placed on the CPU by
+        ``tensor_distribution_config`` are CPU tensors: owned memory with
+        ``copy=True``, zero-copy views of a copy-on-write memory map of the
+        file with ``copy=False``.
 
         Note:
             Synchronizes the current CUDA stream to ensure data transfer
@@ -941,15 +1175,26 @@ class safe_open:
         if self.iterated:
             raise RuntimeError("tensors() can only be called once")
         self.iterated = True
-        for tensor_index, (name, metadata) in enumerate(self.ordered_tensor_metadatas):
-            stream = torch.cuda.current_stream()
-            stream.synchronize()
+        for (name, metadata), source in zip(self.ordered_tensor_metadatas, self._tensor_sources):
             shape = metadata["shape"]
             safetensors_dtype = metadata["dtype"]
             torch_dtype = safetensors_to_torch_dtype.get(safetensors_dtype, None)
             if torch_dtype is None:
                 raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
 
+            if source[0] == "cpu":
+                _, f_idx, header_size, data_offsets = source
+                mapped = self._mapped_files.get(f_idx)
+                if mapped is None:
+                    with open(self.filename[f_idx], "rb") as f:
+                        mapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)
+                    self._mapped_files[f_idx] = mapped
+                yield name, read_cpu_tensor(mapped, header_size, data_offsets, torch_dtype, shape, self.copy)
+                continue
+
+            tensor_index = source[1]
+            stream = torch.cuda.current_stream()
+            stream.synchronize()
             tensor_size = get_tensor_size(shape, torch_dtype)
             dl_tensor = _C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
             tensor_int8 = torch.from_dlpack(dl_tensor)
