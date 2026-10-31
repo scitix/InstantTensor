@@ -49,6 +49,7 @@ enum Backend {
     URING_BUFFERED,
     CUFILE,
     MMAP,
+    FGDS,
 };
 
 struct BackendStatus {
@@ -58,7 +59,7 @@ struct BackendStatus {
 };
 
 inline bool is_valid_backend(Backend backend) {
-    return backend >= Backend::AIO && backend <= Backend::MMAP;
+    return backend >= Backend::AIO && backend <= Backend::FGDS;
 }
 
 inline string backend_to_string(Backend backend) {
@@ -69,6 +70,7 @@ inline string backend_to_string(Backend backend) {
         case Backend::URING_BUFFERED: return "URING_BUFFERED";
         case Backend::CUFILE: return "CUFILE";
         case Backend::MMAP: return "MMAP";
+        case Backend::FGDS: return "FGDS";
     }
     return "UNKNOWN";
 }

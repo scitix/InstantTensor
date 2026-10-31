@@ -26,12 +26,14 @@
 #include <instant_tensor/dl_binding/cuda_binding.hpp>
 #include <instant_tensor/dl_binding/cufile_binding.hpp>
 #include <instant_tensor/dl_binding/nccl_binding.hpp>
+#include <instant_tensor/dl_binding/fgds_binding.hpp>
 
 namespace instanttensor {
 
 using namespace instanttensor::cuda_binding;
 using namespace instanttensor::cufile_binding;
 using namespace instanttensor::nccl_binding;
+using namespace instanttensor::fgds_binding;
 
 inline constexpr size_t MAX_IO_DEPTH = 1024;
 inline constexpr size_t MAX_CHUNK_SIZE = 1ULL << 30;

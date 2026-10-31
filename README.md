@@ -63,6 +63,7 @@ Performance depends on your hardware and workload; benchmark before choosing.
 - GPU platforms: CUDA, ROCm
 - Framework: PyTorch
 - `URING`/`URING_BUFFERED`: Linux kernel 5.6 or newer; 5.15 or newer is recommended
+- `FGDS`: the [fgds](https://github.com/Storage-and-OS-for-AI/fgds) kernel module and `libfgds.so` must be installed (available in the process via `LD_PRELOAD` or on the `LD_LIBRARY_PATH`)
 
 
 ### Method 1: Install from pip
@@ -177,9 +178,9 @@ InstantTensor tries the candidates in order and uses the first backend that is
 supported by the file system and available on the current system.
 
 Supported backend values are `Backend.AIO`, `Backend.AIO_BUFFERED`,
-`Backend.URING`, `Backend.URING_BUFFERED`, `Backend.CUFILE`, and
-`Backend.MMAP`. The `backend` argument accepts a single `Backend` or a list of
-`Backend`/`BackendPolicy` values:
+`Backend.URING`, `Backend.URING_BUFFERED`, `Backend.CUFILE`, `Backend.MMAP`,
+and `Backend.FGDS`. The `backend` argument accepts a single `Backend` or a
+list of `Backend`/`BackendPolicy` values:
 
 ```python
 from instanttensor import Backend, BackendPolicy, safe_open
@@ -209,13 +210,17 @@ Backends are used in different file-system and I/O scenarios:
   in-memory files.
 - **Regular file systems**: InstantTensor can use either Direct I/O or Buffered
   I/O.
-  - **Direct I/O** (available backends: `AIO`, `URING`, `CUFILE`) is best when
-    a model is loaded once for a long-running
+  - **Direct I/O** (available backends: `AIO`, `URING`, `CUFILE`, `FGDS`) is
+    best when a model is loaded once for a long-running
     workload. It avoids page-cache cold-start effects and reduces page-cache
     pollution. When choosing manually, `URING` may be faster on newer platforms.
     `AIO` has the broadest platform compatibility. `CUFILE` requires GPUDirect
     Storage support, and its higher throughput can be offset by cuFile
-    initialization overhead.
+    initialization overhead. `FGDS` is an alternative GPUDirect Storage
+    implementation (see [fgds](https://github.com/Storage-and-OS-for-AI/fgds))
+    that requires the `libfgds.so` library and the `fgds` kernel module, and
+    typically achieves higher throughput than `CUFILE` without extra
+    initialization cost.
   - **Buffered I/O** (available backends: `AIO_BUFFERED`, `URING_BUFFERED`,
     `MMAP`) is best when the same model is
     loaded repeatedly within a short period. Later reads can benefit from the

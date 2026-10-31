@@ -69,6 +69,7 @@ class Backend(Enum):
     URING_BUFFERED = _backend_values["URING_BUFFERED"]
     CUFILE = _backend_values["CUFILE"]
     MMAP = _backend_values["MMAP"]
+    FGDS = _backend_values["FGDS"]
 
 
 del _backend_values
@@ -541,7 +542,7 @@ class safe_open:
             ``Backend``/``BackendPolicy`` value or a list of them. Supported
             backends are ``Backend.AIO``, ``Backend.AIO_BUFFERED``,
             ``Backend.URING``, ``Backend.URING_BUFFERED``, ``Backend.CUFILE``,
-            and ``Backend.MMAP``. Supported policies are
+            ``Backend.MMAP``, and ``Backend.FGDS``. Supported policies are
             ``BackendPolicy.BUFFERED``, which expands to
             ``[Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]``.
             If ``None`` (default), uses ``INSTANTTENSOR_BACKEND`` when set; the
@@ -759,6 +760,14 @@ class safe_open:
                 concurrency = max(32 // self.world_size, 1)
             if io_depth is None:
                 io_depth = 2 * concurrency
+        elif backend == Backend.FGDS:
+            # 8M chunk size is the best performance.
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = max(16 // self.world_size, 1)
+            if io_depth is None:
+                io_depth = 8 * concurrency
 
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than zero")
@@ -903,6 +912,7 @@ class safe_open:
                 f"buffer_size ({self.buffer_size} B) exceeds device memory "
                 f"budget ({self._device_memory_budget} B)"
             )
+        debug_log("final buf size is:%d", self.buffer_size)
 
     def _read_metadata(self):
         meta_read_threads = []

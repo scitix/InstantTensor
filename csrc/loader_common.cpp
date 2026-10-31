@@ -34,6 +34,8 @@ void Loader::open_file() {
             this->open_file_inmem(f);
         } else if (this->backend == Backend::CUFILE) {
             this->open_file_cufile(f);
+        } else if (this->backend == Backend::FGDS) {
+            this->open_file_fgds(f);
         } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
             this->open_file_uring(f);
         } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
@@ -55,6 +57,8 @@ void Loader::close_file() {
             this->close_file_inmem(f);
         } else if (this->backend == Backend::CUFILE) {
             this->close_file_cufile(f);
+        } else if (this->backend == Backend::FGDS) {
+            this->close_file_fgds(f);
         } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
             this->close_file_uring(f);
         } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
@@ -66,6 +70,9 @@ void Loader::close_file() {
     }
     if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
         this->destroy_uring_context();
+    }
+    if(this->backend == Backend::FGDS) {
+        fgds_close(this->device_idx);
     }
 }
 
@@ -89,10 +96,34 @@ void Loader::init_buffer() {
     // For three tensors, these paddings exist at most 3 times
     size_t padded_size = 3 * (this->first_tensor_alignment + this->rank_alignment + this->world_chunk_alignment); // can be any value that >= 0
     this->buffer_size += padded_size;
-    CUDA_CHECK(cudaMalloc(&this->device_buffer, this->buffer_size));
+
+    // Allocate page-aligned device buffer: over-allocate by (PAGE_SIZE-1) and adjust pointer
+    size_t alloc_size = this->buffer_size + PAGE_SIZE - 1;
+    CUDA_CHECK(cudaMalloc(&this->device_buffer_raw, alloc_size));
+    uintptr_t raw_addr = reinterpret_cast<uintptr_t>(this->device_buffer_raw);
+    uintptr_t aligned_addr = ROUND_UP(raw_addr, (uintptr_t)PAGE_SIZE);
+    this->device_buffer = reinterpret_cast<void*>(aligned_addr);
+    debug_log("device_buffer_raw=%p, aligned device_buffer=%p, buffer_size=%zu",
+              this->device_buffer_raw, this->device_buffer, this->buffer_size);
+
+    // FGDS needs a page-aligned device staging buffer for DIRECT_IO reads
+    // because chunk_device_buffer_offset is only aligned to first_tensor_alignment (16 bytes),
+    // not PAGE_SIZE. We stage each rank's page-aligned IO here then D2D copy to the final location.
+    if (this->backend == Backend::FGDS) {
+        this->device_staging_buffer_size = this->io_depth * ROUND_UP(this->rank_chunk_size, PAGE_SIZE);
+        size_t staging_alloc_size = this->device_staging_buffer_size + PAGE_SIZE - 1;
+        CUDA_CHECK(cudaMalloc(&this->device_staging_buffer_raw, staging_alloc_size));
+        uintptr_t staging_raw = reinterpret_cast<uintptr_t>(this->device_staging_buffer_raw);
+        uintptr_t staging_aligned = ROUND_UP(staging_raw, (uintptr_t)PAGE_SIZE);
+        this->device_staging_buffer = reinterpret_cast<void*>(staging_aligned);
+        debug_log("FGDS device_staging_buffer=%p, size=%zu",
+                  this->device_staging_buffer, this->device_staging_buffer_size);
+    }
 
     if (this->backend == Backend::CUFILE) {
         this->register_device_buffer_cufile();
+    } else if (this->backend == Backend::FGDS) {
+        this->register_device_buffer_fgds();
     }
 
     if (this->need_host_buffer) {
@@ -127,8 +158,22 @@ void Loader::destroy_buffer() {
     if (this->backend == Backend::CUFILE) {
         this->deregister_device_buffer_cufile();
     }
+    if (this->backend == Backend::FGDS) {
+        this->deregister_device_buffer_fgds();
+    }
 
-    CUDA_CHECK(cudaFree(this->device_buffer));
+    // Free the raw cudaMalloc'd pointers (device_buffer/device_staging_buffer are
+    // aligned offsets into these raw allocations and must not be passed to cudaFree).
+    if (this->device_buffer_raw) {
+        CUDA_CHECK(cudaFree(this->device_buffer_raw));
+        this->device_buffer_raw = nullptr;
+        this->device_buffer = nullptr;
+    }
+    if (this->device_staging_buffer_raw) {
+        CUDA_CHECK(cudaFree(this->device_staging_buffer_raw));
+        this->device_staging_buffer_raw = nullptr;
+        this->device_staging_buffer = nullptr;
+    }
 
     if (this->need_host_buffer) {
         // Buffer registration belongs to this loader's ring and must not outlive it.
@@ -472,7 +517,8 @@ void Loader::open(OpenArgs args) {
             " bytes after page alignment"));
     }
     if(this->concurrency == 0 &&
-       (this->backend == Backend::MMAP || this->backend == Backend::CUFILE)) {
+       (this->backend == Backend::MMAP || this->backend == Backend::CUFILE ||
+        this->backend == Backend::FGDS)) {
         print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
     }
     if(this->io_depth == 0 || this->io_depth > MAX_IO_DEPTH) {
@@ -593,6 +639,8 @@ void Loader::post_read_chunk() {
         io_request = this->post_read_chunk_inmem(params);
     } else if (this->backend == Backend::CUFILE) {
         io_request = this->post_read_chunk_cufile(params);
+    } else if (this->backend == Backend::FGDS) {
+        io_request = this->post_read_chunk_fgds(params);
     } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
         io_request = this->post_read_chunk_uring(params);
     } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {

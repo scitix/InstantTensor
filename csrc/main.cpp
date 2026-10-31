@@ -61,6 +61,7 @@ public:
         ncclComm_t nccl_group_communicator = nullptr;
         int rank = 0;
         int world_size = 1;
+
         if(!cuda_binding::init()) {
             print_and_throw(std::runtime_error(
                 "cuda_binding: CUDA not found in process. "
@@ -86,6 +87,7 @@ public:
         int req_id = this->call(loader_handle, CLOSE, std::make_any<CloseArgs>());
         this->get_result(loader_handle, req_id);
         this->loader_handle_to_queue.erase(loader_handle);
+        debug_log("LoaderManager close done");
     }
 
     py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
@@ -156,6 +158,15 @@ BackendStatus backend_status(int backend) {
             "",
         };
     }
+    else if(backend_enum == Backend::FGDS) {
+        debug_log("call fgds available func");
+        bool available = Loader::fgds_available();
+        return {
+            available,
+            available ? "" : "fgds is not available on this system.",
+            "",
+        };
+    }
     else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
         return Loader::uring_status();
     }
@@ -185,6 +196,7 @@ PYBIND11_MODULE(_C, m) {
                        instanttensor::Backend::URING_BUFFERED,
                        instanttensor::Backend::CUFILE,
                        instanttensor::Backend::MMAP,
+                       instanttensor::Backend::FGDS,
                    }) {
                   values[pybind11::str(instanttensor::backend_to_string(backend))]
                       = static_cast<int>(backend);

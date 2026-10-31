@@ -18,7 +18,11 @@ public:
     bool use_internal_memory_register = false;
     bool need_host_buffer = false;
     bool need_worker_threads = false;
-    void *device_buffer = nullptr;
+    void *device_buffer = nullptr;       // page-aligned pointer for tensor storage
+    void *device_buffer_raw = nullptr;   // raw cudaMalloc pointer (for cudaFree)
+    void *device_staging_buffer = nullptr;       // page-aligned device staging for FGDS
+    void *device_staging_buffer_raw = nullptr;   // raw cudaMalloc pointer for staging
+    size_t device_staging_buffer_size = 0;
     void* host_buffer = nullptr; // rank-local staging windows
     HostBufferCacheEntry host_buffer_entry = {nullptr, 0, nullptr};
     vector<TensorMetadate> tensors;
@@ -148,6 +152,17 @@ public:
     IORequest post_read_chunk_uring(const ChunkIOParams &p);
     IOSubmitStatus submit_read_uring(chunk_id_t id);
     void poll_uring(std::vector<IOCompletion> &completed);
+
+    // fgds path (loader_io_fgds.cpp)
+    static bool fgds_available();
+    void open_file_fgds(FileInfo &f);     // open fd with O_DIRECT, fgds_open
+    void close_file_fgds(FileInfo &f);    // close fd
+    void register_device_buffer_fgds();   // fgds_regmem
+    void deregister_device_buffer_fgds(); // fgds_deregmem
+    IORequest post_read_chunk_fgds(const ChunkIOParams &p);
+
+    // fgds state
+    void *fgds_target_addr = nullptr;    // registered device buffer target addr
 };
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
