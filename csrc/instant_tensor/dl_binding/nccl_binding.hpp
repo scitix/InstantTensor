@@ -29,6 +29,13 @@ inline ncclResult_t (*ncclCommUserRank_fn)(const ncclComm_t comm, int* rank) = n
 inline ncclResult_t (*ncclCommCount_fn)(const ncclComm_t comm, int* count) = nullptr;
 inline const char* (*ncclGetErrorString_fn)(ncclResult_t result) = nullptr;
 
+template <typename T>
+inline T resolve_nccl(const std::string& name) {
+    // Preserve NCCL wrappers that may own the communicator supplied by PyTorch.
+    T symbol = dl_binding_utils::resolve_global<T>(name);
+    return symbol ? symbol : dl_binding_utils::resolve_required<T>(lib_handle, name);
+}
+
 inline bool init() {
     if (lib_handle != nullptr) {
         if (lib_handle == (void*)0x1) return false;
@@ -51,12 +58,11 @@ inline bool init() {
         return false;
     }
 
-    using dl_binding_utils::resolve;
     // RCCL provides NCCL-compatible API (same function names and signatures), thus we don't need things like "rcclAllGather"
-    ncclAllGather_fn = resolve<decltype(ncclAllGather_fn)>(lib_handle, "ncclAllGather");
-    ncclCommUserRank_fn = resolve<decltype(ncclCommUserRank_fn)>(lib_handle, "ncclCommUserRank");
-    ncclCommCount_fn = resolve<decltype(ncclCommCount_fn)>(lib_handle, "ncclCommCount");
-    ncclGetErrorString_fn = resolve<decltype(ncclGetErrorString_fn)>(lib_handle, "ncclGetErrorString");
+    ncclAllGather_fn = resolve_nccl<decltype(ncclAllGather_fn)>("ncclAllGather");
+    ncclCommUserRank_fn = resolve_nccl<decltype(ncclCommUserRank_fn)>("ncclCommUserRank");
+    ncclCommCount_fn = resolve_nccl<decltype(ncclCommCount_fn)>("ncclCommCount");
+    ncclGetErrorString_fn = resolve_nccl<decltype(ncclGetErrorString_fn)>("ncclGetErrorString");
 
     return true;
 }

@@ -28,25 +28,41 @@ inline void* find_loaded_so(const char* prefix) {
     return nullptr;
 }
 
+// Lookup helpers return nullptr when a symbol is unavailable.
 template <typename T>
 inline T resolve(void* handle, const std::string& name) {
     // Clear any previous error
     dlerror();
-    void* sym = dlsym(handle, name.c_str());
-    if (!sym) {
-        throw std::runtime_error(std::string("failed to resolve ") + name.c_str() + ": " + dlerror());
-    }
-    return reinterpret_cast<T>(sym);
+    return reinterpret_cast<T>(dlsym(handle, name.c_str()));
 }
 
 template <typename T>
 inline T resolve(void* handle, std::initializer_list<std::string> names) {
-    void* sym = nullptr;
     for (const auto& name : names) {
-        dlerror();
-        sym = dlsym(handle, name.c_str());
-        if (sym) break;
+        if (T sym = resolve<T>(handle, name)) return sym;
     }
+    return nullptr;
+}
+
+template <typename T>
+inline T resolve_global(const std::string& name) {
+    return resolve<T>(RTLD_DEFAULT, name);
+}
+
+template <typename T>
+inline T resolve_required(void* handle, const std::string& name) {
+    T sym = resolve<T>(handle, name);
+    if (!sym) {
+        const char* error = dlerror();
+        throw std::runtime_error("failed to resolve " + name + ": " +
+                                 (error ? error : "null symbol address"));
+    }
+    return sym;
+}
+
+template <typename T>
+inline T resolve_required(void* handle, std::initializer_list<std::string> names) {
+    T sym = resolve<T>(handle, names);
     if (!sym) {
         std::string error_message = "failed to resolve any of the following names: ";
         size_t i = 0;
@@ -59,7 +75,7 @@ inline T resolve(void* handle, std::initializer_list<std::string> names) {
         }
         throw std::runtime_error(error_message);
     }
-    return reinterpret_cast<T>(sym);
+    return sym;
 }
 
 } // namespace dl_binding_utils

@@ -80,25 +80,25 @@ inline bool init() {
         return false;
     }
 
-    using dl_binding_utils::resolve;
+    using dl_binding_utils::resolve_required;
 
     // Try CUDA function names first (cuda* prefix), then HIP names (hip* prefix) as fallback
     // On NVIDIA: libcudart.so has cuda* functions - uses CUDA path
     // On AMD: libamdhip64.so only has hip* functions - uses HIP fallback path
-    cudaMalloc_fn = resolve<decltype(cudaMalloc_fn)>(lib_handle, {"cudaMalloc", "hipMalloc"});
-    cudaFree_fn = resolve<decltype(cudaFree_fn)>(lib_handle, {"cudaFree", "hipFree"});
-    cudaSetDevice_fn = resolve<decltype(cudaSetDevice_fn)>(lib_handle, {"cudaSetDevice", "hipSetDevice"});
-    cudaStreamCreateWithFlags_fn = resolve<decltype(cudaStreamCreateWithFlags_fn)>(lib_handle, {"cudaStreamCreateWithFlags", "hipStreamCreateWithFlags"});
-    cudaStreamDestroy_fn = resolve<decltype(cudaStreamDestroy_fn)>(lib_handle, {"cudaStreamDestroy", "hipStreamDestroy"});
-    cudaMemcpyAsync_fn = resolve<decltype(cudaMemcpyAsync_fn)>(lib_handle, {"cudaMemcpyAsync", "hipMemcpyAsync"});
-    cudaEventCreateWithFlags_fn = resolve<decltype(cudaEventCreateWithFlags_fn)>(lib_handle, {"cudaEventCreateWithFlags", "hipEventCreateWithFlags"});
-    cudaEventRecord_fn = resolve<decltype(cudaEventRecord_fn)>(lib_handle, {"cudaEventRecord", "hipEventRecord"});
-    cudaEventQuery_fn = resolve<decltype(cudaEventQuery_fn)>(lib_handle, {"cudaEventQuery", "hipEventQuery"});
-    cudaEventSynchronize_fn = resolve<decltype(cudaEventSynchronize_fn)>(lib_handle, {"cudaEventSynchronize", "hipEventSynchronize"});
-    cudaStreamWaitEvent_fn = resolve<decltype(cudaStreamWaitEvent_fn)>(lib_handle, {"cudaStreamWaitEvent", "hipStreamWaitEvent"});
-    cudaHostRegister_fn = resolve<decltype(cudaHostRegister_fn)>(lib_handle, {"cudaHostRegister", "hipHostRegister"});
-    cudaHostUnregister_fn = resolve<decltype(cudaHostUnregister_fn)>(lib_handle, {"cudaHostUnregister", "hipHostUnregister"});
-    cudaGetErrorString_fn = resolve<decltype(cudaGetErrorString_fn)>(lib_handle, {"cudaGetErrorString", "hipGetErrorString"});
+    cudaMalloc_fn = resolve_required<decltype(cudaMalloc_fn)>(lib_handle, {"cudaMalloc", "hipMalloc"});
+    cudaFree_fn = resolve_required<decltype(cudaFree_fn)>(lib_handle, {"cudaFree", "hipFree"});
+    cudaSetDevice_fn = resolve_required<decltype(cudaSetDevice_fn)>(lib_handle, {"cudaSetDevice", "hipSetDevice"});
+    cudaStreamCreateWithFlags_fn = resolve_required<decltype(cudaStreamCreateWithFlags_fn)>(lib_handle, {"cudaStreamCreateWithFlags", "hipStreamCreateWithFlags"});
+    cudaStreamDestroy_fn = resolve_required<decltype(cudaStreamDestroy_fn)>(lib_handle, {"cudaStreamDestroy", "hipStreamDestroy"});
+    cudaMemcpyAsync_fn = resolve_required<decltype(cudaMemcpyAsync_fn)>(lib_handle, {"cudaMemcpyAsync", "hipMemcpyAsync"});
+    cudaEventCreateWithFlags_fn = resolve_required<decltype(cudaEventCreateWithFlags_fn)>(lib_handle, {"cudaEventCreateWithFlags", "hipEventCreateWithFlags"});
+    cudaEventRecord_fn = resolve_required<decltype(cudaEventRecord_fn)>(lib_handle, {"cudaEventRecord", "hipEventRecord"});
+    cudaEventQuery_fn = resolve_required<decltype(cudaEventQuery_fn)>(lib_handle, {"cudaEventQuery", "hipEventQuery"});
+    cudaEventSynchronize_fn = resolve_required<decltype(cudaEventSynchronize_fn)>(lib_handle, {"cudaEventSynchronize", "hipEventSynchronize"});
+    cudaStreamWaitEvent_fn = resolve_required<decltype(cudaStreamWaitEvent_fn)>(lib_handle, {"cudaStreamWaitEvent", "hipStreamWaitEvent"});
+    cudaHostRegister_fn = resolve_required<decltype(cudaHostRegister_fn)>(lib_handle, {"cudaHostRegister", "hipHostRegister"});
+    cudaHostUnregister_fn = resolve_required<decltype(cudaHostUnregister_fn)>(lib_handle, {"cudaHostUnregister", "hipHostUnregister"});
+    cudaGetErrorString_fn = resolve_required<decltype(cudaGetErrorString_fn)>(lib_handle, {"cudaGetErrorString", "hipGetErrorString"});
 
     return true;
 }

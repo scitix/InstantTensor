@@ -77,14 +77,14 @@ inline bool init() {
         return false;
     }
 
-    using dl_binding_utils::resolve;
-    cuFileDriverOpen_fn = resolve<decltype(cuFileDriverOpen_fn)>(lib_handle, {"cuFileDriverOpen", "hipFileDriverOpen"});
-    cuFileDriverClose_fn = resolve<decltype(cuFileDriverClose_fn)>(lib_handle, {"cuFileDriverClose", "hipFileDriverClose"});
-    cuFileHandleRegister_fn = resolve<decltype(cuFileHandleRegister_fn)>(lib_handle, {"cuFileHandleRegister", "hipFileHandleRegister"});
-    cuFileHandleDeregister_fn = resolve<decltype(cuFileHandleDeregister_fn)>(lib_handle, {"cuFileHandleDeregister", "hipFileHandleDeregister"});
-    cuFileBufRegister_fn = resolve<decltype(cuFileBufRegister_fn)>(lib_handle, {"cuFileBufRegister", "hipFileBufRegister"});
-    cuFileBufDeregister_fn = resolve<decltype(cuFileBufDeregister_fn)>(lib_handle, {"cuFileBufDeregister", "hipFileBufDeregister"});
-    cuFileRead_fn = resolve<decltype(cuFileRead_fn)>(lib_handle, {"cuFileRead", "hipFileRead"});
+    using dl_binding_utils::resolve_required;
+    cuFileDriverOpen_fn = resolve_required<decltype(cuFileDriverOpen_fn)>(lib_handle, {"cuFileDriverOpen", "hipFileDriverOpen"});
+    cuFileDriverClose_fn = resolve_required<decltype(cuFileDriverClose_fn)>(lib_handle, {"cuFileDriverClose", "hipFileDriverClose"});
+    cuFileHandleRegister_fn = resolve_required<decltype(cuFileHandleRegister_fn)>(lib_handle, {"cuFileHandleRegister", "hipFileHandleRegister"});
+    cuFileHandleDeregister_fn = resolve_required<decltype(cuFileHandleDeregister_fn)>(lib_handle, {"cuFileHandleDeregister", "hipFileHandleDeregister"});
+    cuFileBufRegister_fn = resolve_required<decltype(cuFileBufRegister_fn)>(lib_handle, {"cuFileBufRegister", "hipFileBufRegister"});
+    cuFileBufDeregister_fn = resolve_required<decltype(cuFileBufDeregister_fn)>(lib_handle, {"cuFileBufDeregister", "hipFileBufDeregister"});
+    cuFileRead_fn = resolve_required<decltype(cuFileRead_fn)>(lib_handle, {"cuFileRead", "hipFileRead"});
 
     return true;
 }
