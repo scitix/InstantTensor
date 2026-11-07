@@ -99,7 +99,7 @@ def allocate_tensors(global_rank, files):
     pp_rank = global_rank // tp % pp
     dp_rank = global_rank // (tp * pp)
     tensors = {}
-    f = instant_safe_open(files, framework='pt', device='cuda:0', load_now=False) # only reads metadata, device is ignored
+    f = instant_safe_open(files, framework='pt', device='cuda', load_now=False) # only reads metadata
     tensor_names = f.keys()
     num_tensors = len(tensor_names)
     pp_tensor_names = tensor_names[(num_tensors+pp-1)//pp*pp_rank : (num_tensors+pp-1)//pp*(pp_rank+1)] # the right side may overflow, but it is ok

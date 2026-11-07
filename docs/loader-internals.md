@@ -178,6 +178,12 @@ resources, CPU affinity, and CUDA free memory. All ranks must use the same
 budgets; integrated GPUs split the scaled host-memory budget equally between
 host and device, rounding down.
 
+Debug timing separates preparation, native open, load, and close; `load` includes
+the context body and exit stream synchronization. `outside` is time spent outside the context after
+preparation, and `total` includes it. Resource, backend, and metadata timings
+are components of preparation, while `load` includes caller processing.
+Throughput uses bytes actually yielded, including when iteration stops early.
+
 The names come from several layers of the implementation. Use `R`, `W`, and
 `D` when reasoning about layout to avoid treating similarly named
 objects as identical.

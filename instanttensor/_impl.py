@@ -606,7 +606,7 @@ class safe_open:
         
         See class docstring for detailed parameter descriptions.
         """ 
-        self.init_time = time.perf_counter()
+        self.created_at = time.perf_counter()
 
         matches_tensor = _compile_name_matcher(tensor_filter, tensor_name_match_mode)
 
@@ -639,6 +639,7 @@ class safe_open:
         self.tmp_generator = None
         self.copy = copy
         self._invalidated = False
+        self.yielded_bytes = 0
 
         config = _resolve_open_config(
             buffer_size, chunk_size, concurrency, io_depth,
@@ -646,7 +647,7 @@ class safe_open:
         )
         self._determine_io_params(config)
 
-        self.meta_read_time = time.perf_counter()
+        metadata_started_at = time.perf_counter()
 
         meta_read_results = self._read_metadata()
 
@@ -675,6 +676,7 @@ class safe_open:
         # adjust buffer size    
         self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
         self.total_tensor_size = sum(self.tensor_sizes)
+        self.metadata_seconds = time.perf_counter() - metadata_started_at
 
         self._finalize_buffer_size(config.buffer_size)
 
@@ -689,6 +691,7 @@ class safe_open:
                 stacklevel=2,
             )
 
+        self.prepare_seconds = time.perf_counter() - self.created_at
         if load_now:
             self._open()
 
@@ -717,19 +720,22 @@ class safe_open:
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
 
+        resources_started_at = time.perf_counter()
         resources = negotiate_resources(self.process_group, device=self.device,
                                         max_free_mem_usage=max_free_mem_usage)
+        self.resources_seconds = time.perf_counter() - resources_started_at
         self.host_memory_budget = resources.avail_mem
         cpus = resources.avail_cpus
-        debug_log("Agreed host resources: CPUs=%d, memory=%d bytes", cpus, resources.avail_mem)
         avail_bytes = resources.avail_device_mem
+        debug_log("Rank resource limits: CPUs=%d, host_memory=%d bytes, device_memory=%d bytes",
+                  cpus, resources.avail_mem, avail_bytes)
 
-        self.sync_time = time.perf_counter()
+        backend_started_at = time.perf_counter()
         backend = select_distributed_backend(
             backend_candidates, self.device, self.process_group,
         )
+        self.backend_seconds = time.perf_counter() - backend_started_at
         self.device_memory_budget = avail_bytes
-        debug_log("Device memory budget: %d bytes", avail_bytes)
 
         if concurrency is not None:
             if concurrency < 0:
@@ -893,7 +899,6 @@ class safe_open:
                 f"buffer_size ({self.buffer_size} B) exceeds device memory "
                 f"budget ({self.device_memory_budget} B)"
             )
-        debug_log("final buf size is:%d", self.buffer_size)
 
     def _read_metadata(self):
         meta_read_threads = []
@@ -934,47 +939,55 @@ class safe_open:
         return meta_read_results
 
     def _open(self):
-        self.open_time = time.perf_counter()
+        open_started_at = time.perf_counter()
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
         self.loader_handle = _C.open(
             self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets, self.tensor_keep)
+        self.open_seconds = time.perf_counter() - open_started_at
 
     def __enter__(self) -> 'safe_open':
         if self.loader_handle is None:
             self._open()
-        self.enter_time = time.perf_counter()
+        self.load_started_at = time.perf_counter()
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         stream = torch.cuda.current_stream()
         stream.synchronize() # make sure all the data transfer is done
-        self.exit_time = time.perf_counter()
+        load_finished_at = time.perf_counter()
         self._invalidated = True
         _C.close(self.loader_handle)
-        self.close_time = time.perf_counter()
-        total_time = self.close_time - self.init_time
-        init_time = self.sync_time - self.init_time
-        sync_time = self.meta_read_time - self.sync_time
-        meta_read_time = self.open_time - self.meta_read_time
-        open_time = self.enter_time - self.open_time
-        load_time = self.exit_time - self.enter_time
-        close_time = self.close_time - self.exit_time
+        closed_at = time.perf_counter()
         if env_debug():
+            total_seconds = closed_at - self.created_at
+            prepare_seconds = self.prepare_seconds
+            open_seconds = self.open_seconds
+            load_seconds = load_finished_at - self.load_started_at
+            close_seconds = closed_at - load_finished_at
+            # Delays before entering the context are not preparation or open work.
+            outside_seconds = max(self.load_started_at - self.created_at
+                                  - prepare_seconds - open_seconds, 0.0)
             debug_log(
-                "Time: total=%.2fs, init=%.2fs, sync=%.2fs, meta_read=%.2fs, open=%.2fs, load=%.2fs, close=%.2fs",
-                total_time,
-                init_time,
-                sync_time,
-                meta_read_time,
-                open_time,
-                load_time,
-                close_time,
+                "Time: total=%.2fs, prepare=%.2fs, outside=%.2fs, open=%.2fs, load=%.2fs, close=%.2fs",
+                total_seconds,
+                prepare_seconds,
+                outside_seconds,
+                open_seconds,
+                load_seconds,
+                close_seconds,
             )
             debug_log(
-                "Throughput: total=%.2fGB/s, load=%.2fGB/s",
-                self.total_tensor_size * 1e-9 / total_time,
-                self.total_tensor_size * 1e-9 / load_time,
+                "Prepare time: resources=%.2fs, backend=%.2fs, metadata=%.2fs",
+                self.resources_seconds,
+                self.backend_seconds,
+                self.metadata_seconds,
+            )
+            debug_log(
+                "Throughput: total=%.2fGB/s, load=%.2fGB/s, yielded=%d B",
+                self.yielded_bytes * 1e-9 / total_seconds if total_seconds > 0 else 0.0,
+                self.yielded_bytes * 1e-9 / load_seconds if load_seconds > 0 else 0.0,
+                self.yielded_bytes,
             )
 
     def tensors(self) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1026,6 +1039,7 @@ class safe_open:
 
             if tensor.data_ptr() % tensor.element_size() != 0:
                 raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
+            self.yielded_bytes += tensor_size
             yield name, tensor
 
     def keys(self) -> list[str]:
