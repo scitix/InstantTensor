@@ -5,11 +5,10 @@ import json
 import re
 import fnmatch
 import warnings
-import math
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
-from instanttensor._cpu_count import cpu_count
+from instanttensor.resources import negotiate_resources
 from enum import Enum
 from typing import Union, Generator, Optional, Callable, Literal
 import threading
@@ -175,8 +174,6 @@ def select_backend(candidates: list[Backend], supported_backends: Optional[list[
     )
 
 
-
-
 def env_backend():
     ret = os.environ.get("INSTANTTENSOR_BACKEND")
     if ret is None:
@@ -205,15 +202,6 @@ def env_max_free_mem_usage():
 def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
-
-
-def _host_available_bytes():
-    with open("/proc/meminfo", encoding="ascii") as meminfo:
-        for line in meminfo:
-            if line.startswith("MemAvailable:"):
-                _, available_kb, _ = line.split()
-                return int(available_kb) * 1024
-    raise ValueError("Missing MemAvailable in /proc/meminfo")
 
 
 def _resolve_open_config(
@@ -712,7 +700,20 @@ class safe_open:
                 candidate for candidate in backend_candidates
                 if candidate in available_in_memory_backends
             ]
+        if max_free_mem_usage is None:
+            max_free_mem_usage = 0.5
+
+        resources = negotiate_resources(self.process_group, device=self.device,
+                                        max_free_mem_usage=max_free_mem_usage)
+        self.host_memory_budget = resources.avail_mem
+        cpus = resources.avail_cpus
+        debug_log("Agreed host resources: CPUs=%d, memory=%d bytes", cpus, resources.avail_mem)
+        avail_bytes = resources.avail_device_mem
+
+        self.sync_time = time.perf_counter()
         backend = select_backend(backend_candidates)
+        self.device_memory_budget = avail_bytes
+        debug_log("Device memory budget: %d bytes", avail_bytes)
 
         if concurrency is not None:
             if concurrency < 0:
@@ -731,7 +732,7 @@ class safe_open:
                 )
                 concurrency = 0
 
-        default_concurrency = max(min(32, cpu_count()) // self.world_size - 4, 1)
+        default_concurrency = max(min(32, cpus) - 4, 1)
         if backend == Backend.MMAP:
             if chunk_size is None:
                 chunk_size = 2 * 1024 * 1024
@@ -815,42 +816,6 @@ class safe_open:
                     )
                     io_depth = max_io_depth_for_buffer
         
-        if max_free_mem_usage is None:
-            max_free_mem_usage = 0.5
-        
-        budget_error = None
-        try:
-            if not math.isfinite(max_free_mem_usage) or not 0 < max_free_mem_usage <= 1:
-                raise ValueError("max_free_mem_usage must be finite and satisfy 0 < value <= 1")
-            # Managed-memory support alone does not imply shared physical memory.
-            if sys.platform == "linux" and torch.cuda.get_device_properties(self.device).is_integrated:
-                avail_bytes = _host_available_bytes()
-                debug_log("MemAvailable: %d bytes", avail_bytes)
-            else:
-                avail_bytes = torch.cuda.mem_get_info(self.device)[0]
-                debug_log("CUDA free memory: %d bytes", avail_bytes)
-            avail_bytes = int(avail_bytes * max_free_mem_usage)
-        except (OSError, ValueError, AttributeError) as error:
-            # Participate in the existing MIN collective before rejecting, so
-            # invalid budget input on one rank cannot strand another rank there.
-            budget_error = error
-            avail_bytes = 0
-        debug_log("Local memory budget: %d bytes (fraction=%s)", avail_bytes, max_free_mem_usage)
-
-        self.sync_time = time.perf_counter()
-        if self.process_group is not None:
-            # Warm up nccl to ensure ncclComm_t is initialized
-            # Even set async_op=True, the first call may still block to initialize ncclComm_t
-            # Most of the time is spent on NCCL initialization rather than on the all_reduce itself.
-            avail_bytes_tensor = torch.tensor([avail_bytes], device=self.device)
-            dist.all_reduce(avail_bytes_tensor, op=torch.distributed.ReduceOp.MIN, group=self.process_group) 
-            avail_bytes = avail_bytes_tensor.item()
-            # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
-
-        self._device_memory_budget = avail_bytes
-        debug_log("Device memory budget: %d bytes", avail_bytes)
-        if budget_error is not None:
-            raise RuntimeError("Cannot select memory budget: " + str(budget_error)) from budget_error
         buffer_size_per_io_depth = required_buffer_size_for_io(
             chunk_size, 1, self.world_size,
         )
@@ -907,10 +872,10 @@ class safe_open:
                 )
                 self.buffer_size = max_buffer_size
 
-        if self.buffer_size > self._device_memory_budget:
+        if self.buffer_size > self.device_memory_budget:
             raise RuntimeError(
                 f"buffer_size ({self.buffer_size} B) exceeds device memory "
-                f"budget ({self._device_memory_budget} B)"
+                f"budget ({self.device_memory_budget} B)"
             )
         debug_log("final buf size is:%d", self.buffer_size)
 

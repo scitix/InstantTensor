@@ -171,6 +171,13 @@ explicit `concurrency` value cannot change their layout or memory use. Free
 device-memory pressure shrinks only `io_depth`. The accepted range is
 `1 <= io_depth <= 1024`, matching the executor capacity.
 
+Before backend selection, `negotiate_resources()` agrees on the minimum CPU and
+memory budgets across ranks, accounting for shared cgroup v2 limits, host
+resources, CPU affinity, and CUDA free memory. All ranks must use the same
+`max_free_mem_usage` and `is_integrated` value. The fraction scales both memory
+budgets; integrated GPUs split the scaled host-memory budget equally between
+host and device, rounding down.
+
 The names come from several layers of the implementation. Use `R`, `W`, and
 `D` when reasoning about layout to avoid treating similarly named
 objects as identical.

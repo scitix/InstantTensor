@@ -201,6 +201,10 @@ INSTANTTENSOR_BACKEND=URING,AIO
 INSTANTTENSOR_BACKEND=BUFFERED
 ```
 
+With a process group, CPU-based defaults use the
+smallest per-rank CPU allocation across the group, accounting for shared cgroup
+limits, host CPUs, and overlapping CPU affinity.
+
 Backends are used in different file-system and I/O scenarios:
 
 - **In-memory file systems** (available backends: `MMAP`, `URING_BUFFERED`,
