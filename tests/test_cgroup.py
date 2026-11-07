@@ -11,7 +11,7 @@ from unittest import mock
 import torch
 import torch.distributed as dist
 
-from instanttensor import _cgroup as cgroup, _resources as resources
+from instanttensor._internal import cgroup, resources
 
 
 BOOT = "12345678-1234-5678-9abc-def012345678"

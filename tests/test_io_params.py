@@ -15,9 +15,9 @@ from unittest import mock
 
 import torch
 from instanttensor import Backend, safe_open
-from instanttensor import _cgroup as cgroup, _resources as resources
+from instanttensor._internal import cgroup, resources
 
-import instanttensor._impl as impl
+import instanttensor._internal.loader as impl
 
 
 IO_ENV_VARS = [

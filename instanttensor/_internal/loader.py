@@ -8,7 +8,7 @@ import warnings
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
-from instanttensor._resources import negotiate_resources
+from .resources import negotiate_resources
 from enum import Enum
 from typing import Union, Generator, Optional, Callable, Literal
 import threading

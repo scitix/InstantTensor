@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 from instanttensor import safe_open
-import instanttensor._impl as impl
+import instanttensor._internal.loader as impl
 
 
 class TensorFilterTest(unittest.TestCase):

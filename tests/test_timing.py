@@ -4,8 +4,8 @@ from unittest import mock
 
 import torch
 
-import instanttensor._impl as impl
-from instanttensor._resources import ResourceBudget
+import instanttensor._internal.loader as impl
+from instanttensor._internal.resources import ResourceBudget
 
 
 class LoaderTimingTest(unittest.TestCase):

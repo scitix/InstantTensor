@@ -34,7 +34,7 @@ if cuda_available:
     from safetensors.torch import save_file
 
     from instanttensor import Backend, safe_open
-    from instanttensor._impl import _C
+    from instanttensor._internal.loader import _C
 
 
 def _fgds_available() -> bool:

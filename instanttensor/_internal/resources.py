@@ -9,7 +9,7 @@ import struct
 
 import torch
 
-from instanttensor import _cgroup as cgroup
+from . import cgroup
 
 
 @dataclass(frozen=True)

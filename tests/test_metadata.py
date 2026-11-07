@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from instanttensor._impl import read_safetensors_metadata
+from instanttensor._internal.loader import read_safetensors_metadata
 
 
 def write_safetensors(path, metadata, payload=b""):

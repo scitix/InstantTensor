@@ -3,7 +3,7 @@ from unittest import mock
 
 import torch
 
-import instanttensor._impl as impl
+import instanttensor._internal.loader as impl
 
 
 class ChunkLimitTest(unittest.TestCase):
