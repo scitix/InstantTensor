@@ -24,7 +24,7 @@
 - [`Loader::compute_layout`](../csrc/loader_common.cpp#L215)
 - [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L442)
 - [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L198)
-- [`safe_open.tensors`](../instanttensor/_internal/loader.py#L993)
+- [`safe_open.tensors`](../instanttensor/_internal/loader.py#L1028)
 
 ## 生命周期总览
 

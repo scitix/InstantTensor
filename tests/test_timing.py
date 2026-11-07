@@ -34,6 +34,8 @@ class LoaderTimingTest(unittest.TestCase):
                 side_effect=timed(3, impl.Backend.URING)))
             stack.enter_context(mock.patch.object(impl.safe_open, "_read_metadata",
                 side_effect=timed(5, [(None, metadata, 8)])))
+            check = stack.enter_context(mock.patch.object(impl.safe_open, "_check_open_params",
+                side_effect=timed(4)))
             stack.enter_context(mock.patch.object(impl._C, "open", side_effect=timed(7, 1)))
             stack.enter_context(mock.patch.object(impl._C, "close", side_effect=timed(11)))
             stack.enter_context(mock.patch.object(impl._C, "get_dl_tensor",
@@ -44,7 +46,9 @@ class LoaderTimingTest(unittest.TestCase):
             loader = impl.safe_open("unused.safetensors", "pt", "cuda:0",
                 backend=impl.Backend.URING, load_now=load_now, chunk_size=4096,
                 io_depth=1, buffer_size=4096)
+            check.assert_called_once()
             yield loader, log
+            check.assert_called_once()
 
     def logged_values(self, log, prefix):
         return next(call.args[1:] for call in log.call_args_list if call.args[0].startswith(prefix))
@@ -63,9 +67,9 @@ class LoaderTimingTest(unittest.TestCase):
                         self.assertTrue(fail)
                         self.assertEqual(str(error), "consumer failed")
                     total, prepare, outside, opened, load, closed = self.logged_values(log, "Time:")
-                    self.assertEqual((prepare, outside, opened, load, closed), (10, 100, 7, 30, 11))
+                    self.assertEqual((prepare, outside, opened, load, closed), (14, 100, 7, 30, 11))
                     self.assertEqual(total, prepare + outside + opened + load + closed)
-                    self.assertEqual(self.logged_values(log, "Prepare time:"), (2, 3, 5))
+                    self.assertEqual(self.logged_values(log, "Prepare time:"), (2, 3, 5, 4))
 
     def test_throughput_counts_only_yielded_tensors(self):
         for count in (0, 1, 2):

@@ -27,7 +27,7 @@ Key source locations:
 - [`Loader::compute_layout`](../csrc/loader_common.cpp#L215)
 - [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L442)
 - [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L198)
-- [`safe_open.tensors`](../instanttensor/_internal/loader.py#L993)
+- [`safe_open.tensors`](../instanttensor/_internal/loader.py#L1028)
 
 ## Lifecycle at a Glance
 
@@ -178,9 +178,14 @@ resources, CPU affinity, and CUDA free memory. All ranks must use the same
 budgets; integrated GPUs split the scaled host-memory budget equally between
 host and device, rounding down.
 
+At the end of initialization, ranks compare buffer size, chunk size, concurrency, IO depth,
+backend, page size, and SHA-256 hashes of tensor offsets and the selection mask
+using one `all_gather_into_tensor`. A mismatch raises an error on every rank
+before native loading starts, including when `load_now=False`.
+
 Debug timing separates preparation, native open, load, and close; `load` includes
 the context body and exit stream synchronization. `outside` is time spent outside the context after
-preparation, and `total` includes it. Resource, backend, and metadata timings
+preparation, and `total` includes it. Resource, backend, metadata, and parameter-check (`check`) timings
 are components of preparation, while `load` includes caller processing.
 Throughput uses bytes actually yielded, including when iteration stops early.
 

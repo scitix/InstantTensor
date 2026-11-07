@@ -751,7 +751,8 @@ def exercise_distributed():
                 loader = safe_open(str(path), "pt", rank, process_group=dist.group.WORLD,
                                    backend=Backend.MMAP, load_now=False)
             assert reduce.call_count == 3, reduce.call_count
-            assert gather.call_count == 1, gather.call_count
+            # Resource negotiation and final open-parameter validation each gather once.
+            assert gather.call_count == 2, gather.call_count
             assert loader.concurrency == 3, loader.concurrency
             assert loader.io_depth == 9, loader.io_depth
             assert loader.host_memory_budget == 75 << 19, loader.host_memory_budget

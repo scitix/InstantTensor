@@ -13,6 +13,9 @@ from enum import Enum
 from typing import Union, Generator, Optional, Callable, Literal
 import threading
 import atexit
+import array
+import hashlib
+import struct
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -691,7 +694,11 @@ class safe_open:
                 stacklevel=2,
             )
 
-        self.prepare_seconds = time.perf_counter() - self.created_at
+        check_started_at = time.perf_counter()
+        self._check_open_params()
+        prepared_at = time.perf_counter()
+        self.check_seconds = prepared_at - check_started_at
+        self.prepare_seconds = prepared_at - self.created_at
         if load_now:
             self._open()
 
@@ -938,6 +945,33 @@ class safe_open:
 
         return meta_read_results
 
+    def _check_open_params(self):
+        if self.process_group is None or self.world_size == 1:
+            return
+
+        # File offsets can exceed 4 GiB; hash uint64 values in a fixed byte order.
+        offsets = array.array('Q', (value for pair in self.tensor_offsets for value in pair))
+        keep = array.array('B', self.tensor_keep)
+        if sys.byteorder != 'little':
+            offsets.byteswap()
+        values = [os.sysconf('SC_PAGE_SIZE'), self.buffer_size, self.chunk_size,
+                  self.concurrency, self.io_depth, self.backend.value]
+        values.extend(struct.unpack('<4q', hashlib.sha256(offsets.tobytes()).digest()))
+        values.extend(struct.unpack('<4q', hashlib.sha256(keep.tobytes()).digest()))
+
+        rows = torch.empty((self.world_size, len(values)), dtype=torch.int64, device=self.device)
+        record = rows[self.rank]
+        record.copy_(torch.tensor(values, dtype=torch.int64, device=self.device))
+        dist.all_gather_into_tensor(rows.view(-1), record, group=self.process_group)
+        records = rows.tolist()
+        fields = [('page_size', 0, 1), ('buffer_size', 1, 2), ('chunk_size', 2, 3),
+                  ('concurrency', 3, 4), ('io_depth', 4, 5), ('backend', 5, 6),
+                  ('tensor_offsets', 6, 10), ('tensor_keep', 10, 14)]
+        mismatched = [name for row in records[1:] if row != records[0]
+                      for name, start, end in fields if row[start:end] != records[0][start:end]]
+        if mismatched:
+            raise ValueError('Loader open parameters differ across ranks: ' + ', '.join(dict.fromkeys(mismatched)))
+
     def _open(self):
         open_started_at = time.perf_counter()
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
@@ -965,7 +999,7 @@ class safe_open:
             open_seconds = self.open_seconds
             load_seconds = load_finished_at - self.load_started_at
             close_seconds = closed_at - load_finished_at
-            # Delays before entering the context are not preparation or open work.
+            # Exclude preparation and open work from caller delays.
             outside_seconds = max(self.load_started_at - self.created_at
                                   - prepare_seconds - open_seconds, 0.0)
             debug_log(
@@ -978,10 +1012,11 @@ class safe_open:
                 close_seconds,
             )
             debug_log(
-                "Prepare time: resources=%.2fs, backend=%.2fs, metadata=%.2fs",
+                "Prepare time: resources=%.2fs, backend=%.2fs, metadata=%.2fs, check=%.2fs",
                 self.resources_seconds,
                 self.backend_seconds,
                 self.metadata_seconds,
+                self.check_seconds,
             )
             debug_log(
                 "Throughput: total=%.2fGB/s, load=%.2fGB/s, yielded=%d B",
