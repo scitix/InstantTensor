@@ -118,8 +118,9 @@ with safe_open(files, framework="pt", device=0,
         tensors[name] = tensor
 ```
 
-Filtering requires `process_group=None`: each GPU loads its own selection
-independently. Unfiltered distributed loading is unchanged.
+Filtering supports distributed loading when all ranks in the process group select
+the same tensors from the same files. Use `process_group=None` for independent
+selections on each GPU.
 Use `tensor_name_match_mode` to choose how all entries in the list are interpreted:
 
 | Mode | Example | Matching |

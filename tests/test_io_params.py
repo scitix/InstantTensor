@@ -100,10 +100,6 @@ class DistributedBackendSelectionTest(unittest.TestCase):
 
 
 class IOParamsTest(unittest.TestCase):
-    def test_tensor_filter_rejects_collective_loading(self):
-        with self.assertRaisesRegex(ValueError, "tensor_filter requires process_group=None"):
-            safe_open([], "pt", 0, process_group=object(), tensor_filter=["weight"])
-
     def test_tensor_filter_requires_string_list(self):
         for filters in ("weight", [1], lambda name: True):
             with self.subTest(filters=filters), self.assertRaises(TypeError):
@@ -730,7 +726,7 @@ def exercise_distributed():
                 with mock.patch.object(impl, "negotiate_resources", return_value=resources.ResourceBudget(8, 1 << 30, 128 << 20)), \
                      mock.patch.object(impl.dist, "all_reduce", wraps=dist.all_reduce) as reduce:
                     loader = safe_open(str(path), "pt", rank, process_group=dist.group.WORLD,
-                                       backend=candidates, load_now=False)
+                                       backend=candidates, tensor_filter=["weight"], load_now=False)
                 assert reduce.call_count == 2
                 assert loader.backend == chosen
                 assert loader.device_memory_budget == 128 << 20

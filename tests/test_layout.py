@@ -109,7 +109,7 @@ def exercise_gpu(backend, ranks):
                     path = Path(directory) / f"case{case_id}-{file_id}.safetensors"
                     path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
                     paths.append(str(path))
-                selection = [name for name in expected if int(name[1:]) % 2 == rank % 2]
+                selection = [name for name in expected if int(name[1:]) % 2 == 0]
                 for mode, filters in (("glob", None), ("exact", selection),
                                       ("glob", ["t*[02468]"]), ("regex", [r"t\d*[02468]"]),
                                       ("exact", []), ("glob", []), ("regex", [])):
@@ -127,7 +127,7 @@ def exercise_gpu(backend, ranks):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", UserWarning)
                         with safe_open(paths, "pt", rank,
-                                       process_group=dist.group.WORLD if ranks > 1 and filters is None else None,
+                                       process_group=dist.group.WORLD if ranks > 1 else None,
                                        tensor_filter=filters,
                                        tensor_name_match_mode=mode,
                                        backend=Backend[backend], chunk_size=4096, io_depth=8,

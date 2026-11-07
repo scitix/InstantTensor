@@ -534,7 +534,8 @@ class safe_open:
             Patterns are matched using the rules specified by ``tensor_name_match_mode``.
             A tensor is selected when any pattern matches. An empty list selects none.
             Excluded tensors do not contribute to buffer sizing or progress.
-            Requires ``process_group=None`` so ranks can select different tensors.
+            Currently, all ranks must select the same tensors from the
+            same files. Use ``process_group=None`` for independent selections.
         tensor_name_match_mode: How to match tensor name patterns: ``"glob"``
             (default) for shell-style wildcards, ``"exact"`` for literal names,
             or ``"regex"`` for regular expressions. Matching is case-sensitive
@@ -607,8 +608,6 @@ class safe_open:
         """ 
         self.init_time = time.perf_counter()
 
-        if tensor_filter is not None and process_group is not None:
-            raise ValueError("tensor_filter requires process_group=None")
         matches_tensor = _compile_name_matcher(tensor_filter, tensor_name_match_mode)
 
         if isinstance(filename, str):
