@@ -8,7 +8,7 @@ import warnings
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
-from instanttensor.resources import negotiate_resources
+from instanttensor._resources import negotiate_resources
 from enum import Enum
 from typing import Union, Generator, Optional, Callable, Literal
 import threading
@@ -92,7 +92,7 @@ _emitted_backend_warnings = set()
 
 
 @dataclass(frozen=True)
-class _OpenConfig:
+class OpenConfig:
     buffer_size: Optional[int]
     chunk_size: Optional[int]
     concurrency: Optional[int]
@@ -138,7 +138,7 @@ def backend_names(backends: list[Backend]) -> list[str]:
     return [backend.name for backend in backends]
 
 
-def _emit_backend_warning(message: str) -> None:
+def emit_backend_warning(message: str) -> None:
     if not message or message in _emitted_backend_warnings:
         return
 
@@ -182,7 +182,7 @@ def select_distributed_backend(
         # Other ranks retain the intersection; MIN distributes rank 0's single choice.
         dist.all_reduce(selection, op=dist.ReduceOp.MIN, group=process_group)
         backend = Backend(selection.tolist().index(1))
-    _emit_backend_warning(statuses[backend][2])
+    emit_backend_warning(statuses[backend][2])
     debug_log("Using backend %s", backend.name)
     return backend
 
@@ -217,15 +217,15 @@ def env_buffer_size():
     return int(ret) if ret is not None else None
 
 
-def _resolve_open_config(
+def resolve_open_config(
     buffer_size: Optional[int],
     chunk_size: Optional[int],
     concurrency: Optional[int],
     io_depth: Optional[int],
     max_free_mem_usage: Optional[float],
     backend: BackendCandidates,
-) -> _OpenConfig:
-    return _OpenConfig(
+) -> OpenConfig:
+    return OpenConfig(
         buffer_size=buffer_size if buffer_size is not None else env_buffer_size(),
         chunk_size=chunk_size if chunk_size is not None else env_chunk_size(),
         concurrency=concurrency if concurrency is not None else env_concurrency(),
@@ -436,7 +436,7 @@ def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor:
 
 group_communicator_cache = {}
 
-def _compile_name_matcher(
+def compile_name_matcher(
     name_patterns: Optional[list[str]],
     tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob",
 ) -> Callable[[str], bool]:
@@ -608,7 +608,7 @@ class safe_open:
         """ 
         self.created_at = time.perf_counter()
 
-        matches_tensor = _compile_name_matcher(tensor_filter, tensor_name_match_mode)
+        matches_tensor = compile_name_matcher(tensor_filter, tensor_name_match_mode)
 
         if isinstance(filename, str):
             filename = [filename]
@@ -641,7 +641,7 @@ class safe_open:
         self._invalidated = False
         self.yielded_bytes = 0
 
-        config = _resolve_open_config(
+        config = resolve_open_config(
             buffer_size, chunk_size, concurrency, io_depth,
             max_free_mem_usage, backend,
         )
@@ -695,7 +695,7 @@ class safe_open:
         if load_now:
             self._open()
 
-    def _determine_io_params(self, config: _OpenConfig):
+    def _determine_io_params(self, config: OpenConfig):
         buffer_size = config.buffer_size
         chunk_size = config.chunk_size
         concurrency = config.concurrency

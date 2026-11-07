@@ -15,7 +15,7 @@ from unittest import mock
 
 import torch
 from instanttensor import Backend, safe_open
-from instanttensor import cgroup, resources
+from instanttensor import _cgroup as cgroup, _resources as resources
 
 import instanttensor._impl as impl
 
@@ -146,7 +146,7 @@ class IOParamsTest(unittest.TestCase):
                 "mem_get_info",
                 return_value=(free_bytes, free_bytes),
             ))
-            config = impl._resolve_open_config(
+            config = impl.resolve_open_config(
                 buffer_size=buffer_size,
                 chunk_size=chunk_size,
                 concurrency=concurrency,
@@ -481,7 +481,7 @@ class IOParamsTest(unittest.TestCase):
                 return_value=(1 << 50, 1 << 50),
             ))
 
-            config = impl._resolve_open_config(
+            config = impl.resolve_open_config(
                 buffer_size=None,
                 chunk_size=chunk_size,
                 concurrency=0,

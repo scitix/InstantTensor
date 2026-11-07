@@ -5,7 +5,7 @@ from unittest import mock
 import torch
 
 import instanttensor._impl as impl
-from instanttensor.resources import ResourceBudget
+from instanttensor._resources import ResourceBudget
 
 
 class LoaderTimingTest(unittest.TestCase):

@@ -11,7 +11,7 @@ from unittest import mock
 import torch
 import torch.distributed as dist
 
-from instanttensor import cgroup, resources
+from instanttensor import _cgroup as cgroup, _resources as resources
 
 
 BOOT = "12345678-1234-5678-9abc-def012345678"
@@ -27,18 +27,18 @@ def entry(inode, host=BOOT):
 
 class CgroupTest(unittest.TestCase):
     def test_mount_mapping_and_escaping(self):
-        mounts = cgroup._mounts(
+        mounts = cgroup.mounts(
             "10 1 0:29 /job /cg\\040sub rw - cgroup2 cgroup rw\n"
             "11 1 0:29 / /cg rw - cgroup2 cgroup rw\n"
             "12 1 0:29 /.. /bad rw - cgroup2 cgroup rw\n"
         )
         self.assertEqual([m["id"] for m in mounts], [11, 10])
-        self.assertEqual(cgroup._local_path(mounts[1], "/job/worker"), "/cg sub/worker")
-        self.assertIsNone(cgroup._local_path(mounts[1], "/job-other/worker"))
-        self.assertEqual(cgroup._v2_path("1:cpu:/old\n0::/job\n"), "/job")
+        self.assertEqual(cgroup.local_path(mounts[1], "/job/worker"), "/cg sub/worker")
+        self.assertIsNone(cgroup.local_path(mounts[1], "/job-other/worker"))
+        self.assertEqual(cgroup.v2_path("1:cpu:/old\n0::/job\n"), "/job")
         for text in ("1:memory:/old\n", "0::/../hidden\n"):
             with self.assertRaises(ValueError):
-                cgroup._v2_path(text)
+                cgroup.v2_path(text)
 
     def test_resource_files_and_missing_controllers(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
@@ -46,7 +46,7 @@ class CgroupTest(unittest.TestCase):
             fd = os.open(path, os.O_PATH | os.O_DIRECTORY)
             stack.callback(os.close, fd)
             key = entry(10).key
-            empty = cgroup._resources(fd, key, "/")
+            empty = cgroup.resources(fd, key, "/")
             self.assertIsNone(empty.avail_cpus)
             self.assertIsNone(empty.avail_mem)
             for name, value in {
@@ -55,27 +55,27 @@ class CgroupTest(unittest.TestCase):
                 "memory.stat": "anon 1024\nfile 2048\ninactive_file 1024\n",
             }.items():
                 (path / name).write_text(value)
-            resources = cgroup._resources(fd, key, "/job")
+            resources = cgroup.resources(fd, key, "/job")
             self.assertEqual(resources.avail_cpus, 2)
             self.assertEqual(resources.avail_mem, 2048)
             (path / "memory.current").write_text("8192\n")
-            self.assertEqual(cgroup._resources(fd, key, "/job").avail_mem, 0)
+            self.assertEqual(cgroup.resources(fd, key, "/job").avail_mem, 0)
             (path / "cpu.max").write_text("max 100000\n")
             (path / "memory.max").write_text("max\n")
-            resources = cgroup._resources(fd, key, "/job")
+            resources = cgroup.resources(fd, key, "/job")
             self.assertEqual(resources.avail_cpus, 6)
             self.assertIsNone(resources.avail_mem)
             (path / "cpu.max").write_text("800000 100000\n")
-            self.assertEqual(cgroup._resources(fd, key, "/job").avail_cpus, 6)
+            self.assertEqual(cgroup.resources(fd, key, "/job").avail_cpus, 6)
             (path / "memory.max").write_text("4096\n")
             (path / "memory.current").unlink()
             with self.assertRaises(FileNotFoundError):
-                cgroup._resources(fd, key, "/job")
+                cgroup.resources(fd, key, "/job")
 
     def test_permission_errors_are_not_unlimited(self):
-        with mock.patch.object(cgroup, "_read_at", side_effect=PermissionError("denied")):
+        with mock.patch.object(cgroup, "read_at", side_effect=PermissionError("denied")):
             with self.assertRaises(PermissionError):
-                cgroup._resources(0, entry(1).key, "/")
+                cgroup.resources(0, entry(1).key, "/")
 
     def test_query_includes_unlimited_parents_and_visible_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -86,21 +86,21 @@ class CgroupTest(unittest.TestCase):
             (path / "memory.stat").write_text("inactive_file 512\n")
             fd = os.open(path, os.O_PATH | os.O_DIRECTORY)
             try:
-                info = dict(line.split(":", 1) for line in cgroup._read(f"/proc/self/fdinfo/{fd}").splitlines())
+                info = dict(line.split(":", 1) for line in cgroup.read(f"/proc/self/fdinfo/{fd}").splitlines())
                 st = os.fstat(fd)
             finally:
                 os.close(fd)
             mount = {"id": int(info["mnt_id"]), "device": f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}",
                      "point": directory, "root_parts": ("job",)}
-            original_read = cgroup._read
+            original_read = cgroup.read
 
             def read(filename):
                 if filename == "/proc/self/cgroup":
                     return "0::/job/worker\n"
                 return original_read(filename)
 
-            with mock.patch.object(cgroup, "_read", side_effect=read), \
-                 mock.patch.object(cgroup, "_mounts", return_value=[mount]):
+            with mock.patch.object(cgroup, "read", side_effect=read), \
+                 mock.patch.object(cgroup, "mounts", return_value=[mount]):
                 snapshot = cgroup.query_resources(host_boot_id=BOOT)
             self.assertEqual([e.path for e in snapshot.entries], ["/job/worker", "/job"])
             self.assertIsNone(snapshot.entries[0].avail_mem)
@@ -110,7 +110,7 @@ class CgroupTest(unittest.TestCase):
 
     def test_local_count_and_lossless_key_encoding(self):
         leaf, root = entry((1 << 64) - 1), entry(1)
-        self.assertEqual(cgroup._decode_key(cgroup._encode_key(leaf.key)), leaf.key)
+        self.assertEqual(cgroup.decode_key(cgroup.encode_key(leaf.key)), leaf.key)
         snapshot = cgroup.CgroupSnapshot((leaf, root, root), False)
         with mock.patch.object(dist, "all_reduce") as reduce, \
              mock.patch.object(dist, "all_gather_into_tensor") as gather:

@@ -9,23 +9,23 @@ import instanttensor._impl as impl
 
 class TensorFilterTest(unittest.TestCase):
     def test_default_is_glob(self):
-        matches = impl._compile_name_matcher(["model.layers.*.weight"])
+        matches = impl.compile_name_matcher(["model.layers.*.weight"])
         self.assertTrue(matches("model.layers.0.weight"))
         self.assertTrue(matches("model.layers.0.attn.weight"))
         self.assertFalse(matches("modelXlayersX0Xweight"))
 
     def test_glob_metacharacters(self):
-        matches = impl._compile_name_matcher(["layer?.weight[012]"])
+        matches = impl.compile_name_matcher(["layer?.weight[012]"])
         self.assertTrue(matches("layer0.weight2"))
         self.assertFalse(matches("layer10.weight2"))
         self.assertFalse(matches("layer0.weight3"))
-        self.assertTrue(impl._compile_name_matcher(["weight[[]0]"])("weight[0]"))
+        self.assertTrue(impl.compile_name_matcher(["weight[[]0]"])("weight[0]"))
 
     def test_glob_literals_skip_regex_compilation(self):
         names = ["model.layers.0.weight", "weight]", "weight!", "weight-",
                  "weight{0}", "weight(0)", "weight+", "weight^$", "weight|0", r"weight\0", ""]
         with mock.patch.object(impl.re, "compile", wraps=impl.re.compile) as compile_pattern:
-            matches = impl._compile_name_matcher(names)
+            matches = impl.compile_name_matcher(names)
             for name in names:
                 self.assertIs(matches(name), True)
             self.assertIs(matches("modelXlayersX0Xweight"), False)
@@ -36,7 +36,7 @@ class TensorFilterTest(unittest.TestCase):
         patterns = ["literal.weight", "literal.weight", "layer*.bias", "layer?.weight",
                     "weight[012]", "broken["]
         with mock.patch.object(impl.re, "compile", wraps=impl.re.compile) as compile_pattern:
-            matches = impl._compile_name_matcher(patterns)
+            matches = impl.compile_name_matcher(patterns)
             self.assertEqual(compile_pattern.call_count, 4)
             for name in ("literal.weight", "layer0.attn.bias", "layer1.weight", "weight0", "broken["):
                 self.assertIs(matches(name), True)
@@ -46,7 +46,7 @@ class TensorFilterTest(unittest.TestCase):
 
     def test_regex_does_not_use_glob_literal_fast_path(self):
         with mock.patch.object(impl.re, "compile", wraps=impl.re.compile) as compile_pattern:
-            matches = impl._compile_name_matcher(["weight", "model.layers.0.weight"], "regex")
+            matches = impl.compile_name_matcher(["weight", "model.layers.0.weight"], "regex")
             self.assertEqual(compile_pattern.call_count, 2)
             self.assertTrue(matches("modelXlayersX0Xweight"))
             self.assertTrue(matches("weight"))
@@ -60,21 +60,21 @@ class TensorFilterTest(unittest.TestCase):
             ]
             names = patterns + ["".join(rng.choices(alphabet, k=rng.randrange(0, 12)))
                                 for _ in range(30)]
-            matches = impl._compile_name_matcher(patterns)
+            matches = impl.compile_name_matcher(patterns)
             for name in names:
                 with self.subTest(trial=trial, name=name):
                     self.assertEqual(matches(name), any(fnmatch.fnmatchcase(name, p) for p in patterns))
 
     def test_exact_treats_special_characters_literally(self):
         names = ["weight[0]", "weight*", "weight?", "broken[", "(foo"]
-        matches = impl._compile_name_matcher(names, "exact")
+        matches = impl.compile_name_matcher(names, "exact")
         for name in names:
             self.assertTrue(matches(name))
         self.assertFalse(matches("weight0"))
         self.assertFalse(matches("weight_anything"))
 
     def test_regex_fullmatch(self):
-        matches = impl._compile_name_matcher([r"model\.layers\.\d+\.weight"], "regex")
+        matches = impl.compile_name_matcher([r"model\.layers\.\d+\.weight"], "regex")
         self.assertTrue(matches("model.layers.12.weight"))
         self.assertFalse(matches("prefix.model.layers.12.weight"))
         self.assertFalse(matches("model.layers.12.weight.suffix"))
@@ -82,20 +82,20 @@ class TensorFilterTest(unittest.TestCase):
     def test_case_sensitive_by_default(self):
         for mode in ("exact", "glob", "regex"):
             with self.subTest(mode=mode):
-                matches = impl._compile_name_matcher(["weight"], mode)
+                matches = impl.compile_name_matcher(["weight"], mode)
                 self.assertTrue(matches("weight"))
                 self.assertFalse(matches("Weight"))
 
     def test_none_and_empty_list(self):
         for mode in ("exact", "glob", "regex"):
             with self.subTest(mode=mode):
-                self.assertTrue(impl._compile_name_matcher(None, mode)("anything"))
-                self.assertFalse(impl._compile_name_matcher([], mode)("anything"))
+                self.assertTrue(impl.compile_name_matcher(None, mode)("anything"))
+                self.assertFalse(impl.compile_name_matcher([], mode)("anything"))
 
     def test_patterns_are_alternatives_and_return_bool(self):
         for mode in ("exact", "glob", "regex"):
             with self.subTest(mode=mode):
-                matches = impl._compile_name_matcher(["first", "second"], mode)
+                matches = impl.compile_name_matcher(["first", "second"], mode)
                 self.assertIs(matches("first"), True)
                 self.assertIs(matches("second"), True)
                 self.assertIs(matches("third"), False)
@@ -103,18 +103,18 @@ class TensorFilterTest(unittest.TestCase):
     def test_invalid_mode(self):
         for mode in ("auto", "GLOB", "", None, [], 1):
             with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "tensor_name_match_mode"):
-                impl._compile_name_matcher(None, mode)
+                impl.compile_name_matcher(None, mode)
 
     def test_requires_string_list(self):
         for filters in ("weight", [1], [None], ("weight",), {"weight"}, lambda name: True):
             with self.subTest(filters=filters), self.assertRaisesRegex(TypeError, "list of strings"):
-                impl._compile_name_matcher(filters)
+                impl.compile_name_matcher(filters)
 
     def test_invalid_regex_does_not_affect_other_modes(self):
         with self.assertRaisesRegex(ValueError, "Invalid regex pattern"):
-            impl._compile_name_matcher(["broken["], "regex")
+            impl.compile_name_matcher(["broken["], "regex")
         for mode in ("exact", "glob"):
-            self.assertTrue(impl._compile_name_matcher(["broken["], mode)("broken["))
+            self.assertTrue(impl.compile_name_matcher(["broken["], mode)("broken["))
 
     def test_public_api_validates_before_reading_metadata(self):
         with mock.patch.object(safe_open, "_read_metadata") as read:

@@ -9,7 +9,7 @@ import struct
 
 import torch
 
-from instanttensor import cgroup
+from instanttensor import _cgroup as cgroup
 
 
 @dataclass(frozen=True)
@@ -88,8 +88,8 @@ def allocate_resources(ranks: list[RankResources]) -> tuple[ResourceBudget, ...]
     return tuple(budgets)
 
 
-def _encode_rank(rank):
-    values = cgroup._encode_key(cgroup.CgroupKey(rank.host_boot_id, 0, 0, 0))[:4]
+def encode_rank(rank):
+    values = cgroup.encode_key(cgroup.CgroupKey(rank.host_boot_id, 0, 0, 0))[:4]
     values += [rank.cpu_count, rank.avail_mem, len(rank.affinity),
                len(rank.cgroups.entries), int(rank.cgroups.ancestors_complete)]
     # Preserve the fraction's float64 bits in the int64 resource record.
@@ -97,14 +97,14 @@ def _encode_rank(rank):
                struct.unpack("q", struct.pack("d", rank.max_free_mem_usage))[0]]
     values.extend(sorted(rank.affinity))
     for entry in rank.cgroups.entries:
-        values.extend(cgroup._encode_key(entry.key))
+        values.extend(cgroup.encode_key(entry.key))
         values.extend([entry.avail_cpus if entry.avail_cpus is not None else -1,
                        entry.avail_mem if entry.avail_mem is not None else -1])
     return values
 
 
-def _decode_rank(values):
-    boot_id = cgroup._decode_key(values[:4] + [0] * 4).host_boot_id
+def decode_rank(values):
+    boot_id = cgroup.decode_key(values[:4] + [0] * 4).host_boot_id
     cpu_count, avail_mem, affinity_size, entry_count, complete = values[4:9]
     device_free_mem, is_integrated, fraction_bits = values[9:12]
     fraction = struct.unpack("d", struct.pack("q", fraction_bits))[0]
@@ -112,7 +112,7 @@ def _decode_rank(values):
     entries = []
     for index in range(entry_count):
         start = offset + 10 * index
-        key = cgroup._decode_key(values[start:start + 8])
+        key = cgroup.decode_key(values[start:start + 8])
         cpus, memory = values[start + 8:start + 10]
         entries.append(cgroup.CgroupResources(key, "", None if cpus == -1 else cpus,
                                                None if memory == -1 else memory))
@@ -128,8 +128,8 @@ def negotiate_resources(process_group, *, device, max_free_mem_usage) -> Resourc
     minimum locally. No additional collective is needed for the final minimum.
     """
     local = query_rank_resources(device, max_free_mem_usage=max_free_mem_usage)
-    rows = cgroup._gather_records(_encode_rank(local), process_group, device)
-    ranks = [_decode_rank(row) for row in rows]
+    rows = cgroup.gather_records(encode_rank(local), process_group, device)
+    ranks = [decode_rank(row) for row in rows]
     if any(rank.device_free_mem < 0 for rank in ranks):
         raise RuntimeError("Cannot query CUDA resources on at least one rank")
     if any(not math.isfinite(rank.max_free_mem_usage) or

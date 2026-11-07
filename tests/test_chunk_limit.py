@@ -14,7 +14,7 @@ class ChunkLimitTest(unittest.TestCase):
         loader.process_group = None
         loader.device = torch.device("cuda:0")
 
-        config = impl._resolve_open_config(
+        config = impl.resolve_open_config(
             buffer_size=None,
             chunk_size=impl.MAX_CHUNK_SIZE + 1,
             concurrency=1,

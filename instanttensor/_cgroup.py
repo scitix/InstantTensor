@@ -44,28 +44,28 @@ class CgroupUsage:
     ancestors_complete_by_rank: tuple[bool, ...]
 
 
-def _read(path):
+def read(path):
     with open(path, encoding="utf-8", errors="surrogateescape") as stream:
         return stream.read()
 
 
-def _components(path):
+def components(path):
     parts = path.split("/")
     if not path.startswith("/") or any(p in (".", "..") for p in parts):
         raise ValueError("Unresolvable namespace-relative path: " + repr(path))
     return tuple(p for p in parts if p)
 
 
-def _v2_path(text):
+def v2_path(text):
     for line in text.splitlines():
         hierarchy, controllers, path = line.split(":", 2)
         if hierarchy == "0" and controllers == "":
-            _components(path)
+            components(path)
             return path
     raise ValueError("No cgroup v2 membership found")
 
 
-def _mounts(text):
+def mounts(text):
     result = []
     for line in text.splitlines():
         left, right = line.split(" - ", 1)
@@ -75,7 +75,7 @@ def _mounts(text):
         root, point = (re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), field)
                        for field in fields[3:5])
         try:
-            root_parts = _components(root)
+            root_parts = components(root)
         except ValueError:
             continue
         result.append({"id": int(fields[0]), "device": fields[2],
@@ -83,17 +83,17 @@ def _mounts(text):
     return sorted(result, key=lambda mount: len(mount["root_parts"]))
 
 
-def _local_path(mount, path):
-    root, parts = mount["root_parts"], _components(path)
+def local_path(mount, path):
+    root, parts = mount["root_parts"], components(path)
     if root != parts[:len(root)]:
         return None
     return posixpath.join(mount["point"], *parts[len(root):])
 
 
-def _checked_open(path, mount, stack):
+def checked_open(path, mount, stack):
     fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     stack.callback(os.close, fd)
-    info = dict(line.split(":", 1) for line in _read(f"/proc/self/fdinfo/{fd}").splitlines())
+    info = dict(line.split(":", 1) for line in read(f"/proc/self/fdinfo/{fd}").splitlines())
     st = os.fstat(fd)
     device = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
     if int(info["mnt_id"]) != mount["id"] or device != mount["device"]:
@@ -103,20 +103,20 @@ def _checked_open(path, mount, stack):
     return fd, st
 
 
-def _read_at(fd, name):
+def read_at(fd, name):
     with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd),
                    encoding="ascii") as stream:
         return stream.read().strip()
 
 
-def _optional_read_at(fd, name):
+def optional_read_at(fd, name):
     try:
-        return _read_at(fd, name)
+        return read_at(fd, name)
     except FileNotFoundError:
         return None
 
 
-def _parse_cpuset(text):
+def parse_cpuset(text):
     cpus = set()
     for item in text.split(",") if text else ():
         bounds = item.split("-")
@@ -127,22 +127,22 @@ def _parse_cpuset(text):
     return tuple(sorted(cpus))
 
 
-def _resources(fd, key, path):
+def resources(fd, key, path):
     cpu_limits = []
-    cpu_max = _optional_read_at(fd, "cpu.max")
+    cpu_max = optional_read_at(fd, "cpu.max")
     if cpu_max is not None:
         quota_text, period_text = cpu_max.split()
         if quota_text != "max":
             quota, period = int(quota_text), int(period_text)
             cpu_limits.append((quota + period - 1) // period)
-    cpuset = _optional_read_at(fd, "cpuset.cpus.effective")
+    cpuset = optional_read_at(fd, "cpuset.cpus.effective")
     if cpuset is not None:
-        cpu_limits.append(len(_parse_cpuset(cpuset)))
+        cpu_limits.append(len(parse_cpuset(cpuset)))
     avail_mem = None
-    limit = _optional_read_at(fd, "memory.max")
+    limit = optional_read_at(fd, "memory.max")
     if limit is not None and limit != "max":
-        current = int(_read_at(fd, "memory.current"))
-        stats = dict(line.split() for line in _read_at(fd, "memory.stat").splitlines())
+        current = int(read_at(fd, "memory.current"))
+        stats = dict(line.split() for line in read_at(fd, "memory.stat").splitlines())
         avail_mem = max(int(limit) - current + int(stats["inactive_file"]), 0)
     return CgroupResources(key, path, min(cpu_limits, default=None), avail_mem)
 
@@ -155,28 +155,28 @@ def query_resources(*, host_boot_id: str | None = None) -> CgroupSnapshot:
     The completeness flag uses the Linux kernfs root-inode convention (inode 1).
     """
     boot_id = get_host_boot_id(host_boot_id)
-    membership = _v2_path(_read("/proc/self/cgroup"))
+    membership = v2_path(read("/proc/self/cgroup"))
     errors = []
-    for mount in _mounts(_read("/proc/self/mountinfo")):
-        if _local_path(mount, membership) is None:
+    for mount in mounts(read("/proc/self/mountinfo")):
+        if local_path(mount, membership) is None:
             continue
         try:
             with contextlib.ExitStack() as stack:
                 entries, paths = [], []
                 current = membership
                 while True:
-                    path = _local_path(mount, current)
-                    fd, st = _checked_open(path, mount, stack)
+                    path = local_path(mount, current)
+                    fd, st = checked_open(path, mount, stack)
                     key = CgroupKey(boot_id, os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
-                    entries.append(_resources(fd, key, current))
+                    entries.append(resources(fd, key, current))
                     paths.append(path)
-                    if _components(current) == mount["root_parts"]:
+                    if components(current) == mount["root_parts"]:
                         break
                     current = posixpath.dirname(current)
-                if _v2_path(_read("/proc/self/cgroup")) != membership:
+                if v2_path(read("/proc/self/cgroup")) != membership:
                     raise ValueError("Cgroup membership changed during observation")
                 for entry, path in zip(entries, paths):
-                    _, st = _checked_open(path, mount, stack)
+                    _, st = checked_open(path, mount, stack)
                     if entry.key != CgroupKey(boot_id, os.major(st.st_dev), os.minor(st.st_dev), st.st_ino):
                         raise ValueError("Cgroup changed during observation")
                 return CgroupSnapshot(tuple(entries), entries[-1].key.inode == 1)
@@ -186,7 +186,7 @@ def query_resources(*, host_boot_id: str | None = None) -> CgroupSnapshot:
                      ("; ".join(errors) or "no compatible, accessible cgroup2 mount"))
 
 
-def _encode_key(key):
+def encode_key(key):
     # Use 32-bit words so UUIDs and unsigned inode numbers fit signed int64
     # tensors exactly. Python hash() is process-dependent and is not used.
     host = uuid.UUID(key.host_boot_id).int
@@ -195,7 +195,7 @@ def _encode_key(key):
     ]
 
 
-def _decode_key(words):
+def decode_key(words):
     host = 0
     for word in words[:4]:
         host = (host << 32) | word
@@ -205,10 +205,10 @@ def _decode_key(words):
 
 def get_host_boot_id(override=None):
     return str(uuid.UUID(override or os.getenv("CGROUP_HOST_BOOT_ID") or
-                         _read("/proc/sys/kernel/random/boot_id").strip()))
+                         read("/proc/sys/kernel/random/boot_id").strip()))
 
 
-def _gather_records(values, process_group, device):
+def gather_records(values, process_group, device):
     """Exchange variable-length int64 records without pickling Python objects."""
     if process_group is None:
         return [values]
@@ -246,11 +246,11 @@ def count_process_group_users(
 
     values = [len(keys), int(snapshot.ancestors_complete)]
     for key in keys:
-        values.extend(_encode_key(key))
+        values.extend(encode_key(key))
     counts, complete = {}, []
-    for row in _gather_records(values, process_group, device):
+    for row in gather_records(values, process_group, device):
         complete.append(bool(row[1]))
         for index in range(row[0]):
-            key = _decode_key(row[2 + 8 * index:2 + 8 * (index + 1)])
+            key = decode_key(row[2 + 8 * index:2 + 8 * (index + 1)])
             counts[key] = counts.get(key, 0) + 1
     return CgroupUsage(counts, tuple(complete))

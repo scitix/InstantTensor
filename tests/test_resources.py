@@ -2,7 +2,7 @@ from dataclasses import replace
 import unittest
 from unittest import mock
 
-from instanttensor import cgroup, resources
+from instanttensor import _cgroup as cgroup, _resources as resources
 
 
 BOOT = "12345678-1234-5678-9abc-def012345678"
@@ -58,13 +58,13 @@ class ResourceAllocationTest(unittest.TestCase):
     def test_independent_cpu_and_memory_minimum(self):
         ranks = [rank(cpus=4, memory=1000), rank(cpus=16, memory=400)]
         with mock.patch.object(resources, "query_rank_resources", return_value=ranks[0]), \
-             mock.patch.object(cgroup, "_gather_records", return_value=[resources._encode_rank(r) for r in ranks]):
+             mock.patch.object(cgroup, "gather_records", return_value=[resources.encode_rank(r) for r in ranks]):
             self.assertEqual(resources.negotiate_resources(object(), device=None, max_free_mem_usage=1.0), resources.ResourceBudget(2, 200, 1000))
 
     def test_record_roundtrip(self):
         local = rank(affinity=(1, 1000), entries=(entry((1 << 64) - 1, 3, 0), entry(1)))
         local = replace(local, device_free_mem=123456789, max_free_mem_usage=0.1)
-        decoded = resources._decode_rank(resources._encode_rank(local))
+        decoded = resources.decode_rank(resources.encode_rank(local))
         self.assertEqual(decoded, replace(local, cgroups=replace(local.cgroups,
             entries=tuple(replace(e, path="") for e in local.cgroups.entries))))
 
@@ -92,7 +92,7 @@ class ResourceAllocationTest(unittest.TestCase):
         ranks = [rank(memory=1000, device_memory=1000, fraction=0.5),
                  rank(memory=20, device_memory=400, fraction=0.5)]
         with mock.patch.object(resources, "query_rank_resources", return_value=ranks[0]), \
-             mock.patch.object(cgroup, "_gather_records", return_value=[resources._encode_rank(r) for r in ranks]):
+             mock.patch.object(cgroup, "gather_records", return_value=[resources.encode_rank(r) for r in ranks]):
             budget = resources.negotiate_resources(object(), device=None, max_free_mem_usage=1.0)
         self.assertEqual(budget, resources.ResourceBudget(8, 5, 200))
 
@@ -100,7 +100,7 @@ class ResourceAllocationTest(unittest.TestCase):
         ranks = [rank(memory=2000, integrated=True, fraction=0.5),
                  rank(memory=414, integrated=True, device_memory=0, fraction=0.5)]
         with mock.patch.object(resources, "query_rank_resources", return_value=ranks[0]), \
-             mock.patch.object(cgroup, "_gather_records", return_value=[resources._encode_rank(r) for r in ranks]):
+             mock.patch.object(cgroup, "gather_records", return_value=[resources.encode_rank(r) for r in ranks]):
             budget = resources.negotiate_resources(object(), device=None, max_free_mem_usage=1.0)
         # 414 / 2 host users -> 207; floor(207 * 0.5) / 2 -> 51 each.
         self.assertEqual(budget, resources.ResourceBudget(8, 51, 51))
@@ -125,7 +125,7 @@ class ResourceAllocationTest(unittest.TestCase):
             ranks = [rank(), replace(rank(), **{field: value})]
             with self.subTest(field=field), \
                  mock.patch.object(resources, "query_rank_resources", return_value=ranks[0]), \
-                 mock.patch.object(cgroup, "_gather_records", return_value=[resources._encode_rank(r) for r in ranks]), \
+                 mock.patch.object(cgroup, "gather_records", return_value=[resources.encode_rank(r) for r in ranks]), \
                  self.assertRaisesRegex(ValueError, field + " must be identical"):
                 resources.negotiate_resources(object(), device=None, max_free_mem_usage=1.0)
 
@@ -134,7 +134,7 @@ class ResourceAllocationTest(unittest.TestCase):
             ranks = [rank(), replace(rank(), max_free_mem_usage=fraction)]
             with self.subTest(fraction=fraction), \
                  mock.patch.object(resources, "query_rank_resources", return_value=ranks[0]), \
-                 mock.patch.object(cgroup, "_gather_records", return_value=[resources._encode_rank(r) for r in ranks]), \
+                 mock.patch.object(cgroup, "gather_records", return_value=[resources.encode_rank(r) for r in ranks]), \
                  self.assertRaisesRegex(ValueError, "max_free_mem_usage"):
                 resources.negotiate_resources(object(), device=None, max_free_mem_usage=1.0)
 
