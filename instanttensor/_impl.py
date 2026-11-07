@@ -150,28 +150,41 @@ def _emit_backend_warning(message: str) -> None:
     _emitted_backend_warnings.add(message)
 
 
-def select_backend(candidates: list[Backend], supported_backends: Optional[list[Backend]] = None) -> Backend:
-    rejected = []
-    for backend in candidates:
-        if supported_backends is not None and backend not in supported_backends:
-            rejected.append(f"{backend.name} is not supported for this filesystem.")
-            continue
-        available, reason, warning = _C.backend_status(backend.value)
-        if not available:
-            rejected.append(
-                reason or f"{backend.name} is not available on this system."
+def select_distributed_backend(
+    candidates: list[Backend], device, process_group,
+) -> Backend:
+    statuses = {backend: _C.backend_status(backend.value) for backend in candidates}
+    # Index by backend ID so different candidate lists and orders remain compatible.
+    backend_count = max(backend.value for backend in Backend) + 1
+    values = [0] * backend_count
+    for backend, (available, _, _) in statuses.items():
+        values[backend.value] = int(available)
+    if process_group is not None:
+        selection = torch.tensor(values, dtype=torch.uint8, device=device)
+        dist.all_reduce(selection, op=dist.ReduceOp.MIN, group=process_group)
+        values = selection.tolist()
+    if not any(values):
+        if process_group is None:
+            candidates_str = ", ".join(backend_names(candidates))
+            rejected_str = " ".join(reason or f"{backend.name} is not available on this system."
+                                    for backend, (_, reason, _) in statuses.items())
+            raise RuntimeError(
+                f"No available backend was found among candidates [{candidates_str}]. "
+                f"{rejected_str}"
             )
-            continue
-        _emit_backend_warning(warning)
-        debug_log("Using backend %s", backend.name)
-        return backend
+        raise RuntimeError("No backend is available on every rank in the process group")
 
-    candidates_str = ", ".join(backend_names(candidates))
-    rejected_str = " ".join(rejected)
-    raise RuntimeError(
-        f"No available backend was found among candidates [{candidates_str}]. "
-        f"{rejected_str}"
-    )
+    backend = next(backend for backend in candidates if values[backend.value])
+    if process_group is not None:
+        if dist.get_rank(process_group) == 0:
+            selection.zero_()
+            selection[backend.value] = 1
+        # Other ranks retain the intersection; MIN distributes rank 0's single choice.
+        dist.all_reduce(selection, op=dist.ReduceOp.MIN, group=process_group)
+        backend = Backend(selection.tolist().index(1))
+    _emit_backend_warning(statuses[backend][2])
+    debug_log("Using backend %s", backend.name)
+    return backend
 
 
 def env_backend():
@@ -539,6 +552,8 @@ class safe_open:
             ``[Backend.URING, Backend.AIO]`` for disk files and ``[Backend.MMAP]``
             for tmpfs/ramfs files. InstantTensor uses the first candidate that
             is supported by the filesystem and available on the current system.
+            With a process group, it chooses the first candidate in group rank 0's
+            order that is allowed and available on every rank.
 
     Returns:
         A context manager that yields a file-like object with tensor access
@@ -711,7 +726,9 @@ class safe_open:
         avail_bytes = resources.avail_device_mem
 
         self.sync_time = time.perf_counter()
-        backend = select_backend(backend_candidates)
+        backend = select_distributed_backend(
+            backend_candidates, self.device, self.process_group,
+        )
         self.device_memory_budget = avail_bytes
         debug_log("Device memory budget: %d bytes", avail_bytes)
 

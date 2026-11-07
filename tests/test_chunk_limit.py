@@ -24,7 +24,7 @@ class ChunkLimitTest(unittest.TestCase):
         )
 
         with mock.patch.object(impl, "file_in_memory", return_value=False), \
-             mock.patch.object(impl, "select_backend", return_value=impl.Backend.URING):
+             mock.patch.object(impl, "select_distributed_backend", return_value=impl.Backend.URING):
             with self.assertRaisesRegex(ValueError, "after page alignment"):
                 loader._determine_io_params(config)
 

@@ -30,6 +30,73 @@ IO_ENV_VARS = [
 ]
 
 
+class DistributedBackendSelectionTest(unittest.TestCase):
+    def test_without_group_uses_local_order_without_distributed_calls(self):
+        with mock.patch.object(impl._C, "backend_status",
+                               side_effect=lambda backend: (backend != Backend.URING.value, "", "")), \
+             mock.patch.object(impl.dist, "all_reduce") as reduce, \
+             mock.patch.object(impl.dist, "get_rank") as get_rank, \
+             mock.patch.object(impl.torch, "tensor") as tensor:
+            backend = impl.select_distributed_backend(
+                [Backend.URING, Backend.URING_BUFFERED, Backend.MMAP], "cpu", None,
+            )
+        self.assertEqual(backend, Backend.URING_BUFFERED)
+        reduce.assert_not_called()
+        get_rank.assert_not_called()
+        tensor.assert_not_called()
+
+    def test_rank_zero_selects_from_intersection(self):
+        # The first local candidate is unavailable remotely, and IDs (not list
+        # positions) identify the common candidates in both reductions.
+        group = object()
+        calls = []
+
+        def reduce(values, op, group):
+            self.assertEqual(op, impl.dist.ReduceOp.MIN)
+            calls.append(values.clone())
+            if len(calls) == 1:
+                values[Backend.URING.value] = 0
+
+        with mock.patch.object(impl._C, "backend_status", return_value=(True, "", "")), \
+             mock.patch.object(impl.dist, "get_rank", return_value=0), \
+             mock.patch.object(impl.dist, "all_reduce", side_effect=reduce):
+            result = impl.select_distributed_backend(
+                [Backend.URING, Backend.MMAP, Backend.URING_BUFFERED],
+                "cpu", group,
+            )
+        self.assertEqual(result, Backend.MMAP)
+        self.assertEqual(calls[0].numel(), max(backend.value for backend in Backend) + 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].sum().item(), 1)
+        self.assertEqual(calls[1][Backend.MMAP.value].item(), 1)
+
+    def test_other_rank_retains_intersection_until_second_reduce(self):
+        calls = []
+
+        def reduce(values, **kwargs):
+            calls.append(values.clone())
+            if len(calls) == 2:
+                self.assertEqual(values.sum().item(), 2)
+                values.zero_()
+                values[Backend.MMAP.value] = 1
+
+        with mock.patch.object(impl._C, "backend_status", return_value=(True, "", "")), \
+             mock.patch.object(impl.dist, "get_rank", return_value=1), \
+             mock.patch.object(impl.dist, "all_reduce", side_effect=reduce):
+            result = impl.select_distributed_backend(
+                [Backend.URING_BUFFERED, Backend.MMAP], "cpu", object(),
+            )
+        self.assertEqual(result, Backend.MMAP)
+        self.assertEqual(len(calls), 2)
+
+    def test_empty_intersection_rejects_after_first_reduce(self):
+        for candidates in ([], [Backend.URING]):
+            with self.subTest(candidates=candidates), \
+                 mock.patch.object(impl._C, "backend_status", return_value=(False, "unavailable", "")), \
+                 mock.patch.object(impl.dist, "all_reduce") as reduce:
+                with self.assertRaisesRegex(RuntimeError, "every rank"):
+                    impl.select_distributed_backend(candidates, "cpu", object())
+                self.assertEqual(reduce.call_count, 1)
 
 
 class IOParamsTest(unittest.TestCase):
@@ -72,7 +139,7 @@ class IOParamsTest(unittest.TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(impl, "file_in_memory", return_value=in_memory))
-            stack.enter_context(mock.patch.object(impl, "select_backend", return_value=selected_backend))
+            stack.enter_context(mock.patch.object(impl, "select_distributed_backend", return_value=selected_backend))
             stack.enter_context(mock.patch.object(impl, "negotiate_resources",
                 return_value=resources.ResourceBudget(cpus, free_bytes, free_bytes)))
             stack.enter_context(mock.patch.object(
@@ -410,7 +477,7 @@ class IOParamsTest(unittest.TestCase):
             ))
             stack.enter_context(mock.patch.object(impl, "file_in_memory", return_value=False))
             stack.enter_context(mock.patch.object(
-                impl, "select_backend", return_value=impl.Backend.URING,
+                impl, "select_distributed_backend", return_value=impl.Backend.URING,
             ))
             stack.enter_context(mock.patch.object(
                 impl.torch.cuda,
@@ -442,7 +509,7 @@ class IOParamsTest(unittest.TestCase):
             impl._C, "backend_status", backend_status,
         ):
             with self.assertRaises(RuntimeError) as raised:
-                impl.select_backend([impl.Backend.URING])
+                impl.select_distributed_backend([impl.Backend.URING], "cpu", None)
 
         self.assertEqual(
             str(raised.exception),
@@ -469,7 +536,7 @@ class IOParamsTest(unittest.TestCase):
             ))
 
             with self.assertWarnsRegex(RuntimeWarning, "Linux 5.15 or newer"):
-                backend = impl.select_backend([impl.Backend.URING])
+                backend = impl.select_distributed_backend([impl.Backend.URING], "cpu", None)
 
         self.assertEqual(backend, impl.Backend.URING)
 
@@ -489,8 +556,8 @@ class IOParamsTest(unittest.TestCase):
             ))
             warn = stack.enter_context(mock.patch.object(impl.warnings, "warn"))
 
-            impl.select_backend([impl.Backend.URING])
-            impl.select_backend([impl.Backend.URING_BUFFERED])
+            impl.select_distributed_backend([impl.Backend.URING], "cpu", None)
+            impl.select_distributed_backend([impl.Backend.URING_BUFFERED], "cpu", None)
 
         warn.assert_called_once()
 
@@ -503,7 +570,7 @@ class IOParamsTest(unittest.TestCase):
             ))
             warn = stack.enter_context(mock.patch.object(impl.warnings, "warn"))
 
-            backend = impl.select_backend([impl.Backend.URING_BUFFERED])
+            backend = impl.select_distributed_backend([impl.Backend.URING_BUFFERED], "cpu", None)
 
         self.assertEqual(backend, impl.Backend.URING_BUFFERED)
         warn.assert_not_called()
@@ -656,6 +723,25 @@ def exercise_distributed():
                 assert outcomes == [scenario.endswith("_accept")] * 2, (scenario, outcomes)
 
             write_weights(path, 1 << 20)
+            for chosen in (Backend.MMAP, Backend.URING_BUFFERED):
+                other = Backend.URING_BUFFERED if chosen == Backend.MMAP else Backend.MMAP
+                # Backend preferences differ; resources have already been agreed.
+                candidates = [Backend.URING, chosen, other] if rank == 0 else [other, chosen]
+                with mock.patch.object(impl, "negotiate_resources", return_value=resources.ResourceBudget(8, 1 << 30, 128 << 20)), \
+                     mock.patch.object(impl.dist, "all_reduce", wraps=dist.all_reduce) as reduce:
+                    loader = safe_open(str(path), "pt", rank, process_group=dist.group.WORLD,
+                                       backend=candidates, load_now=False)
+                assert reduce.call_count == 2
+                assert loader.backend == chosen
+                assert loader.device_memory_budget == 128 << 20
+                assert loader.concurrency == (4 if chosen == Backend.MMAP else 0)
+                assert loader.io_depth == (12 if chosen == Backend.MMAP else 4)
+                actual = (loader.chunk_size, loader.io_depth, loader.concurrency,
+                          loader.buffer_size, loader.tensor_offsets, loader.tensor_keep)
+                outcomes = [None, None]
+                dist.all_gather_object(outcomes, actual)
+                assert outcomes[0] == outcomes[1], outcomes
+
             # Exercise real resource negotiation through safe_open, including defaults.
             boot_id = "12345678-1234-5678-9abc-def012345678"
             root = cgroup.CgroupResources(cgroup.CgroupKey(boot_id, 0, 29, 1),
@@ -668,13 +754,22 @@ def exercise_distributed():
                  mock.patch.object(impl.dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor) as gather:
                 loader = safe_open(str(path), "pt", rank, process_group=dist.group.WORLD,
                                    backend=Backend.MMAP, load_now=False)
-            assert reduce.call_count == 1, reduce.call_count
+            assert reduce.call_count == 3, reduce.call_count
             assert gather.call_count == 1, gather.call_count
             assert loader.concurrency == 3, loader.concurrency
             assert loader.io_depth == 9, loader.io_depth
             assert loader.host_memory_budget == 75 << 19, loader.host_memory_budget
             assert loader.device_memory_budget == 75 << 19, loader.device_memory_budget
 
+            # A rank with no usable candidates must still join the first round.
+            with mock.patch.object(impl._C, "backend_status", return_value=(rank == 0, "unavailable", "")):
+                try:
+                    safe_open(str(path), "pt", rank, process_group=dist.group.WORLD,
+                              backend=Backend.MMAP, load_now=False)
+                except RuntimeError as error:
+                    assert "every rank" in str(error), error
+                else:
+                    raise AssertionError("expected empty backend intersection")
     finally:
         dist.destroy_process_group()
 

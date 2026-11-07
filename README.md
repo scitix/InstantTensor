@@ -201,7 +201,8 @@ INSTANTTENSOR_BACKEND=URING,AIO
 INSTANTTENSOR_BACKEND=BUFFERED
 ```
 
-With a process group, CPU-based defaults use the
+With a process group, all ranks use the first backend in group rank 0's candidate
+order that is allowed and available on every rank. CPU-based defaults use the
 smallest per-rank CPU allocation across the group, accounting for shared cgroup
 limits, host CPUs, and overlapping CPU affinity.
 
