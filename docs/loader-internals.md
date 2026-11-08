@@ -116,7 +116,8 @@ and device buffers, IO/CUDA executors, and NCCL scheduling. AIO and io_uring own
 their native queues; AIO also owns its last-page helper. `WorkerIOBackend` shares
 the worker pool, completion polling, and abort logic used by MMAP, cuFile, and
 FGDS. FGDS owns its additional device staging allocation. Buffered and direct
-variants share the same backend class.
+variants share the same backend class. MMAP workers copy file mappings into
+pinned host staging buffers; the shared CUDA executor then transfers them to the GPU.
 
 `open_files()` encapsulates context initialization, file opening, and file
 registration; `close_files()` closes files and releases the native context.
@@ -903,7 +904,7 @@ synchronization and lifetime control.
    completions between submissions, yields when none are available, and only
    publishes a task after its logical payload is complete. AIO tail submission may use the dedicated
    `last_page_reader_thread` because `io_submit()` can block on the final file page.
-5. cuFile and staged MMAP worker reads are submitted from the I/O driver's task
+5. cuFile and MMAP worker reads are submitted from the I/O driver's task
    start callback, using the same request ID as the IO task. Their shared completion
    callback drains worker results with `try_reap_any`. cuFile handles synchronous
    partial reads inside the worker task; CUDA sees only complete I/O results.

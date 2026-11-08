@@ -45,16 +45,11 @@ void check_backend_factory() {
                 assert(dynamic_cast<UringBackend*>(backend.get()));
                 assert(backend->needs_host_buffer());
                 break;
-            case Backend::MMAP: {
-                auto* mmap_backend = dynamic_cast<MmapBackend*>(backend.get());
-                assert(mmap_backend);
-                const char* setting = std::getenv("INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER");
-                bool registered = setting && std::string(setting) == "1";
-                assert(mmap_backend->use_internal_memory_register == registered);
-                assert(backend->needs_host_buffer() == !registered);
+            case Backend::MMAP:
+                assert(dynamic_cast<MmapBackend*>(backend.get()));
+                assert(backend->needs_host_buffer());
                 worker = true;
                 break;
-            }
             case Backend::CUFILE:
                 assert(dynamic_cast<CuFileBackend*>(backend.get()));
                 assert(!backend->needs_host_buffer());

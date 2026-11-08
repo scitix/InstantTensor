@@ -110,11 +110,6 @@ inline std::optional<string> get_env(const string& name) {
     }
 }
 
-inline bool _env_use_internal_memory_register(){
-    static bool ret = get_env("INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER").value_or("0") == "1";
-    return ret;
-}
-
 inline bool _env_cache_buffer(){
     static bool ret = get_env("INSTANTTENSOR_CACHE_BUFFER").value_or("0") == "1";
     return ret;

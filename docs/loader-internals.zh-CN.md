@@ -110,6 +110,7 @@ struct Chunk {
 调度。`open_files()` 封装上下文初始化、文件打开及文件注册，`close_files()`
 负责关闭文件和释放上下文。io_uring 在打开文件后注册 fixed files，在分配公共
 host buffer 后注册 fixed buffers。FGDS 每个后端上下文只打开一次设备。
+MMAP worker 将文件映射中的数据复制到 pinned host staging buffer，再由公共 CUDA executor 传到 GPU。
 AIO helper 和 MMAP memcpy worker 不设置 CUDA device；cuFile 和 FGDS worker 仍需设置。
 关闭时先等待 CUDA/IO executor 和后端 worker 结束，再释放注册、buffer、文件和上下文。
 后端对象的生命周期长于调用它的 executor；abort 在发布任务错误前等待已接受的 IO 完成。
@@ -868,7 +869,7 @@ Python generator 在每次获取下一个 tensor 前同步当前 CUDA stream。�
    返回已完成的 request ID，不再逐任务 poll。它在提交之间回收并发布完成，没有
    completion 时执行 yield，只有 logical payload 完整后才发布 task。AIO 非页对齐尾部提交仍可能使用专用的
    `last_page_reader_thread`，因为 `io_submit()` 在文件最后一页可能阻塞。
-5. cuFile 和 staged MMAP 的 worker read 都从 IO driver 的 task start callback 中提交，
+5. cuFile 和 MMAP 的 worker read 都从 IO driver 的 task start callback 中提交，
    沿用 IO task 的 request ID，共用完成回调通过 `try_reap_any` 回收 worker 结果。
    cuFile 在 worker task 内处理同步 partial read，公共 CUDA 路径只看到完整的 IO 结果。
 6. AIO 完成事件直接推进读取，不等待 last-page helper 返回。`aio_last_page_submissions`

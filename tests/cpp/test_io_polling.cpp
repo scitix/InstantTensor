@@ -625,19 +625,13 @@ void check_uring_batch_poll() {
     assert(output.empty() && batch_peeks == 3 && batch_advances == 2);
 }
 
-cudaError_t mock_copy(void* dst, const void* src, size_t size,
-                      cudaMemcpyKind kind, cudaStream_t) {
-    assert(kind == cudaMemcpyHostToDevice);
-    std::memcpy(dst, src, size);
-    return cudaSuccess;
-}
-
-void check_mmap(bool registered, bool empty) {
+void check_mmap(bool empty) {
     Loader loader(nullptr, nullptr);
     loader.backend = Backend::MMAP;
-    loader.io_backend = std::make_unique<MmapBackend>(loader, registered);
+    loader.io_backend = make_mmap_backend(loader);
     auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
-    if (!registered) backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
+    loader.concurrency = 2;
+    backend.init_threads();
     loader.io_thread = std::make_unique<IOExecutor>(
         [&](auto& output) { loader.io_backend->poll(output); },
         [&]() { loader.io_backend->abort(); });
@@ -654,11 +648,11 @@ void check_mmap(bool registered, bool empty) {
     ChunkIOParams params{0, loader.chunks[0], file,
                          0, device + 32, device, nullptr};
     auto request = loader.io_backend->post_read_chunk(params);
-    assert(request.loaded_to_device == registered);
+    assert(!request.loaded_to_device);
     loader.io_thread->join();
-    if (backend.worker_threads) backend.worker_threads->join();
+    backend.destroy_threads();
     request.executor->reap(request.wait_handle);
-    auto* result = registered ? device + 32 : staging + 64;
+    auto* result = staging + 64;
     for (int i = 0; i < 17; ++i) assert(result[i] == (empty ? 0 : 42));
 }
 
@@ -720,7 +714,7 @@ void check_chunk_completion_handles() {
 void check_worker_abort_drains(bool fail_poll) {
     Loader loader(nullptr, nullptr);
     loader.backend = Backend::MMAP;
-    loader.io_backend = std::make_unique<MmapBackend>(loader, false);
+    loader.io_backend = make_mmap_backend(loader);
     auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
     backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(1);
     std::atomic<bool> entered{false}, release{false}, finished{false};
@@ -766,7 +760,7 @@ void check_worker_abort_drains(bool fail_poll) {
 
 void check_worker_poll_batch() {
     Loader loader(nullptr, nullptr);
-    loader.io_backend = std::make_unique<MmapBackend>(loader, false);
+    loader.io_backend = make_mmap_backend(loader);
     auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
     backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
     std::atomic<bool> release{false}, entered{false};
@@ -841,9 +835,6 @@ int main() {
     check_tail_completion_before_helper(false);
     check_tail_completion_before_helper(true);
     check_tail_published_before_helper();
-    cuda_binding::cudaMemcpyAsync_fn = mock_copy;
-    for (bool registered : {false, true}) {
-        check_mmap(registered, false);
-        check_mmap(registered, true);
-    }
+    check_mmap(false);
+    check_mmap(true);
 }

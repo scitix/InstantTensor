@@ -83,12 +83,10 @@ class IOPollingTest(unittest.TestCase):
                 f"-Wl,-rpath,{library}", "-ldl", "-o", str(executable),
             ], capture_output=True, text=True, timeout=120)
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            # These environment settings are cached on first use in C++.
-            for registered, cached in (("0", "0"), ("1", "1")):
-                with self.subTest(registered_mmap=registered, cached_buffers=cached):
-                    env = dict(os.environ,
-                               INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER=registered,
-                               INSTANTTENSOR_CACHE_BUFFER=cached)
+            # The buffer-cache setting is cached on first use in C++.
+            for cached in ("0", "1"):
+                with self.subTest(cached_buffers=cached):
+                    env = dict(os.environ, INSTANTTENSOR_CACHE_BUFFER=cached)
                     run = subprocess.run([str(executable)], env=env,
                                          capture_output=True, text=True, timeout=30)
                     self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
