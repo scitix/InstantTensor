@@ -2,10 +2,9 @@
 
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/types.hpp>
-#include <instant_tensor/io_executor.hpp>
-#include <instant_tensor/cuda_executor.hpp>
-#include <instant_tensor/io_context.hpp>
-#include <liburing.h>
+#include <instant_tensor/executor/io_executor.hpp>
+#include <instant_tensor/executor/cuda_executor.hpp>
+#include <instant_tensor/io/backend.hpp>
 
 namespace instanttensor {
 
@@ -15,14 +14,8 @@ public:
     std::shared_ptr<SPSCQueue<RPCResponse>> output_queue;
 
     vector<FileInfo> file_info;
-    bool use_internal_memory_register = false;
-    bool need_host_buffer = false;
-    bool need_worker_threads = false;
     void *device_buffer = nullptr;       // page-aligned pointer for tensor storage
     void *device_buffer_raw = nullptr;   // raw cudaMalloc pointer (for cudaFree)
-    void *device_staging_buffer = nullptr;       // page-aligned device staging for FGDS
-    void *device_staging_buffer_raw = nullptr;   // raw cudaMalloc pointer for staging
-    size_t device_staging_buffer_size = 0;
     void* host_buffer = nullptr; // rank-local staging windows
     HostBufferCacheEntry host_buffer_entry = {nullptr, 0, nullptr};
     vector<TensorMetadate> tensors;
@@ -31,8 +24,8 @@ public:
     // Declared before the executors so their workers cannot outlive this storage.
     IOWorkerDriver::Statistics io_stats;
     CUDAWorkerDriver::Statistics cuda_stats;
-    unique_ptr<ThreadPoolTaskExecutor> worker_threads;
-    unique_ptr<SingleThreadTaskExecutor> last_page_reader_thread;
+    // Must outlive IO/CUDA executors and the callbacks that reference it.
+    unique_ptr<IOBackend> io_backend;
     unique_ptr<IOExecutor> io_thread;
     unique_ptr<CUDAExecutor> cuda_executor;
     cudaStream_t cuda_stream = nullptr;
@@ -47,22 +40,6 @@ public:
     // NOTE: cudaHostRegisterMapped can be automatically determined.
     int cuda_host_register_flags = 0;
     // size_t prev_file_index = (size_t)-1;
-
-    // aio
-    bool aio_context_initialized = false;
-    io_context_t aio_ctx = {};
-    vector<struct iocb> aio_iocbs;
-    vector<struct iocb*> aio_iocb_ptrs;
-    vector<struct io_event> aio_events;
-    std::unordered_map<int, chunk_id_t> aio_last_page_submissions;
-
-    // io_uring (loader_io_uring.cpp)
-    bool uring_context_initialized = false;
-    bool uring_register_file = true;
-    bool uring_register_buffer = true; // **important for buffered IO performance**
-    struct io_uring uring_ring = {};
-    struct io_uring uring_ring_last_page = {};
-    size_t uring_reads_pending = 0;
 
     int device_idx = -1;
     ncclComm_t group_communicator = nullptr;
@@ -80,25 +57,17 @@ public:
     std::exception_ptr fatal_error;
 
     int loader_task_id = 0;
-    int io_worker_task_id = 0;
-    bool io_retry_warning_emitted = false;
 
     int next_loader_task_id();
-    int next_io_worker_task_id();
 
     // Constructor
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 
-    // Common methods (loader_common.cpp)
-    void open_file();
-    void close_file();
+    // Common methods (loader.cpp)
     void init_buffer();
     void destroy_buffer();
     void init_threads();
     void destroy_threads();
-    void abort_io();
-    void poll_worker_completions(std::vector<IOCompletion> &completed);
-    IOCompletion complete_native_read(chunk_id_t id, ssize_t result);
     void compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets,
                         const vector<bool>& tensor_keep = {});
     void open(OpenArgs args);
@@ -116,54 +85,10 @@ public:
     std::any dispatch(const RPCRequest &m);
     void run();
 
-    // In-memory IO path (loader_io_inmem.cpp)
-    void open_file_inmem(FileInfo &f);   // open fd, mmap, optional cudaHostRegister
-    void close_file_inmem(FileInfo &f);  // unregister, munmap defer, close fd
-    IORequest post_read_chunk_inmem(const ChunkIOParams &p);
-
-    // cuFile IO path (loader_io_cufile.cpp)
-    static bool cufile_available();
-    void open_file_cufile(FileInfo &f);  // open fd with O_DIRECT, cuFileHandleRegister
-    void close_file_cufile(FileInfo &f); // cuFileHandleDeregister, close fd
-    void register_device_buffer_cufile();
-    void deregister_device_buffer_cufile();
-    IORequest post_read_chunk_cufile(const ChunkIOParams &p);
-
-    // AIO path (loader_io_aio.cpp)
-    void open_file_aio(FileInfo &f);     // open fd with O_DIRECT, fstat
-    void close_file_aio(FileInfo &f);    // close fd
-    void initialize_aio_context();        // io_setup, allocate iocb arrays
-    void destroy_aio_context();       // io_destroy
-    IORequest post_read_chunk_aio(const ChunkIOParams &p);
-    IOSubmitStatus submit_read_aio(chunk_id_t id);
-    IOSubmitStatus schedule_read_aio(chunk_id_t id);
-    void poll_aio(std::vector<IOCompletion> &completed);
-    void drain_aio_submissions();
-
-    // io_uring path (loader_io_uring.cpp)
-    static BackendStatus uring_status();
-    void open_file_uring(FileInfo &f);   // open fd (buffered, no O_DIRECT), fadvise
-    void close_file_uring(FileInfo &f);  // close fd
-    void initialize_uring_context();           // io_uring_queue_init
-    void destroy_uring_context();          // io_uring_queue_exit
-    void abort_io_uring();
-    void register_host_buffer_uring();
-    void deregister_host_buffer_uring();
-    IORequest post_read_chunk_uring(const ChunkIOParams &p);
-    IOSubmitStatus submit_read_uring(chunk_id_t id);
-    void poll_uring(std::vector<IOCompletion> &completed);
-
-    // fgds path (loader_io_fgds.cpp)
-    static bool fgds_available();
-    void open_file_fgds(FileInfo &f);     // open fd with O_DIRECT, fgds_open
-    void close_file_fgds(FileInfo &f);    // close fd
-    void register_device_buffer_fgds();   // fgds_regmem
-    void deregister_device_buffer_fgds(); // fgds_deregmem
-    IORequest post_read_chunk_fgds(const ChunkIOParams &p);
-
-    // fgds state
-    void *fgds_target_addr = nullptr;    // registered device buffer target addr
 };
+
+// Release shared resources before Python tears down the CUDA runtime.
+void cleanup();
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 

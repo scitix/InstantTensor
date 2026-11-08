@@ -10,7 +10,7 @@
 #include <vector>
 
 #include <instant_tensor/types.hpp>
-#include <instant_tensor/io_executor.hpp>
+#include <instant_tensor/executor/io_executor.hpp>
 
 namespace instanttensor {
 

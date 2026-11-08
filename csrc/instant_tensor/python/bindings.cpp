@@ -1,7 +1,18 @@
 #include <instant_tensor/loader.hpp>
-#include <instant_tensor/dlpack_utils.hpp>
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#include <instant_tensor/python/dlpack_utils.hpp>
 
 namespace instanttensor {
+
+bool file_in_memory(const string& filename) {
+    struct statfs buf;
+    if (statfs(filename.c_str(), &buf)==0) {
+        return buf.f_type == TMPFS_MAGIC || buf.f_type == RAMFS_MAGIC;
+    }
+    return false;
+}
+
 
 struct RPCHandle {
     int latest_req_id;
@@ -137,21 +148,13 @@ py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
     return manager->get_dl_tensor(loader_handle, tensor_index, size);
 }
 
-// Clean global cuda-related objects before python exit and cudaDeviceReset() is called
-// to avoid cuda error when the program exits. This is registered by atexit.register() in safe_open_impl.py.
-void cleanup() {
-    instanttensor::cufile_context_initializer.reset();
-    instanttensor::host_buffer_cache.reset();
-    instanttensor::munmaper.reset();
-}
-
 BackendStatus backend_status(int backend) {
     Backend backend_enum = static_cast<Backend>(backend);
     if(!is_valid_backend(backend_enum)) {
         return {false, "The requested backend is not recognized.", ""};
     }
     if(backend_enum == Backend::CUFILE) {
-        bool available = Loader::cufile_available();
+        bool available = cufile_available();
         return {
             available,
             available ? "" : "cuFile is not available on this system.",
@@ -160,7 +163,7 @@ BackendStatus backend_status(int backend) {
     }
     else if(backend_enum == Backend::FGDS) {
         debug_log("call fgds available func");
-        bool available = Loader::fgds_available();
+        bool available = fgds_available();
         return {
             available,
             available ? "" : "fgds is not available on this system.",
@@ -168,7 +171,7 @@ BackendStatus backend_status(int backend) {
         };
     }
     else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
-        return Loader::uring_status();
+        return uring_status();
     }
     else {
         return {true, "", ""};

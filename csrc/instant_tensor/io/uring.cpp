@@ -1,8 +1,35 @@
 #include <instant_tensor/loader.hpp>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <liburing.h>
 #include <sys/utsname.h>
 
 namespace instanttensor {
+
+class UringBackend final : public IOBackend {
+public:
+    using IOBackend::IOBackend;
+    bool needs_host_buffer() const override { return true; }
+    void open_files() override;
+    void close_files() override;
+    void destroy_context();
+    void init_buffer() override;
+    void destroy_buffer() override;
+    void abort() override;
+    IORequest post_read_chunk(const ChunkIOParams &p) override;
+    void poll(std::vector<IOCompletion> &completed) override;
+    IOSubmitStatus submit_read(chunk_id_t id);
+
+    bool uring_context_initialized = false;
+    bool uring_register_file = true;
+    bool uring_register_buffer = true; // Important for buffered IO performance.
+    struct io_uring uring_ring = {};
+    size_t uring_reads_pending = 0;
+private:
+    void open_file(FileInfo &file);
+};
 
 // The IO worker owns both SQ and CQ. CUDA sees only complete logical reads.
 
@@ -100,7 +127,7 @@ bool supports_fixed_buffer_registration(struct io_uring *ring, string *reason) {
 
 } // namespace
 
-BackendStatus Loader::uring_status(){// best-effort check
+BackendStatus uring_status(){// best-effort check
     auto kernel_version = running_kernel_version();
     if (!kernel_version) {
         return {false, "Could not determine the Linux kernel version.", ""};
@@ -146,11 +173,11 @@ BackendStatus Loader::uring_status(){// best-effort check
     return {supported, reason, warning};
 }
 
-void Loader::open_file_uring(FileInfo &f) {
+void UringBackend::open_file(FileInfo &f) {
     // URING uses O_DIRECT; URING_BUFFERED uses the page cache and io-wq
     // workers for asynchronous buffered reads.
     int open_flags = O_RDONLY;
-    if (this->backend == Backend::URING) {
+    if (this->loader.backend == Backend::URING) {
         open_flags |= O_DIRECT;
     }
     f.fd = ::open(f.filename.c_str(), open_flags);
@@ -165,37 +192,27 @@ void Loader::open_file_uring(FileInfo &f) {
 
     // Hint sequential access so the VFS read-ahead fills the page cache ahead
     // of our reads and reduces the time spent in the io-wq workers.
-    if (this->backend == Backend::URING_BUFFERED) {
+    if (this->loader.backend == Backend::URING_BUFFERED) {
         posix_fadvise(f.fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     }
-
-    this->need_host_buffer = true;
 }
 
-void Loader::initialize_uring_context() {
-    int ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring, 0);
+void UringBackend::open_files() {
+    int ret = io_uring_queue_init((unsigned)this->loader.io_depth, &this->uring_ring, 0);
     if (ret < 0) {
         throw std::runtime_error(
             "io_uring_queue_init failed: " + std::string(strerror(-ret)));
     }
     this->uring_context_initialized = true;
-    // Since the SQ and CQ of uring both operate in SPSC mode, we use an extra ring to submit IO for the last page.
-    // ret = io_uring_queue_init((unsigned)this->io_depth, &this->uring_ring_last_page, 0);
-    // if (ret < 0) {
-    //     throw std::runtime_error(
-    //         "io_uring_queue_init failed: " + std::string(strerror(-ret)));
-    // }
-
-    // vector<unsigned int>num_workers = {32, 0};
-    // io_uring_register_iowq_max_workers(&this->uring_ring, num_workers.data());
-    // fprintf(stderr, "io_uring_register_iowq_max_workers: %d, %d\n", num_workers[0], num_workers[1]);
-
+    for (auto &f : this->loader.file_info) {
+        this->open_file(f);
+    }
     if(this->uring_register_file) {
         vector<int> fds;
-        for(const auto &f : this->file_info) {
+        for(const auto &f : this->loader.file_info) {
             fds.push_back(f.fd);
         }
-        ret = io_uring_register_files(&this->uring_ring, fds.data(), fds.size());
+        int ret = io_uring_register_files(&this->uring_ring, fds.data(), fds.size());
         if (ret < 0) {
             throw std::runtime_error(
                 "io_uring_register failed: " + std::string(strerror(-ret)));
@@ -203,22 +220,25 @@ void Loader::initialize_uring_context() {
     }
 }
 
-void Loader::close_file_uring(FileInfo &f) {
-    ::close(f.fd);
+void UringBackend::close_files() {
+    for (auto &f : this->loader.file_info) {
+        ::close(f.fd);
+    }
+    this->destroy_context();
 }
 
-void Loader::destroy_uring_context() {
+void UringBackend::destroy_context() {
     if (!this->uring_context_initialized) return;
     if(this->uring_register_file) {
         io_uring_unregister_files(&this->uring_ring);
     }
 
-    // io_uring_queue_exit(&this->uring_ring_last_page);
     io_uring_queue_exit(&this->uring_ring);
     this->uring_context_initialized = false;
 }
 
-void Loader::abort_io_uring() {
+void UringBackend::abort() {
+    if (!this->uring_context_initialized) return;
     // close(ring_fd) alone need not synchronously finish kernel teardown.
     // Drain accepted reads before unpinning or releasing their host windows.
     while (this->uring_reads_pending != 0) {
@@ -234,14 +254,14 @@ void Loader::abort_io_uring() {
         io_uring_cqe_seen(&this->uring_ring, cqe);
         --this->uring_reads_pending;
     }
-    this->deregister_host_buffer_uring();
-    this->destroy_uring_context();
+    this->destroy_buffer();
+    this->destroy_context();
 }
 
-void Loader::register_host_buffer_uring() {
+void UringBackend::init_buffer() {
     if(this->uring_register_buffer) {
-        void *ptr = this->host_buffer_entry.ptr;
-        size_t size = this->host_buffer_entry.size;
+        void *ptr = this->loader.host_buffer_entry.ptr;
+        size_t size = this->loader.host_buffer_entry.size;
         vector<struct iovec> iovs;
         while(size > 0) {
             size_t iov_size = std::min(size, (size_t)IO_URING_REGISTER_BUFFER_SIZE);
@@ -258,7 +278,7 @@ void Loader::register_host_buffer_uring() {
     }
 }
 
-void Loader::deregister_host_buffer_uring() {
+void UringBackend::destroy_buffer() {
     if(this->uring_context_initialized && this->uring_register_buffer) {
         io_uring_unregister_buffers(&this->uring_ring);
     }
@@ -266,30 +286,30 @@ void Loader::deregister_host_buffer_uring() {
 
 // ─── chunk read ──────────────────────────────────────────────────────────────
 
-IOSubmitStatus Loader::submit_read_uring(chunk_id_t id) {
-    Chunk &chunk = this->chunks[id];
+IOSubmitStatus UringBackend::submit_read(chunk_id_t id) {
+    Chunk &chunk = this->loader.chunks[id];
     const ChunkIOState &state = chunk.io_state;
     if (state.bytes_completed >= state.rank_size) {
         return IOSubmitStatus::Completed;
     }
-    size_t read_offset = ROUND_DOWN(state.bytes_completed, this->rank_alignment);
+    size_t read_offset = ROUND_DOWN(state.bytes_completed, this->loader.rank_alignment);
     size_t remaining_size = state.rank_size - read_offset;
-    size_t rank_size_aligned = ROUND_UP(remaining_size, this->rank_alignment);
+    size_t rank_size_aligned = ROUND_UP(remaining_size, this->loader.rank_alignment);
     bool unaligned_last_page = remaining_size != rank_size_aligned;
-    void *buf = (char*)this->host_buffer + state.window_offset + read_offset;
+    void *buf = (char*)this->loader.host_buffer + state.window_offset + read_offset;
     struct io_uring_sqe *sqe = io_uring_get_sqe(&this->uring_ring);
     if (!sqe) {
         throw std::runtime_error("io_uring SQ full");
     }
     int file_handle = this->uring_register_file
         ? static_cast<int>(chunk.file_index)
-        : this->file_info[chunk.file_index].fd;
+        : this->loader.file_info[chunk.file_index].fd;
     int buffer_index = -1;
     if (this->uring_register_buffer) {
-        size_t left = ((char*)buf - (char*)this->host_buffer_entry.ptr) /
+        size_t left = ((char*)buf - (char*)this->loader.host_buffer_entry.ptr) /
             IO_URING_REGISTER_BUFFER_SIZE;
         size_t right = ((char*)buf + rank_size_aligned - 1 -
-            (char*)this->host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
+            (char*)this->loader.host_buffer_entry.ptr) / IO_URING_REGISTER_BUFFER_SIZE;
         if (left == right) {
             buffer_index = static_cast<int>(left);
         }
@@ -306,7 +326,7 @@ IOSubmitStatus Loader::submit_read_uring(chunk_id_t id) {
     if (this->uring_register_file) {
         sqe->flags |= IOSQE_FIXED_FILE;
     }
-    if (this->backend == Backend::URING_BUFFERED || unaligned_last_page) {
+    if (this->loader.backend == Backend::URING_BUFFERED || unaligned_last_page) {
         sqe->flags |= IOSQE_ASYNC;
     }
     io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(id));
@@ -326,10 +346,10 @@ IOSubmitStatus Loader::submit_read_uring(chunk_id_t id) {
     return IOSubmitStatus::Submitted;
 }
 
-void Loader::poll_uring(std::vector<IOCompletion> &completed) {
+void UringBackend::poll(std::vector<IOCompletion> &completed) {
     struct io_uring_cqe *cqes[MAX_IO_DEPTH];
     unsigned count = io_uring_peek_batch_cqe(
-        &this->uring_ring, cqes, static_cast<unsigned>(this->io_depth));
+        &this->uring_ring, cqes, static_cast<unsigned>(this->loader.io_depth));
     if (count == 0) {
         // Batch peek hides CQ flush errors; preserve the single-peek error path.
         int ret = io_uring_peek_cqe(&this->uring_ring, &cqes[0]);
@@ -342,21 +362,25 @@ void Loader::poll_uring(std::vector<IOCompletion> &completed) {
     completed.reserve(completed.size() + count);
     for (unsigned i = 0; i < count; ++i) {
         chunk_id_t id = static_cast<chunk_id_t>(io_uring_cqe_get_data64(cqes[i]));
-        completed.push_back(this->complete_native_read(id, cqes[i]->res));
+        completed.push_back(this->process_read_result(id, cqes[i]->res));
     }
     io_uring_cq_advance(&this->uring_ring, count);
     this->uring_reads_pending -= count;
 }
 
-IORequest Loader::post_read_chunk_uring(const ChunkIOParams &p) {
+IORequest UringBackend::post_read_chunk(const ChunkIOParams &p) {
     chunk_id_t id = p.chunk_id;
-    ChunkIOState &state = this->chunks[id].io_state;
-    int request_id = this->next_loader_task_id();
+    ChunkIOState &state = this->loader.chunks[id].io_state;
+    int request_id = this->loader.next_loader_task_id();
     state.io_request_id = request_id;
     state.bytes_completed = 0;
-    this->io_thread->submit(request_id,
-        [this, id]() { return this->submit_read_uring(id); });
-    return IORequest{this->io_thread.get(), request_id, false};
+    this->loader.io_thread->submit(request_id,
+        [this, id]() { return this->submit_read(id); });
+    return IORequest{this->loader.io_thread.get(), request_id, false};
+}
+
+std::unique_ptr<IOBackend> make_uring_backend(Loader &loader) {
+    return std::make_unique<UringBackend>(loader);
 }
 
 } // namespace instanttensor

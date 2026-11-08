@@ -4,8 +4,9 @@
 #include <cstring>
 #include <thread>
 
-#include "../../csrc/loader_common.cpp"
-#include "../../csrc/loader_io_cufile.cpp"
+#include "../../csrc/instant_tensor/loader.cpp"
+#include "../../csrc/instant_tensor/io/backend.cpp"
+#include "../../csrc/instant_tensor/io/cufile.cpp"
 
 // This harness exercises the backend with CPU workers and a mocked cuFile API.
 using namespace instanttensor;
@@ -47,10 +48,12 @@ void check(vector<ssize_t> results, const string &expected_error = "", bool empt
     ReadCase test{std::move(results)};
     test.caller = std::this_thread::get_id();
     Loader loader(nullptr, nullptr);
-    loader.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(1);
+    loader.io_backend = make_cufile_backend(loader);
+    auto& backend = static_cast<CuFileBackend&>(*loader.io_backend);
+    backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(1);
     loader.io_thread = std::make_unique<IOExecutor>(
-        [&](auto& output) { loader.poll_worker_completions(output); },
-        [&]() { loader.worker_threads->join(); });
+        [&](auto& output) { loader.io_backend->poll(output); },
+        [&]() { loader.io_backend->abort(); });
     char buffer[64] = {};
     loader.device_buffer = buffer;
     loader.chunks.resize(1);
@@ -60,10 +63,11 @@ void check(vector<ssize_t> results, const string &expected_error = "", bool empt
     chunk.io_state.rank_file_offset = 4096;
     chunk.io_state.rank_size = empty ? 0 : 10;
     FileInfo file{};
-    file.cufile_handle = &test;
+    chunk.file_index = 1;
+    backend.file_handles = {nullptr, &test};
     ChunkIOParams params{0, chunk, file,
                          0, buffer + 16, buffer, nullptr};
-    auto request = loader.post_read_chunk_cufile(params);
+    auto request = loader.io_backend->post_read_chunk(params);
     assert(request.loaded_to_device);
     string error;
     try {
@@ -77,9 +81,9 @@ void check(vector<ssize_t> results, const string &expected_error = "", bool empt
         assert(error.find(expected_error) != string::npos);
     }
     loader.io_thread->join();
-    loader.worker_threads->join();
+    backend.worker_threads->join();
     ThreadPoolTaskExecutor::ResultItem remaining;
-    assert(!loader.worker_threads->try_reap_any(remaining));
+    assert(!backend.worker_threads->try_reap_any(remaining));
     assert(test.index == test.results.size());
     if (error.empty() && !empty) {
         for (size_t i = 16; i < 26; ++i) assert(buffer[i] == 42);
@@ -93,10 +97,12 @@ void check_out_of_order_error_and_drain() {
     first.release = &release;
     first.entered = &entered;
     Loader loader(nullptr, nullptr);
-    loader.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
+    loader.io_backend = make_cufile_backend(loader);
+    auto& backend = static_cast<CuFileBackend&>(*loader.io_backend);
+    backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
     loader.io_thread = std::make_unique<IOExecutor>(
-        [&](auto& output) { loader.poll_worker_completions(output); },
-        [&]() { loader.worker_threads->join(); });
+        [&](auto& output) { loader.io_backend->poll(output); },
+        [&]() { loader.io_backend->abort(); });
     char buffer[64] = {};
     loader.device_buffer = buffer;
     Chunk chunk{};
@@ -105,13 +111,13 @@ void check_out_of_order_error_and_drain() {
     chunk.io_state.rank_file_offset = 4096;
     chunk.io_state.rank_size = 10;
     FileInfo file{};
-    file.cufile_handle = &first;
+    backend.file_handles = {&first, &second};
     ChunkIOParams params{0, chunk, file, 0,
                          buffer + 16, buffer, nullptr};
-    auto first_request = loader.post_read_chunk_cufile(params);
-    file.cufile_handle = &second;
+    auto first_request = loader.io_backend->post_read_chunk(params);
+    chunk.file_index = 1;
     params.chunk_id = 1;
-    auto second_request = loader.post_read_chunk_cufile(params);
+    auto second_request = loader.io_backend->post_read_chunk(params);
     while (!entered) std::this_thread::yield();
     bool failed = false;
     try {
@@ -126,7 +132,7 @@ void check_out_of_order_error_and_drain() {
     release = true;
     loader.io_thread->join();
     first_request.executor->reap(first_request.wait_handle);
-    loader.worker_threads->join();
+    backend.worker_threads->join();
     assert(first.completed == 10 && first.index == 2 && second.index == 1);
     for (size_t i = 16; i < 26; ++i) assert(buffer[i] == 42);
 }

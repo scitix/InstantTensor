@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include <instant_tensor/async_executor.hpp>
+#include <instant_tensor/executor/async_executor.hpp>
 
 namespace instanttensor {
 
