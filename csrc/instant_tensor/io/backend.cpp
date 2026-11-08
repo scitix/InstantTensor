@@ -1,6 +1,16 @@
 #include <instant_tensor/loader.hpp>
+#include <cerrno>
+#include <cstring>
 
 namespace instanttensor {
+
+void cleanup_cufile();
+void cleanup_mmap();
+
+void cleanup_io_backends() {
+    cleanup_cufile();
+    cleanup_mmap();
+}
 
 std::unique_ptr<IOBackend> make_io_backend(Backend backend, Loader &loader) {
     switch (backend) {

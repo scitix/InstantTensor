@@ -1,12 +1,14 @@
 #pragma once
 
+#include <instant_tensor/common.hpp>
+
 #include <instant_tensor/dl_binding/dl_binding_utils.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <unistd.h>
 
 #define CUFILE_ERRSTR(err) \
-        (string("cuFile error code ") + std::to_string(err))
+        (std::string("cuFile error code ") + std::to_string(err))
 
 namespace instanttensor {
 namespace cufile_binding {
@@ -113,3 +115,11 @@ inline ssize_t cuFileRead(CUfileHandle_t fh, void* bufPtr_base, size_t size, off
 
 } // namespace cufile_binding
 } // namespace instanttensor
+
+#define CUFILE_CHECK(_call) \
+    do { \
+        ::instanttensor::cufile_binding::CUfileError_t _e = (_call); \
+        if (_e.err != ::instanttensor::cufile_binding::CU_FILE_SUCCESS) { \
+            ::instanttensor::print_and_throw(std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) + " '" + #_call + "' -> " + std::to_string(_e.err) + ":" + CUFILE_ERRSTR(_e.err))); \
+        } \
+    } while (0)

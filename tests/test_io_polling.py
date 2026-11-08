@@ -3,7 +3,6 @@ import pathlib
 import shutil
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import unittest
 import warnings
@@ -63,15 +62,11 @@ class IOPollingTest(unittest.TestCase):
             self.assertEqual(uring_build.returncode, 0,
                              uring_build.stdout + uring_build.stderr)
             includes = [
-                root / "csrc", root / "csrc/third_party/atomic_queue/include",
-                root / "csrc/third_party/pybind11/include",
-                root / "csrc/third_party/libaio/src", uring / "src/include",
-                pathlib.Path(sysconfig.get_path("include")),
+                root / "csrc",
+                root / "csrc/third_party/atomic_queue/include",
+                root / "csrc/third_party/libaio/src",
+                uring / "src/include",
             ]
-            library = pathlib.Path(sysconfig.get_config_var("LIBDIR"))
-            python_library = library / sysconfig.get_config_var("LDLIBRARY")
-            if not python_library.exists():
-                python_library = library / f"libpython{sysconfig.get_config_var('LDVERSION')}.so"
             sanitize = os.environ.get("IO_TEST_SANITIZE")
             build = subprocess.run([
                 "g++", "-std=c++17", "-pthread", "-ffunction-sections",
@@ -79,8 +74,8 @@ class IOPollingTest(unittest.TestCase):
                 *([f"-fsanitize={sanitize}", "-fno-omit-frame-pointer"] if sanitize else []),
                 *(f"-I{path}" for path in includes),
                 str(root / "tests/cpp/test_io_polling.cpp"),
-                str(uring / "src/liburing.a"), str(python_library),
-                f"-Wl,-rpath,{library}", "-ldl", "-o", str(executable),
+                str(uring / "src/liburing.a"),
+                "-ldl", "-o", str(executable),
             ], capture_output=True, text=True, timeout=120)
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
             # The buffer-cache setting is cached on first use in C++.

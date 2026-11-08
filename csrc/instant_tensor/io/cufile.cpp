@@ -1,10 +1,55 @@
 #include <instant_tensor/loader.hpp>
+#include <instant_tensor/dl_binding/cufile_binding.hpp>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <fcntl.h>
+#include <mutex>
+#include <sys/stat.h>
 
 namespace instanttensor {
+
+using namespace cufile_binding;
+
+namespace {
+
+class CufileContext {
+public:
+    CufileContext() {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        CUFILE_CHECK(cuFileDriverOpen());// This costs a long time (~2s)
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> dt = t1 - t0;
+        debug_log("cuFile Driver Opened in %.2f seconds", dt.count());
+    }
+    ~CufileContext() {
+        CUFILE_CHECK(cuFileDriverClose());
+        debug_log("cuFile Driver Closed");
+    }
+};
+
+class CufileContextInitializer {
+    unique_ptr<CufileContext> context;
+    std::mutex mutex;
+public:
+    void initialize() {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        if(!this->context) this->context = std::make_unique<CufileContext>();
+    }
+};
+
+auto cufile_context_initializer = std::make_unique<CufileContextInitializer>();
+
+} // namespace
+
+void cleanup_cufile() {
+    cufile_context_initializer.reset();
+}
 
 class CuFileBackend final : public WorkerIOBackend {
 public:
     using WorkerIOBackend::WorkerIOBackend;
+    vector<CUfileHandle_t> file_handles;
     void open_files() override;
     void close_files() override;
     void init_buffer() override;
@@ -21,7 +66,9 @@ bool cufile_available(){// best-effort check
 
 void CuFileBackend::open_files() {
     cufile_context_initializer->initialize();
-    for (auto &f : this->loader.file_info) {
+    this->file_handles.resize(this->loader.file_info.size());
+    for (size_t i = 0; i < this->loader.file_info.size(); ++i) {
+        FileInfo &f = this->loader.file_info[i];
         f.fd = ::open(f.filename.c_str(), O_RDONLY | O_DIRECT);
         if (f.fd < 0) {
             throw std::runtime_error("Failed to open file: " + f.filename);
@@ -32,15 +79,16 @@ void CuFileBackend::open_files() {
         CUfileDescr_t descr = {};
         descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         descr.handle.fd = f.fd;
-        CUFILE_CHECK(cuFileHandleRegister(&f.cufile_handle, &descr));
+        CUFILE_CHECK(cuFileHandleRegister(&this->file_handles[i], &descr));
         // Cannot close fd here since cuFileHandleRegister requires fd to be different in value (int),
         // and closing here cause the OS to reuse fd value.
     }
 }
 
 void CuFileBackend::close_files() {
-    for (auto &f : this->loader.file_info) {
-        cuFileHandleDeregister(f.cufile_handle);
+    for (size_t i = 0; i < this->file_handles.size(); ++i) {
+        const FileInfo &f = this->loader.file_info[i];
+        cuFileHandleDeregister(this->file_handles[i]);
         ::close(f.fd);
     }
 }
@@ -55,7 +103,7 @@ void CuFileBackend::destroy_buffer() {
 
 IORequest CuFileBackend::post_read_chunk(const ChunkIOParams &p) {
     chunk_id_t chunk_id = p.chunk_id;
-    CUfileHandle_t handle = p.file.cufile_handle;
+    CUfileHandle_t handle = this->file_handles[p.chunk.file_index];
     size_t file_offset = p.chunk.io_state.rank_file_offset;
     size_t device_offset = p.chunk.device_buffer_offset + (file_offset - p.chunk.file_offset);
     size_t logical_size = p.chunk.io_state.rank_size;

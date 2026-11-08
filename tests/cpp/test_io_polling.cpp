@@ -5,6 +5,8 @@
 #include <mutex>
 #include <instant_tensor/loader.hpp>
 #include <liburing.h>
+#include <libaio.h>
+#include <unistd.h>
 
 using namespace instanttensor;
 
@@ -135,13 +137,13 @@ int mock_unregister(io_uring*) { assert(events.empty()); return 0; }
 #define io_uring_queue_exit mock_exit
 #define io_uring_unregister_buffers mock_unregister
 #define io_uring_unregister_files mock_unregister
-#include "../../csrc/loader_common.cpp"
-#include "../../csrc/io_backend.cpp"
-#include "../../csrc/loader_io_aio.cpp"
-#include "../../csrc/loader_io_uring.cpp"
-#include "../../csrc/loader_io_mmap.cpp"
-#include "../../csrc/loader_io_cufile.cpp"
-#include "../../csrc/loader_io_fgds.cpp"
+#include "../../csrc/instant_tensor/loader.cpp"
+#include "../../csrc/instant_tensor/io/backend.cpp"
+#include "../../csrc/instant_tensor/io/aio.cpp"
+#include "../../csrc/instant_tensor/io/uring.cpp"
+#include "../../csrc/instant_tensor/io/mmap.cpp"
+#include "../../csrc/instant_tensor/io/cufile.cpp"
+#include "../../csrc/instant_tensor/io/fgds.cpp"
 
 namespace {
 void reset() {
@@ -629,7 +631,7 @@ void check_mmap(bool empty) {
     Loader loader(nullptr, nullptr);
     loader.backend = Backend::MMAP;
     loader.io_backend = make_mmap_backend(loader);
-    auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
+    auto& backend = static_cast<MmapBackend&>(*loader.io_backend);
     loader.concurrency = 2;
     backend.init_threads();
     loader.io_thread = std::make_unique<IOExecutor>(
@@ -644,7 +646,8 @@ void check_mmap(bool empty) {
     loader.chunks[0].io_state.rank_size = empty ? 0 : 17;
     loader.chunks[0].io_state.window_offset = 64;
     FileInfo file{};
-    file.mapped_memory = source;
+    loader.chunks[0].file_index = 1;
+    backend.file_mappings = {nullptr, source};
     ChunkIOParams params{0, loader.chunks[0], file,
                          0, device + 32, device, nullptr};
     auto request = loader.io_backend->post_read_chunk(params);

@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include <instant_tensor/queue.hpp>
+#include <instant_tensor/executor/queue.hpp>
 
 namespace instanttensor {
 

@@ -5,18 +5,16 @@
 #include <cstdint>
 #include <functional>
 #include <instant_tensor/common.hpp>
-#include <instant_tensor/function_executor.hpp>
+#include <instant_tensor/dl_binding/cuda_binding.hpp>
+#include <instant_tensor/dl_binding/nccl_binding.hpp>
+#include <instant_tensor/executor/function_executor.hpp>
 
 namespace instanttensor {
 
-using chunk_id_t = ssize_t;
+using namespace cuda_binding;
+using namespace nccl_binding;
 
-inline size_t rank_logical_size(
-    size_t chunk_size, size_t rank_offset, size_t padded_rank_size) {
-    return chunk_size > rank_offset
-        ? std::min(chunk_size - rank_offset, padded_rank_size)
-        : 0;
-}
+using chunk_id_t = ssize_t;
 
 using SingleThreadTaskExecutor = SingleWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
 using ThreadPoolTaskExecutor = MultiWorkerFunctionExecutor<MAX_IO_DEPTH, MAX_IO_DEPTH>;
@@ -175,8 +173,6 @@ struct FileInfo {
     string filename;
     int fd;
     off_t size;
-    void* mapped_memory;
-    CUfileHandle_t cufile_handle;
 };
 
 // Transient submission parameters; persistent IO parameters live in chunk.io_state.

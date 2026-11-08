@@ -1,4 +1,9 @@
 #include <instant_tensor/loader.hpp>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <libaio.h>
+#include <sys/stat.h>
 
 namespace instanttensor {
 

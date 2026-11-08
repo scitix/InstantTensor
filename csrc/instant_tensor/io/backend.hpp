@@ -60,6 +60,9 @@ std::unique_ptr<IOBackend> make_mmap_backend(Loader &loader);
 std::unique_ptr<IOBackend> make_cufile_backend(Loader &loader);
 std::unique_ptr<IOBackend> make_fgds_backend(Loader &loader);
 
+// Release process-wide backend resources at module shutdown.
+void cleanup_io_backends();
+
 BackendStatus uring_status();
 bool cufile_available();
 bool fgds_available();

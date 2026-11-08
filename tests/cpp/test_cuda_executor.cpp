@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <instant_tensor/cuda_executor.hpp>
+#include <instant_tensor/executor/cuda_executor.hpp>
 
 using namespace instanttensor;
 

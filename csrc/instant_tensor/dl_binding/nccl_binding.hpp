@@ -1,5 +1,7 @@
 #pragma once
 
+#include <instant_tensor/common.hpp>
+
 #include <instant_tensor/dl_binding/dl_binding_utils.hpp>
 #include <instant_tensor/dl_binding/cuda_binding.hpp>
 #include <cstddef>
@@ -83,3 +85,11 @@ inline const char* ncclGetErrorString(ncclResult_t result) {
 
 } // namespace nccl_binding
 } // namespace instanttensor
+
+#define NCCL_CHECK(_call) \
+    do { \
+        ::instanttensor::nccl_binding::ncclResult_t _e = (_call); \
+        if (_e != ::instanttensor::nccl_binding::ncclSuccess) { \
+            ::instanttensor::print_and_throw(std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) + " '" + #_call + "' -> " + std::to_string(_e) + ":" + ::instanttensor::nccl_binding::ncclGetErrorString(_e))); \
+        } \
+    } while (0)

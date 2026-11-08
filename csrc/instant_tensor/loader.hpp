@@ -2,10 +2,9 @@
 
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/types.hpp>
-#include <instant_tensor/io_executor.hpp>
-#include <instant_tensor/cuda_executor.hpp>
-#include <instant_tensor/io_context.hpp>
-#include <instant_tensor/io_backend.hpp>
+#include <instant_tensor/executor/io_executor.hpp>
+#include <instant_tensor/executor/cuda_executor.hpp>
+#include <instant_tensor/io/backend.hpp>
 
 namespace instanttensor {
 
@@ -64,7 +63,7 @@ public:
     // Constructor
     Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 
-    // Common methods (loader_common.cpp)
+    // Common methods (loader.cpp)
     void init_buffer();
     void destroy_buffer();
     void init_threads();
@@ -86,8 +85,10 @@ public:
     std::any dispatch(const RPCRequest &m);
     void run();
 
-
 };
+
+// Release shared resources before Python tears down the CUDA runtime.
+void cleanup();
 
 void run_loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue);
 

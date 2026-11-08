@@ -1,5 +1,7 @@
 #pragma once
 
+#include <instant_tensor/common.hpp>
+
 #include <instant_tensor/dl_binding/dl_binding_utils.hpp>
 
 #define cudaStreamDefault 0x00
@@ -152,3 +154,11 @@ inline const char* cudaGetErrorString(cudaError_t error) {
 
 } // namespace cuda_binding
 }
+
+#define CUDA_CHECK(_call) \
+    do { \
+        ::instanttensor::cuda_binding::cudaError_t _e = (_call); \
+        if (_e != ::instanttensor::cuda_binding::cudaSuccess) { \
+            ::instanttensor::print_and_throw(std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) + " '" + #_call + "' -> " + std::to_string(_e) + ":" + ::instanttensor::cuda_binding::cudaGetErrorString(_e))); \
+        } \
+    } while (0)

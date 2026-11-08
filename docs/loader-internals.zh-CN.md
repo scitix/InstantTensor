@@ -21,9 +21,9 @@
 
 关键代码：
 
-- [`Loader::compute_layout` 与 `Loader::post_read_chunk`](../csrc/loader_common.cpp)
-- [`IOBackend`](../csrc/instant_tensor/io_backend.hpp)
-- [`UringBackend::post_read_chunk`](../csrc/loader_io_uring.cpp)
+- [`Loader::compute_layout` 与 `Loader::post_read_chunk`](../csrc/instant_tensor/loader.cpp)
+- [`IOBackend`](../csrc/instant_tensor/io/backend.hpp)
+- [`UringBackend::post_read_chunk`](../csrc/instant_tensor/io/uring.cpp)
 - [`safe_open.tensors`](../instanttensor/_internal/loader.py#L1028)
 
 ## 生命周期总览
@@ -110,10 +110,17 @@ struct Chunk {
 调度。`open_files()` 封装上下文初始化、文件打开及文件注册，`close_files()`
 负责关闭文件和释放上下文。io_uring 在打开文件后注册 fixed files，在分配公共
 host buffer 后注册 fixed buffers。FGDS 每个后端上下文只打开一次设备。
+公共文件信息只保留文件名、fd 和大小；cuFile handle 和 MMAP 映射由各自后端持有，
+通过 `chunk.file_index` 索引。
 MMAP worker 将文件映射中的数据复制到 pinned host staging buffer，再由公共 CUDA executor 传到 GPU。
 AIO helper 和 MMAP memcpy worker 不设置 CUDA device；cuFile 和 FGDS worker 仍需设置。
 关闭时先等待 CUDA/IO executor 和后端 worker 结束，再释放注册、buffer、文件和上下文。
 后端对象的生命周期长于调用它的 executor；abort 在发布任务错误前等待已接受的 IO 完成。
+
+C++ 源码集中在 `csrc/instant_tensor/`，头文件与实现就近存放：`python/` 负责
+Python 绑定和 DLPack 转换，`io/` 负责后端，`executor/` 负责队列和 worker driver，
+`dl_binding/` 负责动态库绑定。公共 host buffer cache 留在 `loader.cpp`，cuFile
+上下文和 mmap 延迟清理留在各自后端。只有 `python/` 依赖 Python/pybind11。
 
 ### 1.1 Rank 与 `torch.distributed`
 

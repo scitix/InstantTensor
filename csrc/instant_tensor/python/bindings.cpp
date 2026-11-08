@@ -1,7 +1,18 @@
 #include <instant_tensor/loader.hpp>
-#include <instant_tensor/dlpack_utils.hpp>
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#include <instant_tensor/python/dlpack_utils.hpp>
 
 namespace instanttensor {
+
+bool file_in_memory(const string& filename) {
+    struct statfs buf;
+    if (statfs(filename.c_str(), &buf)==0) {
+        return buf.f_type == TMPFS_MAGIC || buf.f_type == RAMFS_MAGIC;
+    }
+    return false;
+}
+
 
 struct RPCHandle {
     int latest_req_id;
@@ -135,14 +146,6 @@ py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
         print_and_throw(std::runtime_error("Internal error: manager is not initialized"));
     }
     return manager->get_dl_tensor(loader_handle, tensor_index, size);
-}
-
-// Clean global cuda-related objects before python exit and cudaDeviceReset() is called
-// to avoid cuda error when the program exits. This is registered by atexit.register() in safe_open_impl.py.
-void cleanup() {
-    instanttensor::cufile_context_initializer.reset();
-    instanttensor::host_buffer_cache.reset();
-    instanttensor::munmaper.reset();
 }
 
 BackendStatus backend_status(int backend) {

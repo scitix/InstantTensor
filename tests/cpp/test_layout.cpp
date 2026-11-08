@@ -2,7 +2,7 @@
 #include <random>
 #include <stdexcept>
 
-#include "../../csrc/loader_common.cpp"
+#include "../../csrc/instant_tensor/loader.cpp"
 
 using namespace instanttensor;
 

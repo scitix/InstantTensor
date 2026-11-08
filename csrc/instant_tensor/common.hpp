@@ -1,45 +1,24 @@
 #pragma once
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/vfs.h>
-#include <linux/magic.h>
-#include <libaio.h>
-
-#include <iostream>
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <unordered_map>
-#include <vector>
+#include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
-#include <thread>
-#include <future>
-#include <chrono>
-#include <any>
-
-#include <instant_tensor/queue.hpp>
-#include <instant_tensor/async_executor.hpp>
-#include <instant_tensor/dl_binding/cuda_binding.hpp>
-#include <instant_tensor/dl_binding/cufile_binding.hpp>
-#include <instant_tensor/dl_binding/nccl_binding.hpp>
-#include <instant_tensor/dl_binding/fgds_binding.hpp>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <unistd.h>
 
 namespace instanttensor {
-
-using namespace instanttensor::cuda_binding;
-using namespace instanttensor::cufile_binding;
-using namespace instanttensor::nccl_binding;
-using namespace instanttensor::fgds_binding;
 
 inline constexpr size_t MAX_IO_DEPTH = 1024;
 inline constexpr size_t MAX_CHUNK_SIZE = 1ULL << 30;
 const size_t PAGE_SIZE = sysconf(_SC_PAGESIZE);// typically 4096
-
-namespace py = pybind11;
 
 using std::string;
 using std::vector;
@@ -77,30 +56,6 @@ inline size_t required_buffer_size_for_io(
     size_t chunk_size, size_t io_depth, size_t world_size) {
     return ROUND_UP(chunk_size, PAGE_SIZE) * io_depth * world_size;
 }
-
-#define CUDA_CHECK(_call) \
-    do { \
-        cudaError_t _e = (_call); \
-        if (_e != cudaSuccess) { \
-            print_and_throw(std::runtime_error(string(__FILE__) + ":" + std::to_string(__LINE__) + " '" + #_call + "' -> " + std::to_string(_e) + ":" + cudaGetErrorString(_e))); \
-        } \
-    } while (0)
-
-#define CUFILE_CHECK(_call) \
-    do { \
-        CUfileError_t _e = (_call); \
-        if (_e.err != CU_FILE_SUCCESS) { \
-            print_and_throw(std::runtime_error(string(__FILE__) + ":" + std::to_string(__LINE__) + " '" + #_call + "' -> " + std::to_string(_e.err) + ":" + CUFILE_ERRSTR(_e.err))); \
-        } \
-    } while (0)
-
-#define NCCL_CHECK(_call) \
-    do { \
-        ncclResult_t _e = (_call); \
-        if (_e != ncclSuccess) { \
-            print_and_throw(std::runtime_error(string(__FILE__) + ":" + std::to_string(__LINE__) + " '" + #_call + "' -> " + std::to_string(_e) + ":" + ncclGetErrorString(_e))); \
-        } \
-    } while (0)
 
 inline std::optional<string> get_env(const string& name) {
     if (const char* val = std::getenv(name.c_str())) {

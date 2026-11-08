@@ -4,9 +4,9 @@
 #include <cstring>
 #include <thread>
 
-#include "../../csrc/loader_common.cpp"
-#include "../../csrc/io_backend.cpp"
-#include "../../csrc/loader_io_cufile.cpp"
+#include "../../csrc/instant_tensor/loader.cpp"
+#include "../../csrc/instant_tensor/io/backend.cpp"
+#include "../../csrc/instant_tensor/io/cufile.cpp"
 
 // This harness exercises the backend with CPU workers and a mocked cuFile API.
 using namespace instanttensor;
@@ -49,7 +49,7 @@ void check(vector<ssize_t> results, const string &expected_error = "", bool empt
     test.caller = std::this_thread::get_id();
     Loader loader(nullptr, nullptr);
     loader.io_backend = make_cufile_backend(loader);
-    auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
+    auto& backend = static_cast<CuFileBackend&>(*loader.io_backend);
     backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(1);
     loader.io_thread = std::make_unique<IOExecutor>(
         [&](auto& output) { loader.io_backend->poll(output); },
@@ -63,7 +63,8 @@ void check(vector<ssize_t> results, const string &expected_error = "", bool empt
     chunk.io_state.rank_file_offset = 4096;
     chunk.io_state.rank_size = empty ? 0 : 10;
     FileInfo file{};
-    file.cufile_handle = &test;
+    chunk.file_index = 1;
+    backend.file_handles = {nullptr, &test};
     ChunkIOParams params{0, chunk, file,
                          0, buffer + 16, buffer, nullptr};
     auto request = loader.io_backend->post_read_chunk(params);
@@ -97,7 +98,7 @@ void check_out_of_order_error_and_drain() {
     first.entered = &entered;
     Loader loader(nullptr, nullptr);
     loader.io_backend = make_cufile_backend(loader);
-    auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
+    auto& backend = static_cast<CuFileBackend&>(*loader.io_backend);
     backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
     loader.io_thread = std::make_unique<IOExecutor>(
         [&](auto& output) { loader.io_backend->poll(output); },
@@ -110,11 +111,11 @@ void check_out_of_order_error_and_drain() {
     chunk.io_state.rank_file_offset = 4096;
     chunk.io_state.rank_size = 10;
     FileInfo file{};
-    file.cufile_handle = &first;
+    backend.file_handles = {&first, &second};
     ChunkIOParams params{0, chunk, file, 0,
                          buffer + 16, buffer, nullptr};
     auto first_request = loader.io_backend->post_read_chunk(params);
-    file.cufile_handle = &second;
+    chunk.file_index = 1;
     params.chunk_id = 1;
     auto second_request = loader.io_backend->post_read_chunk(params);
     while (!entered) std::this_thread::yield();

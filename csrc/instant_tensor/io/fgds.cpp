@@ -1,6 +1,11 @@
 #include <instant_tensor/loader.hpp>
+#include <instant_tensor/dl_binding/fgds_binding.hpp>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 namespace instanttensor {
+
+using namespace fgds_binding;
 
 class FGDSBackend final : public WorkerIOBackend {
 public:

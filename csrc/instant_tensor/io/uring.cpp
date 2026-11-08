@@ -1,4 +1,8 @@
 #include <instant_tensor/loader.hpp>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <liburing.h>
 #include <sys/utsname.h>
 

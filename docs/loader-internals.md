@@ -24,9 +24,9 @@ implementation may use different classes or async primitives, but it must:
 
 Key source locations:
 
-- [`Loader::compute_layout` and `Loader::post_read_chunk`](../csrc/loader_common.cpp)
-- [`IOBackend`](../csrc/instant_tensor/io_backend.hpp)
-- [`UringBackend::post_read_chunk`](../csrc/loader_io_uring.cpp)
+- [`Loader::compute_layout` and `Loader::post_read_chunk`](../csrc/instant_tensor/loader.cpp)
+- [`IOBackend`](../csrc/instant_tensor/io/backend.hpp)
+- [`UringBackend::post_read_chunk`](../csrc/instant_tensor/io/uring.cpp)
 - [`safe_open.tensors`](../instanttensor/_internal/loader.py#L1028)
 
 ## Lifecycle at a Glance
@@ -116,7 +116,9 @@ and device buffers, IO/CUDA executors, and NCCL scheduling. AIO and io_uring own
 their native queues; AIO also owns its last-page helper. `WorkerIOBackend` shares
 the worker pool, completion polling, and abort logic used by MMAP, cuFile, and
 FGDS. FGDS owns its additional device staging allocation. Buffered and direct
-variants share the same backend class. MMAP workers copy file mappings into
+variants share the same backend class. Common file records contain only the
+filename, descriptor, and size; cuFile handles and MMAP mappings belong to their
+backends and are indexed by `chunk.file_index`. MMAP workers copy file mappings into
 pinned host staging buffers; the shared CUDA executor then transfers them to the GPU.
 
 `open_files()` encapsulates context initialization, file opening, and file
@@ -127,6 +129,13 @@ set a CUDA device; cuFile and FGDS workers do. On close, Loader joins CUDA and I
 then backend workers, before releasing registrations, buffers, files, and native
 contexts. The backend object outlives the executors that call it. Abort drains
 accepted IO before allowing task errors to release or reuse their buffers.
+
+C++ sources live under `csrc/instant_tensor/`, with headers beside their
+implementations: `python/` contains Python bindings and DLPack conversion,
+`io/` contains backend implementations, `executor/` contains queues and worker
+drivers, and `dl_binding/` contains dynamic library bindings. `loader.cpp` owns
+the shared host buffer cache; cuFile context management and deferred mmap
+cleanup stay local to their backends. Only `python/` depends on Python/pybind11.
 
 ### 1.1 Rank and `torch.distributed`
 

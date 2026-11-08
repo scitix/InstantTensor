@@ -1,8 +1,53 @@
 #include <instant_tensor/loader.hpp>
-
+#include <cerrno>
+#include <cstring>
+#include <mutex>
 
 namespace instanttensor {
+namespace {
 
+size_t rank_logical_size(
+    size_t chunk_size, size_t rank_offset, size_t padded_rank_size) {
+    return chunk_size > rank_offset
+        ? std::min(chunk_size - rank_offset, padded_rank_size)
+        : 0;
+}
+
+class HostBufferCache {// NOTE: do not cache too many entries since get() is O(n)
+    std::mutex mutex;
+    vector<HostBufferCacheEntry> cached_host_buffers;
+public:
+    ~HostBufferCache() {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        for(auto& entry : this->cached_host_buffers) {
+            entry.deleter(entry.ptr);
+        }
+    }
+    void put(HostBufferCacheEntry entry) {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        this->cached_host_buffers.emplace_back(std::move(entry));
+    }
+    HostBufferCacheEntry get(size_t size) {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        for(size_t i = 0; i < this->cached_host_buffers.size(); i++) {
+            if (this->cached_host_buffers[i].size >= size) {
+                HostBufferCacheEntry entry = std::move(this->cached_host_buffers[i]);
+                this->cached_host_buffers.erase(this->cached_host_buffers.begin() + i);
+                return entry;
+            }
+        }
+        return HostBufferCacheEntry{NULL, 0, nullptr};
+    }
+};
+
+auto host_buffer_cache = std::make_unique<HostBufferCache>();
+
+} // namespace
+
+void cleanup() {
+    cleanup_io_backends();
+    host_buffer_cache.reset();
+}
 
 int Loader::next_loader_task_id() {
     int request_id = this->loader_task_id;
@@ -198,7 +243,6 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets,
         current_chunk_size %= this->rank_alignment;
         current_chunk_payload_size = 0;
 
-
         chunk_id_t prev_chunk_id = (chunk_id_t)this->chunks.size() - 2;
         while(in_buffer_tensor_id < left_most_tensor_id
             && (this->tensors[in_buffer_tensor_id].size == 0 ||
@@ -228,7 +272,6 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets,
         current_chunk_size = file_offset % this->rank_alignment;
         chunk_device_buffer_offset = ROUND_UP(chunk_device_buffer_offset, this->first_tensor_alignment) + this->first_tensor_alignment - current_chunk_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
     };
-
 
     reset_chunk_file(tensor_offsets[0].first, tensor_offsets[0].second);
 
@@ -287,7 +330,6 @@ void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets,
     reset_chunk_buffer_offset(tensor_id);
     // set prefetch_chunk_id of all last layer tensors to the last chunk
     reset_chunk_buffer_offset(tensor_id);
-
 
     // // for debugging. Uncomment to print the layout of the tensors and chunks
     // if(this->rank == 0) {
