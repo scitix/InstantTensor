@@ -4,6 +4,7 @@
 #include <deque>
 #include <mutex>
 #include <instant_tensor/loader.hpp>
+#include <liburing.h>
 
 using namespace instanttensor;
 
@@ -135,9 +136,12 @@ int mock_unregister(io_uring*) { assert(events.empty()); return 0; }
 #define io_uring_unregister_buffers mock_unregister
 #define io_uring_unregister_files mock_unregister
 #include "../../csrc/loader_common.cpp"
+#include "../../csrc/io_backend.cpp"
 #include "../../csrc/loader_io_aio.cpp"
 #include "../../csrc/loader_io_uring.cpp"
-#include "../../csrc/loader_io_inmem.cpp"
+#include "../../csrc/loader_io_mmap.cpp"
+#include "../../csrc/loader_io_cufile.cpp"
+#include "../../csrc/loader_io_fgds.cpp"
 
 namespace {
 void reset() {
@@ -292,24 +296,37 @@ struct Fixture {
         loader.file_info.resize(1);
         loader.file_info[0].fd = fileno(file);
         loader.chunks.resize(4);
-        loader.uring_register_file = loader.uring_register_buffer = false;
         if (aio) {
-            loader.initialize_aio_context();
-            loader.last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>();
+            loader.io_backend = make_aio_backend(loader);
+            loader.file_info[0].filename = "/proc/self/fd/" + std::to_string(fileno(file));
+            loader.io_backend->open_files();
+            aio_backend().last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>();
         } else {
-            loader.uring_context_initialized = true;
+            loader.io_backend = make_uring_backend(loader);
+            uring_backend().uring_register_file = uring_backend().uring_register_buffer = false;
+            uring_backend().uring_context_initialized = true;
         }
+    }
+    AIOBackend& aio_backend() {
+        assert(aio);
+        return static_cast<AIOBackend&>(*loader.io_backend);
+    }
+    UringBackend& uring_backend() {
+        assert(!aio);
+        return static_cast<UringBackend&>(*loader.io_backend);
     }
     ~Fixture() {
         loader.destroy_threads();
+        if (aio) loader.io_backend->close_files();
+        else uring_backend().destroy_context();
         fclose(file);
     }
     void start_executor() {
         loader.io_thread = std::make_unique<IOExecutor>(
-            [&](auto& output) { poll(output); }, [&]() { loader.abort_io(); });
+            [&](auto& output) { poll(output); }, [&]() { loader.io_backend->abort(); });
     }
     void poll(std::vector<IOCompletion>& output) {
-        if (aio) loader.poll_aio(output); else loader.poll_uring(output);
+        loader.io_backend->poll(output);
     }
     IORequest post(int id, size_t size) {
         Chunk& chunk = loader.chunks[id];
@@ -324,7 +341,7 @@ struct Fixture {
         ChunkIOParams params{ id, chunk, loader.file_info[0],
             window_idx,
             nullptr, nullptr, nullptr };
-        return aio ? loader.post_read_chunk_aio(params) : loader.post_read_chunk_uring(params);
+        return loader.io_backend->post_read_chunk(params);
     }
 };
 
@@ -400,19 +417,19 @@ void check_tail_completion_before_helper(bool retry) {
     state.bytes_completed = 0;
     read_results = retry ? std::deque<int>{40, 100} : std::deque<int>{100};
     block_submit = true;
-    assert(f.loader.schedule_read_aio(0) == IOSubmitStatus::Submitted);
+    assert(f.aio_backend().schedule_read(0) == IOSubmitStatus::Submitted);
     while (!submit_entered) std::this_thread::yield();
     std::vector<IOCompletion> completed;
     f.poll(completed);
     assert(completed.size() == 1 && completed[0].request_id == 17);
     assert(!completed[0].error && completed[0].retry == retry);
     assert(state.bytes_completed == (retry ? 40 : 100));
-    assert(f.loader.aio_last_page_submissions.size() == 1);
+    assert(f.aio_backend().aio_last_page_submissions.size() == 1);
     assert(f.loader.chunks[0].size == 100 && f.loader.chunks[0].file_offset == 0);
     if (retry) {
         // Queue the retry before the previous submit helper returns.
-        assert(f.loader.schedule_read_aio(0) == IOSubmitStatus::Submitted);
-        assert(f.loader.aio_last_page_submissions.size() == 2);
+        assert(f.aio_backend().schedule_read(0) == IOSubmitStatus::Submitted);
+        assert(f.aio_backend().aio_last_page_submissions.size() == 2);
     }
     completed.clear();
     f.poll(completed);
@@ -425,9 +442,9 @@ void check_tail_completion_before_helper(bool retry) {
     }
     // Shutdown must reap acknowledgements even after all logical IO completed.
     f.loader.destroy_threads();
-    assert(f.loader.aio_last_page_submissions.empty());
+    assert(f.aio_backend().aio_last_page_submissions.empty());
     SingleThreadTaskExecutor::ResultItem ignored;
-    assert(!f.loader.last_page_reader_thread->try_reap_any(ignored));
+    assert(!f.aio_backend().last_page_reader_thread->try_reap_any(ignored));
     completed.clear();
     f.poll(completed);
     assert(completed.empty());
@@ -445,12 +462,12 @@ void check_tail_published_before_helper() {
     // The IO driver can finish while the successful submit helper is still returning.
     f.loader.io_thread->join();
     assert(block_submit && submit_entered);
-    assert(f.loader.aio_last_page_submissions.size() == 1);
+    assert(f.aio_backend().aio_last_page_submissions.size() == 1);
     block_submit = false;
     f.loader.destroy_threads();
-    assert(f.loader.aio_last_page_submissions.empty());
+    assert(f.aio_backend().aio_last_page_submissions.empty());
     SingleThreadTaskExecutor::ResultItem ignored;
-    assert(!f.loader.last_page_reader_thread->try_reap_any(ignored));
+    assert(!f.aio_backend().last_page_reader_thread->try_reap_any(ignored));
 }
 
 void check_error_routing(bool aio) {
@@ -464,7 +481,7 @@ void check_error_routing(bool aio) {
         chunk.io_state.bytes_completed = 0;
     }
     events = {{2, -EIO}, {3, 8192}, {0, -EINTR}, {1, 4096}};
-    f.loader.uring_reads_pending = 4;
+    if (!aio) f.uring_backend().uring_reads_pending = 4;
     std::vector<IOCompletion> output;
     f.poll(output);
     assert(output.size() == 4);
@@ -500,9 +517,9 @@ void check_queue_failure(bool aio, bool submit_failure, bool tail) {
     assert(failures == (local ? 1 : 2));
     assert(destroys == (local ? 0 : 1));
     assert(events.empty() && read_results.empty() && submit_results.empty());
-    assert(f.loader.uring_reads_pending == 0);
+    if (!aio) assert(f.uring_backend().uring_reads_pending == 0);
     if (!local) {
-        f.loader.abort_io();
+        f.loader.io_backend->abort();
         assert(destroys == 1); // Close after failure cannot tear down twice.
     }
 }
@@ -564,14 +581,14 @@ void check_uring_submit_spin() {
     state.rank_file_offset = state.bytes_completed = 0;
     read_results = {8192};
     submit_results = {0, -EINTR, -EAGAIN, 1};
-    assert(f.loader.submit_read_uring(0) == IOSubmitStatus::Submitted);
+    assert(f.uring_backend().submit_read(0) == IOSubmitStatus::Submitted);
     assert(submit_results.empty() && reads.size() == 4);
-    assert(sqes == 1 && polls == 0 && f.loader.uring_reads_pending == 1);
+    assert(sqes == 1 && polls == 0 && f.uring_backend().uring_reads_pending == 1);
     std::vector<IOCompletion> completed;
     f.poll(completed);
     assert(completed.size() == 1 && completed[0].request_id == 17);
     assert(!completed[0].error && !completed[0].retry);
-    assert(state.bytes_completed == 8192 && f.loader.uring_reads_pending == 0);
+    assert(state.bytes_completed == 8192 && f.uring_backend().uring_reads_pending == 0);
 }
 
 void check_uring_batch_poll() {
@@ -584,11 +601,11 @@ void check_uring_batch_poll() {
         state.bytes_completed = 0;
     }
     events = {{4, 8192}, {1, -EIO}, {3, 4096}, {0, -EAGAIN}, {2, 8192}};
-    f.loader.uring_reads_pending = events.size();
+    f.uring_backend().uring_reads_pending = events.size();
     std::vector<IOCompletion> output;
     f.poll(output);
     assert(polls == 1 && batch_peeks == 1 && batch_advances == 1);
-    assert(output.size() == 4 && events.size() == 1 && f.loader.uring_reads_pending == 1);
+    assert(output.size() == 4 && events.size() == 1 && f.uring_backend().uring_reads_pending == 1);
     assert(output[0].request_id == 104 && !output[0].error && !output[0].retry);
     assert(output[1].request_id == 101 && output[1].error);
     assert(output[2].request_id == 103 && output[2].retry);
@@ -602,7 +619,7 @@ void check_uring_batch_poll() {
     assert(polls == 3 && batch_peeks == 2 && batch_advances == 2);
     assert(output.size() == 1 && output[0].request_id == 102);
     assert(!output[0].error && !output[0].retry);
-    assert(events.empty() && f.loader.uring_reads_pending == 0);
+    assert(events.empty() && f.uring_backend().uring_reads_pending == 0);
     output.clear();
     f.poll(output);
     assert(output.empty() && batch_peeks == 3 && batch_advances == 2);
@@ -618,11 +635,12 @@ cudaError_t mock_copy(void* dst, const void* src, size_t size,
 void check_mmap(bool registered, bool empty) {
     Loader loader(nullptr, nullptr);
     loader.backend = Backend::MMAP;
-    loader.use_internal_memory_register = registered;
-    if (!registered) loader.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
+    loader.io_backend = std::make_unique<MmapBackend>(loader, registered);
+    auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
+    if (!registered) backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
     loader.io_thread = std::make_unique<IOExecutor>(
-        [&](auto& output) { loader.poll_worker_completions(output); },
-        [&]() { loader.abort_io(); });
+        [&](auto& output) { loader.io_backend->poll(output); },
+        [&]() { loader.io_backend->abort(); });
     loader.chunks.resize(1);
     char source[128], staging[128] = {}, device[128] = {};
     std::memset(source, 42, sizeof(source));
@@ -635,10 +653,10 @@ void check_mmap(bool registered, bool empty) {
     file.mapped_memory = source;
     ChunkIOParams params{0, loader.chunks[0], file,
                          0, device + 32, device, nullptr};
-    auto request = loader.post_read_chunk_inmem(params);
+    auto request = loader.io_backend->post_read_chunk(params);
     assert(request.loaded_to_device == registered);
     loader.io_thread->join();
-    if (loader.worker_threads) loader.worker_threads->join();
+    if (backend.worker_threads) backend.worker_threads->join();
     request.executor->reap(request.wait_handle);
     auto* result = registered ? device + 32 : staging + 64;
     for (int i = 0; i < 17; ++i) assert(result[i] == (empty ? 0 : 42));
@@ -702,20 +720,22 @@ void check_chunk_completion_handles() {
 void check_worker_abort_drains(bool fail_poll) {
     Loader loader(nullptr, nullptr);
     loader.backend = Backend::MMAP;
-    loader.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(1);
+    loader.io_backend = std::make_unique<MmapBackend>(loader, false);
+    auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
+    backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(1);
     std::atomic<bool> entered{false}, release{false}, finished{false};
     std::atomic<bool> abort_entered{false}, inject_error{false};
     loader.io_thread = std::make_unique<IOExecutor>(
         [&](auto& output) {
             if (fail_poll && inject_error) throw std::runtime_error("worker poll failure");
-            loader.poll_worker_completions(output);
+            loader.io_backend->poll(output);
         }, [&]() {
             abort_entered = true;
-            loader.abort_io();
+            loader.io_backend->abort();
             assert(finished);
         });
     loader.io_thread->submit(17, [&]() {
-        loader.worker_threads->submit(17, [&]() {
+        backend.worker_threads->submit(17, [&]() {
             entered = true;
             while (!release) std::this_thread::yield();
             finished = true;
@@ -746,31 +766,41 @@ void check_worker_abort_drains(bool fail_poll) {
 
 void check_worker_poll_batch() {
     Loader loader(nullptr, nullptr);
-    loader.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
+    loader.io_backend = std::make_unique<MmapBackend>(loader, false);
+    auto& backend = static_cast<WorkerIOBackend&>(*loader.io_backend);
+    backend.worker_threads = std::make_unique<ThreadPoolTaskExecutor>(2);
     std::atomic<bool> release{false}, entered{false};
-    loader.worker_threads->submit(17, [&]() {
+    backend.worker_threads->submit(17, [&]() {
         entered = true;
         while (!release) std::this_thread::yield();
     });
     while (!entered) std::this_thread::yield();
-    loader.worker_threads->submit(29, []() { throw std::runtime_error("read failure"); });
+    backend.worker_threads->submit(29, []() { throw std::runtime_error("read failure"); });
     std::vector<IOCompletion> completed;
-    while (completed.empty()) loader.poll_worker_completions(completed);
+    while (completed.empty()) loader.io_backend->poll(completed);
     assert(completed.size() == 1);
     assert(completed.back().request_id == 29 && completed.back().error);
     completed.clear();
     for (int i = 0; i < 100; ++i) {
-        loader.poll_worker_completions(completed);
+        loader.io_backend->poll(completed);
         assert(completed.empty());
     }
     release = true;
-    loader.worker_threads->join();
-    loader.poll_worker_completions(completed);
+    backend.worker_threads->join();
+    loader.io_backend->poll(completed);
     assert(completed.size() == 1 && completed[0].request_id == 17 && !completed[0].error);
 }
 }
 
+#include "io_backend_cases.hpp"
+
 int main() {
+    check_worker_device_setup();
+    check_backend_factory();
+    check_failed_open_cleanup();
+    check_backend_lifetime();
+    check_buffer_release_order();
+    check_fgds_backend();
     check_publishing();
     check_driver();
     check_completed_status();

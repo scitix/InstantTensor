@@ -91,10 +91,11 @@ def get_ext_modules():
             sources=[
                 "csrc/main.cpp",
                 "csrc/loader_common.cpp",
+                "csrc/io_backend.cpp",
                 "csrc/loader_io_cufile.cpp",
                 "csrc/loader_io_fgds.cpp",
                 "csrc/loader_io_aio.cpp",
-                "csrc/loader_io_inmem.cpp",
+                "csrc/loader_io_mmap.cpp",
                 "csrc/loader_io_uring.cpp",
             ],
             include_dirs=include_dirs,

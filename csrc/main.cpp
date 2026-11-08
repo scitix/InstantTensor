@@ -151,7 +151,7 @@ BackendStatus backend_status(int backend) {
         return {false, "The requested backend is not recognized.", ""};
     }
     if(backend_enum == Backend::CUFILE) {
-        bool available = Loader::cufile_available();
+        bool available = cufile_available();
         return {
             available,
             available ? "" : "cuFile is not available on this system.",
@@ -160,7 +160,7 @@ BackendStatus backend_status(int backend) {
     }
     else if(backend_enum == Backend::FGDS) {
         debug_log("call fgds available func");
-        bool available = Loader::fgds_available();
+        bool available = fgds_available();
         return {
             available,
             available ? "" : "fgds is not available on this system.",
@@ -168,7 +168,7 @@ BackendStatus backend_status(int backend) {
         };
     }
     else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
-        return Loader::uring_status();
+        return uring_status();
     }
     else {
         return {true, "", ""};

@@ -21,9 +21,9 @@
 
 关键代码：
 
-- [`Loader::compute_layout`](../csrc/loader_common.cpp#L215)
-- [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L442)
-- [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L198)
+- [`Loader::compute_layout` 与 `Loader::post_read_chunk`](../csrc/loader_common.cpp)
+- [`IOBackend`](../csrc/instant_tensor/io_backend.hpp)
+- [`UringBackend::post_read_chunk`](../csrc/loader_io_uring.cpp)
 - [`safe_open.tensors`](../instanttensor/_internal/loader.py#L1028)
 
 ## 生命周期总览
@@ -105,6 +105,14 @@ struct Chunk {
 - disk 和 device 描述的是 world-wide chunk；
 - 每个进程的 host buffer 只暂存本 rank 负责读取的部分；
 - 分布式加载完成后，每个 rank 的 device buffer 都得到完整 world chunk。
+
+`Loader` 通过一个 `IOBackend` 对象管理后端，保留公共 buffer、layout 和 IO/CUDA
+调度。`open_files()` 封装上下文初始化、文件打开及文件注册，`close_files()`
+负责关闭文件和释放上下文。io_uring 在打开文件后注册 fixed files，在分配公共
+host buffer 后注册 fixed buffers。FGDS 每个后端上下文只打开一次设备。
+AIO helper 和 MMAP memcpy worker 不设置 CUDA device；cuFile 和 FGDS worker 仍需设置。
+关闭时先等待 CUDA/IO executor 和后端 worker 结束，再释放注册、buffer、文件和上下文。
+后端对象的生命周期长于调用它的 executor；abort 在发布任务错误前等待已接受的 IO 完成。
 
 ### 1.1 Rank 与 `torch.distributed`
 
@@ -190,7 +198,7 @@ Python:
     call C++ open
 
 C++:
-    open files and initialize io_uring
+    open_files: initialize the backend context, open and register files
     derive A, R, W, Aw
     enlarge and allocate device buffer
     allocate/register host buffer and register it with io_uring

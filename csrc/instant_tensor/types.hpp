@@ -174,7 +174,6 @@ struct HostBufferCacheEntry {
 struct FileInfo {
     string filename;
     int fd;
-    bool in_memory;
     off_t size;
     void* mapped_memory;
     CUfileHandle_t cufile_handle;

@@ -10,70 +10,9 @@ int Loader::next_loader_task_id() {
     return request_id;
 }
 
-int Loader::next_io_worker_task_id() {
-    int request_id = this->io_worker_task_id;
-    this->io_worker_task_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
-    return request_id;
-}
-
 Loader::Loader(unique_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue) {
     this->input_queue = std::move(input_queue);
     this->output_queue = std::move(output_queue);
-    this->use_internal_memory_register = _env_use_internal_memory_register();
-}
-
-void Loader::open_file() {
-    if(!is_valid_backend(this->backend)) {
-        print_and_throw(std::runtime_error("Internal error: Unsupported backend: " + std::to_string(this->backend)));
-    }
-    for(size_t i = 0; i < this->file_info.size(); i++) {
-        FileInfo& f = this->file_info[i];
-        f.in_memory = instanttensor::file_in_memory(f.filename);
-
-        if (this->backend == Backend::MMAP) {
-            this->open_file_inmem(f);
-        } else if (this->backend == Backend::CUFILE) {
-            this->open_file_cufile(f);
-        } else if (this->backend == Backend::FGDS) {
-            this->open_file_fgds(f);
-        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-            this->open_file_uring(f);
-        } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-            this->open_file_aio(f);
-        }
-    }
-    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-        this->initialize_aio_context();
-    }
-    if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-        this->initialize_uring_context();
-    }
-}
-
-void Loader::close_file() {
-    for(size_t i = 0; i < this->file_info.size(); i++) {
-        FileInfo& f = this->file_info[i];
-        if (this->backend == Backend::MMAP) {
-            this->close_file_inmem(f);
-        } else if (this->backend == Backend::CUFILE) {
-            this->close_file_cufile(f);
-        } else if (this->backend == Backend::FGDS) {
-            this->close_file_fgds(f);
-        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-            this->close_file_uring(f);
-        } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-            this->close_file_aio(f);
-        }
-    }
-    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-        this->destroy_aio_context();
-    }
-    if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-        this->destroy_uring_context();
-    }
-    if(this->backend == Backend::FGDS) {
-        fgds_close(this->device_idx);
-    }
 }
 
 void Loader::init_buffer() {
@@ -106,27 +45,7 @@ void Loader::init_buffer() {
     debug_log("device_buffer_raw=%p, aligned device_buffer=%p, buffer_size=%zu",
               this->device_buffer_raw, this->device_buffer, this->buffer_size);
 
-    // FGDS needs a page-aligned device staging buffer for DIRECT_IO reads
-    // because chunk_device_buffer_offset is only aligned to first_tensor_alignment (16 bytes),
-    // not PAGE_SIZE. We stage each rank's page-aligned IO here then D2D copy to the final location.
-    if (this->backend == Backend::FGDS) {
-        this->device_staging_buffer_size = this->io_depth * ROUND_UP(this->rank_chunk_size, PAGE_SIZE);
-        size_t staging_alloc_size = this->device_staging_buffer_size + PAGE_SIZE - 1;
-        CUDA_CHECK(cudaMalloc(&this->device_staging_buffer_raw, staging_alloc_size));
-        uintptr_t staging_raw = reinterpret_cast<uintptr_t>(this->device_staging_buffer_raw);
-        uintptr_t staging_aligned = ROUND_UP(staging_raw, (uintptr_t)PAGE_SIZE);
-        this->device_staging_buffer = reinterpret_cast<void*>(staging_aligned);
-        debug_log("FGDS device_staging_buffer=%p, size=%zu",
-                  this->device_staging_buffer, this->device_staging_buffer_size);
-    }
-
-    if (this->backend == Backend::CUFILE) {
-        this->register_device_buffer_cufile();
-    } else if (this->backend == Backend::FGDS) {
-        this->register_device_buffer_fgds();
-    }
-
-    if (this->need_host_buffer) {
+    if (this->io_backend->needs_host_buffer()) {
         size_t inflight_host_buffer_size = this->io_depth * this->rank_chunk_size;
         size_t host_buffer_size = inflight_host_buffer_size;
         this->host_buffer_entry = host_buffer_cache->get(host_buffer_size);
@@ -149,75 +68,37 @@ void Loader::init_buffer() {
         this->host_buffer = (char*)this->host_buffer_entry.ptr;
     }
 
-    if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-        this->register_host_buffer_uring();
-    }
+    this->io_backend->init_buffer();
 }
 
 void Loader::destroy_buffer() {
-    if (this->backend == Backend::CUFILE) {
-        this->deregister_device_buffer_cufile();
-    }
-    if (this->backend == Backend::FGDS) {
-        this->deregister_device_buffer_fgds();
-    }
+    this->io_backend->destroy_buffer();
 
-    // Free the raw cudaMalloc'd pointers (device_buffer/device_staging_buffer are
-    // aligned offsets into these raw allocations and must not be passed to cudaFree).
+    // device_buffer is an aligned offset; release the original allocation.
     if (this->device_buffer_raw) {
         CUDA_CHECK(cudaFree(this->device_buffer_raw));
         this->device_buffer_raw = nullptr;
         this->device_buffer = nullptr;
     }
-    if (this->device_staging_buffer_raw) {
-        CUDA_CHECK(cudaFree(this->device_staging_buffer_raw));
-        this->device_staging_buffer_raw = nullptr;
-        this->device_staging_buffer = nullptr;
-    }
-
-    if (this->need_host_buffer) {
-        // Buffer registration belongs to this loader's ring and must not outlive it.
-        if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-            this->deregister_host_buffer_uring();
-        }
+    if (this->host_buffer_entry.ptr) {
         if (_env_cache_buffer()) {
             host_buffer_cache->put(std::move(this->host_buffer_entry));
         }
         else {
             this->host_buffer_entry.deleter(this->host_buffer_entry.ptr);
-            this->host_buffer_entry.ptr = nullptr;
         }
+        this->host_buffer_entry = {nullptr, 0, nullptr};
+        this->host_buffer = nullptr;
     }
 }
 
 void Loader::init_threads() {
-    auto driver_factory = [=]() {
-        CUDA_CHECK(cudaSetDevice(this->device_idx));
-        return std::make_unique<FunctionWorkerDriver>();
-    };
-
-    if(this->need_worker_threads) {
-        if(!this->worker_threads) {
-            this->worker_threads = std::make_unique<ThreadPoolTaskExecutor>(this->concurrency, driver_factory);
-        }
-    }
-    if(!this->io_thread) {
-        IOWorkerDriver::PollCompletions poll;
-        if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-            poll = [this](auto& completed) { this->poll_aio(completed); };
-        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-            poll = [this](auto& completed) { this->poll_uring(completed); };
-        } else {
-            poll = [this](auto& completed) { this->poll_worker_completions(completed); };
-        }
+    this->io_backend->init_threads();
+    if (!this->io_thread) {
         this->io_thread = std::make_unique<IOExecutor>(
-            std::move(poll), [this]() { this->abort_io(); },
+            [this](auto &completed) { this->io_backend->poll(completed); },
+            [this]() { this->io_backend->abort(); },
             _env_debug() ? &this->io_stats : nullptr);
-    }
-    if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-        if (!this->last_page_reader_thread) {
-            this->last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
-        }
     }
     if(!this->cuda_executor) {
         this->cuda_executor = std::make_unique<CUDAExecutor>(
@@ -237,63 +118,6 @@ void Loader::init_threads() {
 
 }
 
-void Loader::poll_worker_completions(std::vector<IOCompletion> &completed) {
-    if (!this->worker_threads) return;
-    ThreadPoolTaskExecutor::ResultItem result;
-    while (this->worker_threads->try_reap_any(result)) {
-        std::exception_ptr error;
-        if (result.value.type() == typeid(std::exception_ptr)) {
-            error = std::any_cast<std::exception_ptr>(result.value);
-        }
-        completed.push_back({result.request_id, error});
-    }
-}
-
-void Loader::abort_io() {
-    if (this->worker_threads) {
-        this->worker_threads->join();
-    }
-    if (this->aio_context_initialized) {
-        if (this->last_page_reader_thread) {
-            this->drain_aio_submissions();
-            this->last_page_reader_thread->join();
-        }
-        this->destroy_aio_context();
-        this->aio_last_page_submissions.clear();
-    }
-    if (this->uring_context_initialized) {
-        this->abort_io_uring();
-    }
-}
-
-IOCompletion Loader::complete_native_read(chunk_id_t id, ssize_t result) {
-    Chunk &chunk = this->chunks[id];
-    ChunkIOState &state = chunk.io_state;
-    IOCompletion completion{state.io_request_id, {}};
-    try {
-        if (result == -EAGAIN || result == -EINTR) {
-            completion.retry = true;
-            return completion;
-        }
-        std::string name = backend_to_string(this->backend);
-        if (result < 0) {
-            throw std::runtime_error(name + " read error for chunk id: " +
-                std::to_string(id) + ", error: " + strerror(-result));
-        }
-        size_t read_offset = ROUND_DOWN(state.bytes_completed, this->rank_alignment);
-        size_t covered = read_offset + static_cast<size_t>(result);
-        state.bytes_completed = std::min(state.rank_size,
-            std::max(state.bytes_completed, covered));
-        if (state.bytes_completed >= state.rank_size) {
-            return completion;
-        }
-        completion.retry = true;
-    } catch (...) {
-        completion.error = std::current_exception();
-    }
-    return completion;
-}
-
 void Loader::destroy_threads() {
     if (this->cuda_executor) {
         this->cuda_executor->join();
@@ -301,13 +125,7 @@ void Loader::destroy_threads() {
     if (this->io_thread) {
         this->io_thread->join();
     }
-    if (this->worker_threads) {
-        this->worker_threads->join();
-    }
-    if (this->last_page_reader_thread) {
-        this->drain_aio_submissions();
-        this->last_page_reader_thread->join();
-    }
+    this->io_backend->destroy_threads();
     if (this->cuda_stream) {
         CUDA_CHECK(cudaStreamDestroy(this->cuda_stream));
     }
@@ -506,7 +324,7 @@ void Loader::open(OpenArgs args) {
     this->concurrency = args.concurrency;
     this->io_depth = args.io_depth;
     this->backend = args.backend;
-    this->io_retry_warning_emitted = false;
+    this->io_backend = make_io_backend(this->backend, *this);
 
     if(this->rank_chunk_size == 0) {
         print_and_throw(std::invalid_argument("chunk_size must be greater than zero"));
@@ -516,11 +334,7 @@ void Loader::open(OpenArgs args) {
             "chunk_size must be no greater than " + std::to_string(MAX_CHUNK_SIZE) +
             " bytes after page alignment"));
     }
-    if(this->concurrency == 0 &&
-       (this->backend == Backend::MMAP || this->backend == Backend::CUFILE ||
-        this->backend == Backend::FGDS)) {
-        print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
-    }
+    this->io_backend->validate_config();
     if(this->io_depth == 0 || this->io_depth > MAX_IO_DEPTH) {
         print_and_throw(std::invalid_argument(
             "io_depth must be between 1 and " + std::to_string(MAX_IO_DEPTH)));
@@ -539,7 +353,7 @@ void Loader::open(OpenArgs args) {
 
     // this->init_comm();
     auto t2 = std::chrono::high_resolution_clock::now();
-    this->open_file();// NOTE: this should be called before init_buffer/init_threads/
+    this->io_backend->open_files(); // Context and files must be ready before buffers and threads.
     auto t3 = std::chrono::high_resolution_clock::now();
     this->init_buffer();
     auto t4 = std::chrono::high_resolution_clock::now();
@@ -562,12 +376,13 @@ void Loader::open(OpenArgs args) {
 
 void Loader::close(CloseArgs args) {
     this->stop = true;
+    if (!this->io_backend) return; // Backend construction may have rejected open.
     auto t0 = std::chrono::high_resolution_clock::now();
     this->destroy_threads();
     auto t1 = std::chrono::high_resolution_clock::now();
     this->destroy_buffer();
     auto t2 = std::chrono::high_resolution_clock::now();
-    this->close_file();
+    this->io_backend->close_files();
     auto t3 = std::chrono::high_resolution_clock::now();
     // this->destroy_comm();
     auto t4 = std::chrono::high_resolution_clock::now();
@@ -634,18 +449,7 @@ void Loader::post_read_chunk() {
     chunk.io_state.window_offset = window_offset;
     ChunkIOParams params{chunk_id, chunk, f, window_idx, rank_dst, all_dst, event};
 
-    IORequest io_request;
-    if (this->backend == Backend::MMAP) {
-        io_request = this->post_read_chunk_inmem(params);
-    } else if (this->backend == Backend::CUFILE) {
-        io_request = this->post_read_chunk_cufile(params);
-    } else if (this->backend == Backend::FGDS) {
-        io_request = this->post_read_chunk_fgds(params);
-    } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
-        io_request = this->post_read_chunk_uring(params);
-    } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
-        io_request = this->post_read_chunk_aio(params);
-    }
+    IORequest io_request = this->io_backend->post_read_chunk(params);
 
     bool loaded_to_device = io_request.loaded_to_device;
     auto launch = [this, loaded_to_device, rank_dst, window_offset, rank_size,

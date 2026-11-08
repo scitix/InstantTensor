@@ -54,6 +54,14 @@ class IOPollingTest(unittest.TestCase):
                 capture_output=True, text=True, timeout=120,
             )
             self.assertEqual(configure.returncode, 0, configure.stdout + configure.stderr)
+            # Concrete backend vtables retain ring setup and registration methods.
+            # Build the remaining liburing symbols; read/poll calls stay interposed.
+            uring_build = subprocess.run(
+                ["make", "-C", "src", "liburing.a"], cwd=uring,
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(uring_build.returncode, 0,
+                             uring_build.stdout + uring_build.stderr)
             includes = [
                 root / "csrc", root / "csrc/third_party/atomic_queue/include",
                 root / "csrc/third_party/pybind11/include",
@@ -70,11 +78,20 @@ class IOPollingTest(unittest.TestCase):
                 "-fdata-sections", "-Wl,--gc-sections", "-g",
                 *([f"-fsanitize={sanitize}", "-fno-omit-frame-pointer"] if sanitize else []),
                 *(f"-I{path}" for path in includes),
-                str(root / "tests/cpp/test_io_polling.cpp"), str(python_library),
+                str(root / "tests/cpp/test_io_polling.cpp"),
+                str(uring / "src/liburing.a"), str(python_library),
                 f"-Wl,-rpath,{library}", "-ldl", "-o", str(executable),
             ], capture_output=True, text=True, timeout=120)
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            subprocess.run([str(executable)], check=True, timeout=30)
+            # These environment settings are cached on first use in C++.
+            for registered, cached in (("0", "0"), ("1", "1")):
+                with self.subTest(registered_mmap=registered, cached_buffers=cached):
+                    env = dict(os.environ,
+                               INSTANTTENSOR_USE_INTERNAL_MEMORY_REGISTER=registered,
+                               INSTANTTENSOR_CACHE_BUFFER=cached)
+                    run = subprocess.run([str(executable)], env=env,
+                                         capture_output=True, text=True, timeout=30)
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
 if __name__ == "__main__" and "--early-close" in sys.argv:

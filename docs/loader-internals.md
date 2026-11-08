@@ -24,9 +24,9 @@ implementation may use different classes or async primitives, but it must:
 
 Key source locations:
 
-- [`Loader::compute_layout`](../csrc/loader_common.cpp#L215)
-- [`Loader::post_read_chunk`](../csrc/loader_common.cpp#L442)
-- [`Loader::post_read_chunk_uring`](../csrc/loader_io_uring.cpp#L198)
+- [`Loader::compute_layout` and `Loader::post_read_chunk`](../csrc/loader_common.cpp)
+- [`IOBackend`](../csrc/instant_tensor/io_backend.hpp)
+- [`UringBackend::post_read_chunk`](../csrc/loader_io_uring.cpp)
 - [`safe_open.tensors`](../instanttensor/_internal/loader.py#L1028)
 
 ## Lifecycle at a Glance
@@ -110,6 +110,22 @@ One logical chunk has three runtime representations:
 They are not equal-sized copies. Disk and device describe a world-wide chunk,
 while each process stages only one rank slice. After distributed completion,
 every rank has the complete world chunk on its device.
+
+`Loader` selects one `IOBackend` object at open. It retains layout, common host
+and device buffers, IO/CUDA executors, and NCCL scheduling. AIO and io_uring own
+their native queues; AIO also owns its last-page helper. `WorkerIOBackend` shares
+the worker pool, completion polling, and abort logic used by MMAP, cuFile, and
+FGDS. FGDS owns its additional device staging allocation. Buffered and direct
+variants share the same backend class.
+
+`open_files()` encapsulates context initialization, file opening, and file
+registration; `close_files()` closes files and releases the native context.
+io_uring registers fixed files after opening them and fixed buffers after common
+buffer allocation. FGDS opens its device once per backend context. AIO helpers and MMAP memcpy workers do not
+set a CUDA device; cuFile and FGDS workers do. On close, Loader joins CUDA and IO executors,
+then backend workers, before releasing registrations, buffers, files, and native
+contexts. The backend object outlives the executors that call it. Abort drains
+accepted IO before allowing task errors to release or reuse their buffers.
 
 ### 1.1 Rank and `torch.distributed`
 
@@ -220,7 +236,7 @@ Python:
     call C++ open
 
 C++:
-    open files and initialize io_uring
+    open_files: initialize the backend context, open and register files
     derive A, R, W, Aw
     enlarge and allocate the device buffer
     allocate/register the host buffer and register it with io_uring
@@ -657,7 +673,8 @@ A read contained in one registered segment uses
 
 ### 6.2 SQE Submission
 
-`post_read_chunk_uring()` creates one SQE for the rank slice when it is nonempty:
+`UringBackend::post_read_chunk()` queues an IO task whose start callback creates
+one SQE for the rank slice when it is nonempty:
 
 ```text
 file rank slice -> host window
@@ -666,13 +683,13 @@ file rank slice -> host window
 Both direct and buffered io_uring paths submit
 `round_up(logical_size, PAGE_SIZE)`; buffered I/O intentionally reuses the
 direct-I/O range, while H2D copies only logical bytes. `URING_BUFFERED` also
-sets `IOSQE_ASYNC` to avoid a large inline page-cache copy on the loader
+sets `IOSQE_ASYNC` to avoid a large inline page-cache copy on the IO
 thread. A non-page-aligned final rank slice sets it as well.
 
 All backends use `chunk_id` as the request coordinate and the same rank-size
 calculation. io_uring stores it in SQE `user_data`, while libaio stores it in
-`iocb->data`. cuFile and MMAP use executor request IDs instead. Each chunk's
-`unfinished_cnt` is therefore either zero or one.
+`iocb->data`. cuFile, FGDS, and MMAP use executor request IDs instead. The IO
+driver publishes completion only after the logical payload is ready.
 
 ### 6.3 CQE, H2D, and NCCL
 
@@ -878,7 +895,7 @@ synchronization and lifetime control.
 ## 10. Current Implementation Notes
 
 1. `io_depth` is the rank-local request limit and also sizes host windows, CUDA events, and native I/O queues; a window remains occupied through H2D and optional all-gather.
-2. `concurrency` only controls the MMAP/cuFile worker pool. It does not affect chunk geometry, buffers, AIO, or io_uring.
+2. `concurrency` controls the MMAP/cuFile/FGDS worker pool. It does not affect chunk geometry, buffers, AIO, or io_uring.
 3. Non-increasing tensor element sizes preserve zero-copy alignment after the first tensor is aligned to 16 bytes. Other orders may create unaligned addresses; the frontend clones those tensors as `int8` before dtype reinterpretation and retains the returned-address divisibility check as a final guard.
 
 4. All backends use one poll-based `IOWorkerDriver` and `poll_completions` to
