@@ -150,8 +150,8 @@ variable.
 
 ### Zero-copy mode
 
-Pass `copy=False` to skip the per-tensor clone and yield views into the
-internal ring buffer:
+Pass `copy=False` to yield views into the internal ring buffer. Tensors whose
+addresses are unaligned for their dtype fall back to a copy with a warning:
 
 ```python
 with safe_open(files, framework="pt", device=0, copy=False) as f:
@@ -161,12 +161,14 @@ with safe_open(files, framework="pt", device=0, copy=False) as f:
 
 Two rules:
 
-1. Consume each tensor before the next is yielded — `list(f.tensors())` and
-   similar patterns silently corrupt data when `buffer_size < total_tensor_size`.
-2. Do not keep references past the `with` block — the buffer is freed on exit.
+1. Consume each tensor before the next is yielded — retaining ring views can
+   silently corrupt data when the buffer is reused. Filtering introduces alignment
+   padding, so tensor bytes fitting in the buffer alone does not guarantee safety.
+2. Do not keep ring views past the `with` block — the buffer is freed on exit.
 
-A `UserWarning` fires when `copy=False` and `buffer_size < total_tensor_size`.
-Both attributes are public on the `safe_open` object.
+A `UserWarning` fires when `copy=False` and either `tensor_filter` is specified
+or `buffer_size < total_tensor_size`. Both size attributes are public on the
+`safe_open` object. Fallback copies have independent storage.
 
 See `tests/test.py` for a full benchmark harness (TP/PP grouping, checksums, etc.).
 
@@ -175,8 +177,9 @@ See `tests/test.py` for a full benchmark harness (TP/PP grouping, checksums, etc
 InstantTensor selects an I/O backend automatically by default. You can provide
 one or more backend candidates with the `backend` argument to `safe_open`, or
 with the `INSTANTTENSOR_BACKEND` environment variable when `backend=None`.
-InstantTensor tries the candidates in order and uses the first backend that is
-supported by the file system and available on the current system.
+InstantTensor applies its filesystem policy and uses the first candidate that
+passes backend availability checks. These checks do not test reads from the
+target files; a subsequent open or read failure does not try another candidate.
 
 Supported backend values are `Backend.AIO`, `Backend.AIO_BUFFERED`,
 `Backend.URING`, `Backend.URING_BUFFERED`, `Backend.CUFILE`, `Backend.MMAP`,
@@ -236,9 +239,10 @@ Backends are used in different file-system and I/O scenarios:
     but usually not preferred.
 
 If no backend is specified, InstantTensor tries `[URING, AIO]` for regular disk
-files. For tmpfs/ramfs files, it uses `MMAP`. If none of the requested
-candidates can be used, InstantTensor raises an error listing why each candidate
-was rejected.
+files. For tmpfs/ramfs files, it uses `MMAP`. If no candidate is available,
+InstantTensor raises an error. Without a process group, the error includes
+availability-check rejection reasons for candidates retained by filesystem policy;
+with a process group, it reports that no backend is available on every rank.
 
 ### Environment variables
 
@@ -250,11 +254,15 @@ argument takes precedence over its corresponding environment variable.
 | `INSTANTTENSOR_BACKEND` | Comma-separated backend or policy candidates, for example `URING,AIO` or `BUFFERED`. | Automatically select by filesystem type. |
 | `INSTANTTENSOR_BUFFER_SIZE` | Requested logical GPU tensor ring-buffer size in bytes. It constrains `io_depth` but may be enlarged to fit the largest tensor. | Automatically determined from tensor sizes and I/O settings. |
 | `INSTANTTENSOR_CHUNK_SIZE` | File I/O chunk size in bytes. | Automatically determined for the selected backend. |
-| `INSTANTTENSOR_CONCURRENCY` | Number of worker threads for `MMAP` and `CUFILE`; other backends ignore it. | Automatically determined for the selected backend. |
+| `INSTANTTENSOR_CONCURRENCY` | Number of worker threads for `MMAP`, `CUFILE`, and `FGDS`; native-async backends override positive values to zero with a warning. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_IO_DEPTH` | Maximum number of rank-local I/O operations in flight. Higher values can increase throughput and staging-memory usage; the maximum is 1024. | Automatically determined for the selected backend. |
-| `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Maximum fraction of currently free GPU memory available to the logical device buffer. | `0.5` |
+| `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Fraction applied to negotiated host/device memory budgets; the device budget limits the logical GPU buffer and I/O depth. | `0.5` |
 | `INSTANTTENSOR_CACHE_BUFFER` | Set to `1` to cache pinned host staging buffers across loader opens. Cached memory remains pinned until process cleanup. | `0` |
 | `INSTANTTENSOR_DEBUG` | Set to `1` to print backend selection, buffer sizes, timing, and throughput diagnostics. | `0` |
+
+Integrated GPUs split the scaled host-memory budget equally between host and
+device. The host budget is currently reported but does not independently cap
+pinned staging allocations.
 
 The I/O capacity required by a configuration is
 `round_up(chunk_size, page_size) * io_depth * world_size`. When `buffer_size`

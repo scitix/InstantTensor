@@ -519,8 +519,11 @@ class safe_open:
         io_depth: The maximum number of rank-local I/O operations in flight. If ``None`` (default),
             uses ``INSTANTTENSOR_IO_DEPTH`` when set; otherwise automatically
             determined based on storage type and system capabilities.
-        max_free_mem_usage: Maximum fraction of available memory allowed for the
-            logical GPU buffer. If ``None`` (default), uses
+        max_free_mem_usage: Fraction applied to negotiated host and device memory
+            budgets. The device budget limits the logical GPU buffer and I/O depth;
+            the host budget does not independently cap staging allocations.
+            Integrated GPUs split the scaled host budget equally between host
+            and device. If ``None`` (default), uses
             ``INSTANTTENSOR_MAX_FREE_MEM_USAGE`` when set; otherwise defaults
             to 0.5. The internal allocation also includes a small alignment
             guard.
