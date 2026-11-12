@@ -264,7 +264,7 @@ class IOParamsTest(unittest.TestCase):
         self.assertEqual(loader.io_depth, 5)
 
     def test_worker_backends_reject_zero_concurrency_before_io_depth(self):
-        for backend in (impl.Backend.MMAP, impl.Backend.CUFILE):
+        for backend in (impl.Backend.MMAP, impl.Backend.CUFILE, impl.Backend.FGDS):
             for io_depth in (None, 0, 1):
                 with self.subTest(backend=backend.name, io_depth=io_depth):
                     with self.assertRaisesRegex(ValueError, "concurrency must be greater than zero"):
@@ -283,7 +283,8 @@ class IOParamsTest(unittest.TestCase):
                     )
 
     def test_worker_backends_preserve_positive_concurrency(self):
-        for backend, depth_factor in ((impl.Backend.MMAP, 3), (impl.Backend.CUFILE, 2)):
+        for backend, depth_factor in ((impl.Backend.MMAP, 3), (impl.Backend.CUFILE, 2),
+                                      (impl.Backend.FGDS, 8)):
             with self.subTest(backend=backend.name):
                 with warnings.catch_warnings(record=True) as emitted:
                     warnings.simplefilter("always")

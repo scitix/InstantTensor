@@ -512,8 +512,8 @@ class safe_open:
             value can improve throughput, but values that are too large may
             conversely reduce throughput.
         concurrency: The number of worker threads used by the synchronous
-            ``MMAP`` and ``CUFILE`` backends. Other backends ignore it. It does
-            not affect the I/O layout. If ``None`` (default), uses
+            ``MMAP``, ``CUFILE``, and ``FGDS`` backends. Other backends ignore it.
+            With ``io_depth`` fixed, it does not affect the I/O layout. If ``None`` (default), uses
             ``INSTANTTENSOR_CONCURRENCY`` when set; otherwise automatically
             determined for the selected backend.
         io_depth: The maximum number of rank-local I/O operations in flight. If ``None`` (default),
@@ -747,7 +747,7 @@ class safe_open:
         if concurrency is not None:
             if concurrency < 0:
                 raise ValueError("concurrency must not be negative")
-            if backend in (Backend.MMAP, Backend.CUFILE):
+            if backend in (Backend.MMAP, Backend.CUFILE, Backend.FGDS):
                 if concurrency == 0:
                     raise ValueError(
                         f"concurrency must be greater than zero for backend {backend.name}"
