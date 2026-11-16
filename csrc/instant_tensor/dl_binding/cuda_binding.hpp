@@ -2,6 +2,9 @@
 
 #include <instant_tensor/common.hpp>
 
+#include <cstdlib>
+#include <cstring>
+
 #include <instant_tensor/dl_binding/dl_binding_utils.hpp>
 
 #define cudaStreamDefault 0x00
@@ -24,6 +27,10 @@ namespace instanttensor {
 namespace cuda_binding {
 
 inline bool is_rocm = false;
+// Host runtime: buffers live in host memory and copies are synchronous memcpy.
+// For devices whose runtime cannot be bound here (Intel XPU); the caller copies
+// each yielded host tensor to its device.
+inline bool is_host = false;
 
 // Opaque types (match CUDA runtime ABI)
 typedef void* cudaStream_t;
@@ -59,6 +66,74 @@ inline cudaError_t (*cudaStreamWaitEvent_fn)(cudaStream_t stream, cudaEvent_t ev
 inline cudaError_t (*cudaHostRegister_fn)(void* ptr, size_t size, unsigned int flags) = nullptr;
 inline cudaError_t (*cudaHostUnregister_fn)(void* ptr) = nullptr;
 inline const char* (*cudaGetErrorString_fn)(cudaError_t error) = nullptr;
+
+namespace host_runtime {
+
+constexpr size_t kAlignment = 4096;
+
+inline cudaError_t malloc_(void** ptr, size_t size) {
+    // aligned_alloc needs a size that is a nonzero multiple of the alignment;
+    // a zero-byte request may otherwise return nullptr.
+    size_t rounded = size == 0 ? kAlignment : (size + kAlignment - 1) / kAlignment * kAlignment;
+    *ptr = std::aligned_alloc(kAlignment, rounded);
+    return *ptr != nullptr ? cudaSuccess : static_cast<cudaError_t>(2);  // cudaErrorMemoryAllocation
+}
+inline cudaError_t free_(void* ptr) { std::free(ptr); return cudaSuccess; }
+inline cudaError_t set_device(int) { return cudaSuccess; }
+// Streams and events only need distinct non-null handles: every operation
+// completes before it returns, so there is nothing to order or wait for.
+inline cudaError_t stream_create(cudaStream_t* stream, unsigned int) {
+    *stream = new char;
+    return cudaSuccess;
+}
+inline cudaError_t stream_destroy(cudaStream_t stream) {
+    delete static_cast<char*>(stream);
+    return cudaSuccess;
+}
+inline cudaError_t memcpy_(void* dst, const void* src, size_t count, cudaMemcpyKind, cudaStream_t) {
+    std::memcpy(dst, src, count);
+    return cudaSuccess;
+}
+inline cudaError_t event_create(cudaEvent_t* event, unsigned int) {
+    *event = new char;
+    return cudaSuccess;
+}
+inline cudaError_t event_record(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
+inline cudaError_t event_query(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t event_synchronize(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t stream_wait_event(cudaStream_t, cudaEvent_t, unsigned int) { return cudaSuccess; }
+inline cudaError_t host_register(void*, size_t, unsigned int) { return cudaSuccess; }
+inline cudaError_t host_unregister(void*) { return cudaSuccess; }
+inline const char* error_string(cudaError_t error) {
+    return error == cudaSuccess ? "success" : "host runtime: allocation failed";
+}
+
+} // namespace host_runtime
+
+// Select the host runtime. Must run before init() binds a device runtime;
+// returns false if CUDA or HIP is already bound in this process.
+inline bool init_host() {
+    if (is_host) return true;
+    // (void*)0x1 is init()'s "no device runtime found" marker, not a bound runtime.
+    if (lib_handle != nullptr && lib_handle != (void*)0x1) return false;
+    is_host = true;
+    lib_handle = (void*)0x2;
+    cudaMalloc_fn = host_runtime::malloc_;
+    cudaFree_fn = host_runtime::free_;
+    cudaSetDevice_fn = host_runtime::set_device;
+    cudaStreamCreateWithFlags_fn = host_runtime::stream_create;
+    cudaStreamDestroy_fn = host_runtime::stream_destroy;
+    cudaMemcpyAsync_fn = host_runtime::memcpy_;
+    cudaEventCreateWithFlags_fn = host_runtime::event_create;
+    cudaEventRecord_fn = host_runtime::event_record;
+    cudaEventQuery_fn = host_runtime::event_query;
+    cudaEventSynchronize_fn = host_runtime::event_synchronize;
+    cudaStreamWaitEvent_fn = host_runtime::stream_wait_event;
+    cudaHostRegister_fn = host_runtime::host_register;
+    cudaHostUnregister_fn = host_runtime::host_unregister;
+    cudaGetErrorString_fn = host_runtime::error_string;
+    return true;
+}
 
 inline bool init() {
     if (lib_handle != nullptr) {

@@ -439,6 +439,48 @@ def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor:
 
 group_communicator_cache = {}
 
+
+def supports_device(device_type: str) -> bool:
+    """Whether ``safe_open`` can load to ``device_type`` ("cuda" covers ROCm)."""
+    return device_type in ("cuda", "xpu")
+
+
+def supports_process_group(device_type: str) -> bool:
+    """Whether ``safe_open`` can coordinate ranks over a process group on
+    ``device_type``. XPU loads each rank independently for now."""
+    return device_type == "cuda"
+
+
+# Set once an XPU open selects the host runtime. The selection is process-wide
+# and the native init() then reports the host runtime as bound, so CUDA/HIP
+# opens must be refused here rather than silently staged in host memory.
+_host_runtime_selected = False
+
+
+def _prepare_host_staged_device(device, process_group, copy):
+    """Validate an XPU ``safe_open``. Selecting the host runtime is deferred to
+    ``_select_host_runtime`` so a failed open leaves CUDA usable."""
+    if process_group is not None and dist.get_world_size(process_group) > 1:
+        raise ValueError(
+            "process_group is not supported on XPU yet; pass process_group=None "
+            "to load each rank independently")
+    if not copy:
+        raise ValueError(
+            "copy=False is not supported on XPU: tensors are staged in host "
+            "memory and copied to the device")
+    if device.index is None:
+        device = torch.device(device.type, torch.xpu.current_device())
+    return device
+
+
+def _select_host_runtime():
+    """Bind the process-wide host runtime once every XPU open check has passed."""
+    global _host_runtime_selected
+    if not _C.use_host_runtime():
+        raise RuntimeError(
+            "Cannot load to XPU: a CUDA or HIP runtime is already bound in this process")
+    _host_runtime_selected = True
+
 def compile_name_matcher(
     name_patterns: Optional[list[str]],
     tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob",
@@ -602,6 +644,9 @@ class safe_open:
         ...     for name, tensor in f.tensors():
         ...         tensors[name] = tensor
     """
+    # Set per instance in __init__; the default covers instances built without it.
+    host_staged = False
+
     def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
@@ -622,10 +667,22 @@ class safe_open:
         filename.sort()
 
         device = torch.device(device)
-        if device.type != "cuda":
-            raise ValueError("InstantTensor only supports CUDA devices for now")
+        if device.type != "cuda" and device.type != "xpu":
+            raise ValueError(
+                f"InstantTensor only supports CUDA (including ROCm) and XPU devices, got {device.type!r}")
         if framework != "pt":
             raise ValueError("InstantTensor only supports pytorch for now")
+        # XPU: the native pipeline runs on the host runtime, and each yielded
+        # tensor is copied to the device by PyTorch, which owns all XPU memory.
+        self.host_staged = device.type == "xpu"
+        if self.host_staged:
+            device = _prepare_host_staged_device(device, process_group, copy)
+            # A single-rank group adds nothing on XPU, and its backend has no
+            # NCCL communicator for _open(); load this rank independently.
+            process_group = None
+        elif _host_runtime_selected:
+            raise RuntimeError(
+                "Cannot load to CUDA: this process selected the host runtime for XPU")
 
         self.world_size = 1 if process_group is None else dist.get_world_size(process_group)
         self.rank = 0 if process_group is None else dist.get_rank(process_group)
@@ -634,6 +691,9 @@ class safe_open:
         self.framework = framework
         self.device = device
         self.device_idx = device.index
+        if self.host_staged:
+            # The host runtime ignores the device index; DLPack CPU tensors use 0.
+            self.device_idx = 0
         self.process_group = process_group
         self.loader_handle = None
         self.distributed_metadata_read = False
@@ -702,6 +762,8 @@ class safe_open:
         prepared_at = time.perf_counter()
         self.check_seconds = prepared_at - check_started_at
         self.prepare_seconds = prepared_at - self.created_at
+        if self.host_staged:
+            _select_host_runtime()
         if load_now:
             self._open()
 
@@ -727,6 +789,14 @@ class safe_open:
                 candidate for candidate in backend_candidates
                 if candidate in available_in_memory_backends
             ]
+        if self.host_staged:
+            # GPUDirect Storage reads into CUDA memory; the host runtime has none.
+            backend_candidates = [
+                candidate for candidate in backend_candidates
+                if candidate not in (Backend.CUFILE, Backend.FGDS)
+            ]
+            if not backend_candidates:
+                raise ValueError("CUFILE and FGDS are not available on XPU")
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
 
@@ -990,11 +1060,16 @@ class safe_open:
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
-        stream = torch.cuda.current_stream()
-        stream.synchronize() # make sure all the data transfer is done
-        load_finished_at = time.perf_counter()
         self._invalidated = True
-        _C.close(self.loader_handle)
+        try:
+            if self.host_staged:
+                torch.get_device_module(self.device).synchronize()
+            else:
+                stream = torch.cuda.current_stream()
+                stream.synchronize() # make sure all the data transfer is done
+        finally:
+            load_finished_at = time.perf_counter()
+            _C.close(self.loader_handle)
         closed_at = time.perf_counter()
         if env_debug():
             total_seconds = closed_at - self.created_at
@@ -1036,8 +1111,8 @@ class safe_open:
         the ring buffer (see ``safe_open``).
 
         Note:
-            Synchronizes the current CUDA stream to ensure data transfer
-            completion.
+            Synchronizes the current CUDA stream (or, on XPU, the device) to
+            ensure data transfer completion.
         """
         if self._invalidated:
             raise RuntimeError("tensors() called after safe_open context exited")
@@ -1045,8 +1120,11 @@ class safe_open:
             raise RuntimeError("tensors() can only be called once")
         self.iterated = True
         for tensor_index, (name, metadata) in enumerate(self.ordered_tensor_metadatas):
-            stream = torch.cuda.current_stream()
-            stream.synchronize()
+            if self.host_staged:
+                torch.get_device_module(self.device).synchronize()
+            else:
+                stream = torch.cuda.current_stream()
+                stream.synchronize()
             shape = metadata["shape"]
             safetensors_dtype = metadata["dtype"]
             torch_dtype = safetensors_to_torch_dtype.get(safetensors_dtype, None)
@@ -1059,7 +1137,13 @@ class safe_open:
 
             required_alignment = torch.empty((), dtype=torch_dtype).element_size()
             is_aligned = tensor_int8.data_ptr() % required_alignment == 0
-            if self.copy or not is_aligned:
+            if self.host_staged:
+                # XPU does not guarantee a pageable host-to-device copy has read
+                # its source when .to() returns; wait before the ring-buffer
+                # slot can be reused.
+                tensor_int8 = tensor_int8.to(self.device, copy=True)
+                torch.get_device_module(self.device).synchronize()
+            elif self.copy or not is_aligned:
                 if not self.copy:
                     warnings.warn(
                         f"Tensor {name} address {tensor_int8.data_ptr():#x} is not aligned "

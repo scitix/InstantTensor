@@ -106,6 +106,7 @@ static DLDataType torch_to_dlpack_dtype(const std::string& s) {
 
 static DLDeviceType get_device_type() {
     cuda_binding::init();
+    if (cuda_binding::is_host) return kDLCPU;
     return cuda_binding::is_rocm ? kDLROCM : kDLCUDA;
 }
 
@@ -144,6 +145,9 @@ static py::object pack_dlpack(uint64_t ptr,
     managed->dl_tensor.data = reinterpret_cast<void*>(ptr);
     // Use the appropriate device type (kDLCUDA for NVIDIA, kDLROCM for AMD)
     managed->dl_tensor.device = DLDevice{device_type, device_id};
+    if (cuda_binding::is_host) {
+        managed->dl_tensor.device.device_id = 0;  // DLPack CPU tensors carry device_id 0
+    }
     managed->dl_tensor.ndim = ctx->ndim;
     managed->dl_tensor.dtype = torch_to_dlpack_dtype(dtype);
     managed->dl_tensor.shape = ctx->shape;

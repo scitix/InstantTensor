@@ -242,6 +242,9 @@ PYBIND11_MODULE(_C, m) {
           "Check if the file is in memory",
           pybind11::arg("filenames"));
 
+    m.def("use_host_runtime", []() { return instanttensor::cuda_binding::init_host(); },
+        "Stage tensors in host memory instead of a CUDA/HIP device. Call before the "
+        "first open(); returns False if a CUDA or HIP runtime is already bound.");
     m.def("cleanup", &instanttensor::cleanup,
           "Clean up global cuda-related objects before python exit and cudaDeviceReset() is called");
 
