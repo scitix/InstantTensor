@@ -41,7 +41,7 @@ See [Usage](#usage) for multi-file and distributed usage.
 ## Why InstantTensor?
 
 - **Fast:** Pipeline I/O, GPU transfers, and prefetching.
-- **Distributed:** Coordinate reads across GPUs with NCCL.
+- **Distributed:** Coordinate reads across GPUs with NCCL (CUDA and ROCm).
 - **Selective:** Load only the tensors you need.
 - **Flexible:** Support Direct I/O, Buffered I/O, MMAP, and GPUDirect Storage.
 - **Memory-aware:** Reuse configurable staging buffers, with optional zero-copy views.
@@ -60,7 +60,7 @@ Performance depends on your hardware and workload; benchmark before choosing.
 
 ### Requirements
 
-- GPU platforms: CUDA, ROCm
+- GPU platforms: CUDA, ROCm, Intel XPU (experimental; see [Intel XPU](#intel-xpu))
 - Framework: PyTorch
 - `URING`/`URING_BUFFERED`: Linux kernel 5.6 or newer; 5.15 or newer is recommended
 - `FGDS`: the [fgds](https://github.com/Storage-and-OS-for-AI/fgds) kernel module and `libfgds.so` must be installed (available in the process via `LD_PRELOAD` or on the `LD_LIBRARY_PATH`)
@@ -79,6 +79,10 @@ Performance depends on your hardware and workload; benchmark before choosing.
   pip install .
   # For a debug build, set "DEBUG=1" before "pip"
   ```
+
+Building from source needs no CUDA or ROCm toolkit: the device runtime is loaded
+at run time. Intel XPU support needs no Level Zero headers or oneAPI compiler
+either; install a PyTorch build with XPU support.
 
 ## Usage
 
@@ -104,6 +108,39 @@ with safe_open(files, framework="pt", device=torch.cuda.current_device(), proces
 ```
 
 > **NOTE:** You can also load weights using a subgroup created via `dist.new_group`, which allows multiple subgroups to load weights independently. For example, if you have TP=8 and PP=2 (i.e., two TP groups), you can create two subgroups and load weights independently on each TP group. In cross-node (multi-machine) scenarios, loading using per-node subgroups can sometimes be faster than loading on the world group. However, for most cases, the world group is a good default choice.
+
+### Intel XPU
+
+Pass an XPU device to load onto Intel GPUs:
+
+```python
+import torch
+from instanttensor import safe_open, supports_device
+
+assert supports_device("xpu")
+tensors = {}
+with safe_open(files, framework="pt", device="xpu") as f:  # or torch.device("xpu", i)
+    for name, tensor in f.tensors():
+        tensors[name] = tensor
+```
+
+On XPU, InstantTensor runs its I/O pipeline in host memory (the *host runtime*)
+and PyTorch copies each finished tensor to the device, so PyTorch owns all XPU
+memory. Current limitations:
+
+- `copy=False` is not supported; every yielded tensor is an owned XPU tensor.
+- `process_group` with more than one rank is not supported. Pass
+  `process_group=None` and call `safe_open` on each rank; each rank then reads
+  every file itself.
+- `CUFILE` and `FGDS` are not available; the other backends are.
+- The host runtime is process-wide. A process that has already loaded to CUDA
+  or HIP through InstantTensor cannot load to XPU, and a process that has
+  loaded to XPU cannot then load to CUDA or HIP; both raise `RuntimeError`.
+
+Frameworks can check what a build supports with
+`instanttensor.supports_device(device_type)` and
+`instanttensor.supports_process_group(device_type)`; for example,
+`supports_process_group("xpu")` is currently `False`.
 
 ### Selective loading
 
@@ -263,6 +300,11 @@ argument takes precedence over its corresponding environment variable.
 Integrated GPUs split the scaled host-memory budget equally between host and
 device. The host budget is currently reported but does not independently cap
 pinned staging allocations.
+
+On Intel XPU, both the staging buffers and the tensor ring buffer live in host
+memory, so InstantTensor budgets them as on an integrated GPU, against the
+host's available memory (`MemAvailable`). Use `INSTANTTENSOR_MAX_FREE_MEM_USAGE`
+to limit host-memory use.
 
 The I/O capacity required by a configuration is
 `round_up(chunk_size, page_size) * io_depth * world_size`. When `buffer_size`

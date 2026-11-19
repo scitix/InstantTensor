@@ -924,7 +924,8 @@ user stream:                       [compute/copy T0] [compute/copy T1]...
 Requesting `Ti` guarantees only that its final chunk is complete. Safe later
 chunks may overlap disk I/O, H2D, and NCCL with user work on `Ti`.
 
-Before fetching the next tensor, Python synchronizes the current CUDA stream.
+Before fetching the next tensor, Python synchronizes the current CUDA stream
+(on Intel XPU, the XPU device; see section 10.1).
 This finishes the prior clone or consumption before expanding the prefetch
 window. Users of `copy=False` on another stream must provide their own stream
 synchronization and lifetime control.
@@ -971,6 +972,44 @@ software occupancies, not hardware queue depths or an additive end-to-end depth.
 The Loader owns the statistics storage and passes pointers through the executors
 to their drivers. These members precede the executors so they outlive worker exit.
 Timing is disabled when debug logging is off.
+
+### 10.1 Host Runtime (Intel XPU)
+
+PyTorch XPU allocates device memory through SYCL's default Level Zero context.
+Plain Level Zero code cannot obtain that context without the SYCL C++ API, so
+memory from a separate Level Zero binding would be foreign to PyTorch. Instead,
+`safe_open(device="xpu")` calls `_C.use_host_runtime()` before the first open.
+That calls `cuda_binding::init_host()`, which fills the same function table
+`init()` would bind from the CUDA or HIP runtime:
+
+| Function | Host runtime |
+| --- | --- |
+| `cudaMalloc` / `cudaFree` | 4096-byte-aligned `std::aligned_alloc` / `std::free` |
+| `cudaMemcpyAsync` | Synchronous `std::memcpy` |
+| Streams and events | Distinct non-null handles; record, query, wait, and synchronize return immediately, because every copy has completed |
+| `cudaHostRegister` / `cudaHostUnregister` | No-ops; staging memory is pageable |
+| `cudaSetDevice` | No-op |
+
+`init_host()` fails if CUDA or HIP is already bound in the process, and the
+selection is process-wide. After it, `init()` reports the host runtime as
+bound, so the frontend refuses later CUDA opens (`_host_runtime_selected`).
+The layout, I/O backends, executors, and `IO_READY`/`GPU_PENDING` state machine
+are unchanged: the "device" ring buffer is host memory and the H2D step is a
+`memcpy`. DLPack tensors are `kDLCPU`, device 0.
+
+The frontend:
+
+- refuses `copy=False` and a `process_group` with more than one rank; NCCL is
+  not available, and `ProcessGroupXCCL` has no NCCL communicator to pass in;
+- drops `CUFILE` and `FGDS` from the backend candidates;
+- budgets memory as integrated over `MemAvailable` (`query_rank_resources`);
+- copies each yielded tensor with `.to(device, copy=True)`, then synchronizes
+  the XPU device before fetching the next tensor. The pageable host-to-device
+  copy has completed when it returns, so the ring-buffer slot can be reused,
+  and `copy=True` guarantees the result never aliases the ring buffer.
+
+`supports_device("xpu")` is `True` and `supports_process_group("xpu")` is
+`False`. Distributed XPU loading would need a oneCCL all-gather in place of NCCL.
 
 ## 11. Acceptance Criteria
 
