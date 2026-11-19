@@ -46,15 +46,24 @@ def query_rank_resources(device, *, max_free_mem_usage):
     except (OSError, ValueError):
         # Preserve host/affinity limits when no accessible v2 ancestry exists.
         snapshot = cgroup.CgroupSnapshot((), False)
+    meminfo_ok = True
     try:
         avail_mem = host_available_bytes()
     except (OSError, ValueError):
         # Participate in negotiation even if this rank cannot read MemAvailable.
         avail_mem = 0
+        meminfo_ok = False
     try:
-        # Managed-memory support alone does not imply shared physical memory.
-        integrated = torch.cuda.get_device_properties(device).is_integrated
-        free_mem = torch.cuda.mem_get_info(device)[0]
+        if device is not None and torch.device(device).type == "xpu":
+            # XPU stages in host memory (the host runtime), so the "device"
+            # buffer shares host memory, as on an integrated GPU.
+            if not meminfo_ok:
+                raise OSError("cannot read MemAvailable for the XPU host-staged budget")
+            integrated, free_mem = True, avail_mem
+        else:
+            # Managed-memory support alone does not imply shared physical memory.
+            integrated = torch.cuda.get_device_properties(device).is_integrated
+            free_mem = torch.cuda.mem_get_info(device)[0]
     except (OSError, ValueError, AttributeError, RuntimeError):
         # A negative value reports query failure to every rank before admission.
         free_mem, integrated = -1, False
